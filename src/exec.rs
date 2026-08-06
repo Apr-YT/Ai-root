@@ -5,8 +5,11 @@
 //! 通过 try_wait 轮询 + 超时杀进程实现超时控制，避免跨线程移动 Child 所有权。
 //!
 //! 两种执行模式：
-//! - 单行命令：经 `escape_cmd_meta` 把 `^`/`&` 转义为字面量，避免 cmd /C 二次解析
-//!   把设备实例 ID 等含 `&` 的字面量拆成多段命令。代价：`&`/`&&` 串联在单行内失效。
+//! - 单行命令：经 `escape_cmd_meta` 把**引号外**的 `^`/`&` 转义为字面量，避免 cmd /C 二次解析
+//!   把未加引号的设备实例 ID 等含 `&` 的字面量拆成多段命令。引号内的 `&`/`^` 由 cmd 自身按字面处理、
+//!   不再额外转义（修复 B3：cmd 引号内 `^` 非转义符，盲目转义会把 `&` 变成字面 `^&` 破坏内容，
+//!   例如 `echo "a&b"` 会输出 `a^&b` 而非 `a&b`）。
+//!   代价：**引号外**的 `&`/`&&` 串联在单行内失效（退化为字面 `&`/`&&`）。
 //! - 多行脚本（命令含换行 `\n`）：写入临时 `.cmd` 文件并以 `cmd /C <file>` 执行，
 //!   **不转义**，`&`/`&&`/`|`/`()` 均按正常 cmd 语义工作。这是 AI 批量自治多命令时的推荐路径。
 
@@ -57,9 +60,10 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
     // 进一步：`cmd /C <command>` 会对命令行**二次解析**，把 `&` 误判为命令分隔符，
     // 使含 `&` 的设备实例 ID（`VID_373B&PID_1216&MI_00&COL0x`）被拆成多段、
     // 只有首段送达 pnputil。故在交给 cmd 前对 `^`/`&` 做 `^` 转义为字面量。
-    // 代价：`^`/`&` 均被转义为字面量，故单行内 `&` 与 `&&` 串联**全部失效**（退化为字面 `&`/`&&`）；
+    // 代价：`^`/`&` 仅在**引号外**被转义为字面量，故**引号外**的 `&` 与 `&&` 串联**全部失效**（退化为字面 `&`/`&&`）；
     // 仅 `|`/`<`/`>`/`()` 运算符语义保留。需要 `&`/`&&` 串联请改用多行脚本模式（命令含 `\n`、
     // 或 `ai-root run --file <脚本>` / `ai-root run --stdin`）。
+    // 引号内的 `&`/`^` 不做转义（B3 修复）：cmd 引号内 `^` 非转义符，盲目加 `^` 会把 `&` 变成字面 `^&` 破坏内容。
     let escaped = escape_cmd_meta(command);
     builder.raw_arg("/C").raw_arg(&escaped);
     builder.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -168,43 +172,11 @@ fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
     let out_t = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = stdout_pipe {
-            let mut chunk = [0u8; 8192];
-            loop {
-                match p.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        buf.extend_from_slice(&chunk[..n]);
-                        if buf.len() >= OUTPUT_LIMIT {
-                            break; // 截断，丢弃后续
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        let truncated = buf.len() >= OUTPUT_LIMIT;
+        let (buf, truncated) = drain_pipe(stdout_pipe);
         (decode_output(&buf), truncated)
     });
     let err_t = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = stderr_pipe {
-            let mut chunk = [0u8; 8192];
-            loop {
-                match p.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        buf.extend_from_slice(&chunk[..n]);
-                        if buf.len() >= OUTPUT_LIMIT {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        let truncated = buf.len() >= OUTPUT_LIMIT;
+        let (buf, truncated) = drain_pipe(stderr_pipe);
         (decode_output(&buf), truncated)
     });
 
@@ -250,18 +222,66 @@ fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
     }
 }
 
+/// 从管道读取全部输出，截断至 `OUTPUT_LIMIT`（仅影响返回给客户端的字符串，
+/// 不影响子进程生命周期）。
+///
+/// 关键修复（B1）：原实现在 `buf.len() >= OUTPUT_LIMIT` 时直接 `break` 停止消费，
+/// 子进程写满 8KB 内核管道缓冲后阻塞在 WriteFile，直到超时（默认 60s）才被 taskkill
+/// 杀掉，使 `dir /s C:\`、`systeminfo`、大日志等输出 >1MB 的命令被「错误超时」。
+/// 现改为超限后**继续排空管道（读到 EOF，丢弃超出的字节）**，让子进程自然跑完退出；
+/// 截断标记仅用于告知客户端输出被裁剪，超时判定完全由子进程真实退出状态决定。
+fn drain_pipe<R: Read>(pipe: Option<R>) -> (Vec<u8>, bool) {
+    let mut buf = Vec::with_capacity(OUTPUT_LIMIT.min(64 * 1024));
+    let mut truncated = false;
+    if let Some(mut p) = pipe {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match p.read(&mut chunk) {
+                Ok(0) => break, // 管道关闭，子进程已结束
+                Ok(n) => {
+                    if buf.len() < OUTPUT_LIMIT {
+                        // 仍未到上限：截取不超过上限的字节，恰好填满时标记截断
+                        let take = (OUTPUT_LIMIT - buf.len()).min(n);
+                        buf.extend_from_slice(&chunk[..take]);
+                        if buf.len() >= OUTPUT_LIMIT {
+                            truncated = true;
+                        }
+                    } else {
+                        // 已超出上限：继续消费并丢弃，排空管道让子进程自然退出
+                        truncated = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    (buf, truncated)
+}
+
 /// 对传入 `cmd /C` 的单行命令做 cmd.exe 元字符转义。
 ///
 /// `cmd /C <command>` 会二次解析命令行，把 `&` 当作命令分隔符
-/// （如设备实例 ID `VID_373B&PID_1216&MI_00&COL0x` 中的 `&` 会被拆段）。
-/// 在 `^`/`&` 前加 `^` 转义为字面量，确保整条命令原样送达目标程序。
+/// （如未加引号的设备实例 ID `VID_373B&PID_1216&MI_00&COL0x` 中的 `&` 会被拆段）。
+/// 在**引号外**的 `^`/`&` 前加 `^` 转义为字面量，确保整条命令原样送达目标程序。
+///
+/// **引号感知（修复 B3）**：cmd 的双引号内部，`^` **不是转义符**（引号内 `^` 为字面量），
+/// 且引号内的 `&`/`|`/`<`/`>`/`()` 本来就由 cmd 当字面量处理、不会被当作分隔符/重定向。
+/// 因此**仅当字符位于引号外部时才转义**；引号内的 `&` 必须保持原样。否则盲目加 `^`
+/// 会使 `echo "a&b"` 变成 `echo "a^&b"`、输出 `a^&b` 而非 `a&b`（静默内容破坏）。
+///
 /// 注意：`^` 必须先于 `&` 处理，否则 `^` 自身也会被误转义。
 /// 仅在单行模式下调用；多行脚本模式不转义（见 `run_script`）。
 fn escape_cmd_meta(cmd: &str) -> String {
     let mut out = String::with_capacity(cmd.len() + 8);
+    let mut in_quotes = false;
     for c in cmd.chars() {
         match c {
-            '^' | '&' => {
+            // 每个 `"` 切换引号状态；引号内的 `&`/`^` 不再转义（B3 修复）
+            '"' => {
+                in_quotes = !in_quotes;
+                out.push(c);
+            }
+            '^' | '&' if !in_quotes => {
                 out.push('^');
                 out.push(c);
             }
@@ -334,4 +354,57 @@ fn decode_codepage(bytes: &[u8], codepage: u32) -> String {
 fn encode_script(s: &str) -> Vec<u8> {
     let normalized: String = s.replace("\r\n", "\n").replace('\n', "\r\n");
     normalized.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_cmd_meta;
+
+    #[test]
+    fn escapes_amp_outside_quotes() {
+        // 未加引号的 & 必须转义，避免被 cmd 当作命令分隔符
+        assert_eq!(escape_cmd_meta("echo a&b"), "echo a^&b");
+        assert_eq!(escape_cmd_meta("echo a&&b"), "echo a^&^&b");
+    }
+
+    #[test]
+    fn preserves_amp_inside_quotes_b3() {
+        // B3 修复：引号内的 & 不得转义，否则输出 a^&b
+        assert_eq!(escape_cmd_meta("echo \"a&b\""), "echo \"a&b\"");
+        // 含 & 的设备实例 ID（带引号）应原样保留
+        assert_eq!(
+            escape_cmd_meta("pnputil /instanceid \"VID_373B&PID_1216&MI_00&COL0x\""),
+            "pnputil /instanceid \"VID_373B&PID_1216&MI_00&COL0x\""
+        );
+    }
+
+    #[test]
+    fn escapes_caret_outside_quotes() {
+        assert_eq!(escape_cmd_meta("echo a^b"), "echo a^^b");
+    }
+
+    #[test]
+    fn preserves_caret_inside_quotes() {
+        assert_eq!(escape_cmd_meta("echo \"a^b\""), "echo \"a^b\"");
+    }
+
+    #[test]
+    fn quote_toggle_mixed() {
+        // 引号内的 & 不转义，引号外的 & 转义
+        assert_eq!(
+            escape_cmd_meta("echo \"a&b\" & echo c"),
+            "echo \"a&b\" ^& echo c"
+        );
+        // 引号外的 ^ 转义，引号内的 ^ 不转义
+        assert_eq!(
+            escape_cmd_meta("echo ^a \"b^c\""),
+            "echo ^^a \"b^c\""
+        );
+    }
+
+    #[test]
+    fn unterminated_quote_treats_rest_as_quoted() {
+        // 未闭合引号：其后内容视为引号内，& 不转义
+        assert_eq!(escape_cmd_meta("echo \"a&b"), "echo \"a&b");
+    }
 }
