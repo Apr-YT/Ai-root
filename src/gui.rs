@@ -85,26 +85,27 @@ pub fn run() {
     );
 }
 
-/// 深色「运维控制台」(ops console) 主题：
-/// 深蓝灰面板 + 高对比语义状态色；避免默认浅色主题的「泛 AI」感。
+/// 深色「玻璃拟态运维台」主题（Glassmorphism）：
+/// 半透明低饱和深蓝灰面板（露出底层渐变背景，视觉等效毛玻璃）+ 1px 细描边 + 大圆角。
+/// 语义色仅用于状态（徽章/结果），标题/说明用中性色；拒绝厚重纯色硬边框。
 fn install_theme(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
 
-    // 面板层级：深空蓝灰四阶（窗口 > 面板 > 卡片 > 悬浮），非纯黑
-    v.panel_fill = C_BG_WINDOW;
-    v.window_fill = C_BG_PANEL;
-    v.faint_bg_color = C_BG_HOVER; // hover 底色
-    v.extreme_bg_color = C_BG_INPUT; // 输入框底
-    v.code_bg_color = C_BG_INPUT;
+    // 面板：低饱和深蓝灰半透明（alpha 混合露出背景渐变 → 玻璃感）
+    v.panel_fill = egui::Color32::from_rgba_unmultiplied(16, 20, 28, 218);
+    v.window_fill = egui::Color32::from_rgba_unmultiplied(20, 25, 34, 224);
+    v.faint_bg_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 7); // 玻璃高光
+    v.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(8, 11, 15, 208); // 输入框底
+    v.code_bg_color = egui::Color32::from_rgba_unmultiplied(10, 13, 18, 205);
     v.override_text_color = Some(C_TEXT);
 
-    // 选区 / 链接：品牌蓝
-    v.selection.bg_fill = C_BRAND;
-    v.selection.stroke = egui::Stroke::new(1.0_f32, C_ACCENT);
+    // 选区 / 链接：品牌蓝（低饱和细边）
+    v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(61, 139, 255, 150);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(45, 212, 191, 160));
     v.hyperlink_color = C_INFO;
 
-    // 控件四态：非交互 < 常态 < 悬浮 < 按下，统一圆角
-    let base_radius = egui::Rounding::same(6.0);
+    // 控件四态：非交互 < 常态 < 悬浮 < 按下；统一 8px 圆角 + 1px 半透明细描边
+    let base_radius = egui::Rounding::same(8.0);
     for w in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -115,18 +116,21 @@ fn install_theme(ctx: &egui::Context) {
         w.rounding = base_radius;
         w.expansion = 0.0;
     }
-    v.widgets.noninteractive.bg_fill = C_BG_CARD;
-    v.widgets.noninteractive.weak_bg_fill = C_BG_INPUT;
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, C_BORDER);
-    v.widgets.inactive.bg_fill = C_BG_CARD;
-    v.widgets.inactive.weak_bg_fill = C_BG_INPUT;
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, C_BORDER);
-    v.widgets.hovered.bg_fill = C_BG_HOVER;
-    v.widgets.hovered.weak_bg_fill = C_BG_HOVER;
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, C_BRAND);
-    v.widgets.active.bg_fill = C_BRAND;
-    v.widgets.active.weak_bg_fill = C_BRAND;
-    v.widgets.open.bg_fill = C_BG_HOVER;
+    let hairline = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14); // 细描边 white 5.5%
+    let hairline_brand = egui::Color32::from_rgba_unmultiplied(61, 139, 255, 95); // 悬浮 brand 细边
+    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgba_unmultiplied(23, 28, 37, 205);
+    v.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(16, 20, 28, 200);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, hairline);
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgba_unmultiplied(23, 28, 37, 205);
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(16, 20, 28, 200);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, hairline);
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgba_unmultiplied(34, 42, 54, 212);
+    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(28, 35, 46, 210);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, hairline_brand);
+    v.widgets.active.bg_fill = egui::Color32::from_rgba_unmultiplied(61, 139, 255, 150);
+    v.widgets.active.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(61, 139, 255, 120);
+    v.widgets.open.bg_fill = egui::Color32::from_rgba_unmultiplied(34, 42, 54, 212);
+    v.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, hairline_brand);
 
     // 间距节奏（4/6/8/12 网格）
     ctx.style_mut(|s| {
@@ -870,6 +874,10 @@ impl WbRelayApp {
             let enter_btn = ui
                 .add_enabled(!self.cmd_busy, egui::Button::new("执行"))
                 .on_hover_text("回车或点击执行");
+            // SDF 辉光：执行按钮 hover 时外扩光晕（品牌蓝）
+            if enter_btn.hovered() && !self.cmd_busy {
+                sdf_glow(ui, enter_btn.rect, C_BRAND, 9.0);
+            }
             if input.has_focus() {
                 let (enter, up, down, esc) = ui.input(|i| {
                     (
@@ -1276,9 +1284,53 @@ fn lock_dark_theme(ctx: &egui::Context) {
     }
 }
 
+/// 全屏低饱和垂直渐变背景（背景层）：玻璃面板的半透明 fill 透出此渐变，视觉等效毛玻璃。
+/// 直接用 `ctx.layer_painter(LayerId::background())` 在最底层画 mesh，避开 Area 的 auto-size 坑。
+fn draw_bg_gradient(ctx: &egui::Context) {
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let rect = ctx.screen_rect();
+    if rect.width() < 1.0 || rect.height() < 1.0 {
+        return;
+    }
+    let top = egui::Color32::from_rgb(32, 40, 56); // #202838 低饱和深蓝
+    let bottom = egui::Color32::from_rgb(10, 14, 20); // #0A0E14
+    let mesh = egui::Mesh {
+        texture_id: egui::TextureId::default(),
+        vertices: vec![
+            egui::epaint::Vertex { pos: rect.left_top(), uv: egui::epaint::WHITE_UV, color: top },
+            egui::epaint::Vertex { pos: rect.right_top(), uv: egui::epaint::WHITE_UV, color: top },
+            egui::epaint::Vertex { pos: rect.left_bottom(), uv: egui::epaint::WHITE_UV, color: bottom },
+            egui::epaint::Vertex { pos: rect.right_bottom(), uv: egui::epaint::WHITE_UV, color: bottom },
+        ],
+        indices: vec![0, 1, 2, 1, 3, 2],
+    };
+    painter.add(mesh);
+}
+
+/// 模拟 SDF 辉光：hover 时绘制 2~3 层半透明圆角描边逐级外扩（视觉近似 signed-distance 光晕）。
+fn sdf_glow(ui: &mut egui::Ui, rect: egui::Rect, color: egui::Color32, radius: f32) {
+    let p = ui.painter();
+    for (i, a) in [0.30_f32, 0.15, 0.07].iter().enumerate() {
+        let c = egui::Color32::from_rgba_unmultiplied(
+            color.r(),
+            color.g(),
+            color.b(),
+            (255.0 * a) as u8,
+        );
+        let expand = 1.0 + i as f32 * 3.0;
+        p.rect_stroke(
+            rect.expand(expand),
+            egui::Rounding::same(radius + expand),
+            egui::Stroke::new(1.0_f32, c),
+        );
+    }
+}
+
 impl eframe::App for WbRelayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         lock_dark_theme(ctx);
+        // 玻璃背景渐变（最底层，半透明面板透出）
+        draw_bg_gradient(ctx);
         self.poll_tray_events(ctx);
         self.sync_tray(false);
         self.poll_tasks();
