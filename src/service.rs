@@ -69,6 +69,13 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
 
     let _service = manager.create_service(&info, ServiceAccess::ALL_ACCESS)?;
 
+    // 给当前用户 SID 追加服务 STOP/START 权限：智能体进程（用户身份）此后可自主
+    // stop/start/更新服务，无需每次手动管理员授权（Windows 服务安全描述符标准机制）。
+    // 失败仅降级（更新仍需管理员），不阻断安装。
+    if let Err(e) = grant_acl() {
+        eprintln!("[warn] 服务 ACL 授权失败: {e}（更新服务二进制将仍需管理员）");
+    }
+
     // 安装时即生成令牌并设置 ACL，确保服务启动后可用
     common::ensure_token()?;
     // 持久化安装用户 SID，注入管道 SDDL，使智能体（该用户身份）可无人值守连管道拿 SYSTEM
@@ -99,6 +106,139 @@ pub fn start_svc() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     service.start::<OsString>(&[])?;
     println!("✓ 服务已启动");
+    Ok(())
+}
+
+/// 给当前用户 SID 追加服务 STOP/START 权限（服务 DACL 标准机制）。
+///
+/// 权限位：`SERVICE_START`=0x10=SDDL `RP`，`SERVICE_STOP`=0x20=SDDL `WP`。
+/// 效果：智能体进程（以安装用户身份运行，非提权）此后可执行
+/// `ai-root stop/start/update`，无需管理员 → 二进制更新彻底自治。
+/// 失败不致命（install 继续，仅降级为「更新仍需管理员」）。
+///
+/// 可独立以 `ai-root grant` 调用（需管理员）：用于**对已存在的服务**补发授权，
+/// 无需卸载重装（deploy.ps1 会在部署后自动调用一次）。
+pub fn grant_acl() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(sid) = common::get_user_sid() else {
+        return Ok(());
+    };
+    // 保留默认 ACE（SYSTEM/Administrators 完全控制），追加用户 RPWP(START|STOP)
+    let sddl = format!(
+        "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCLCSWRPWPDTLOCRRC;;;BA)(A;;RPWP;;;{sid})"
+    );
+    let sddl_w = common::to_wide(&sddl);
+    let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
+    let converted = unsafe {
+        winapi_raw::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_w.as_ptr(),
+            1,
+            &mut sd,
+            std::ptr::null_mut(),
+        )
+    };
+    if converted == 0 || sd.is_null() {
+        return Err(format!(
+            "SDDL 转换失败, last_err={}",
+            unsafe { winapi_raw::GetLastError() }
+        )
+        .into());
+    }
+
+    let name_w = common::to_wide(common::SERVICE_NAME);
+    let scm = unsafe {
+        winapi_raw::OpenSCManagerW(
+            std::ptr::null(),
+            std::ptr::null(),
+            winapi_raw::SC_MANAGER_CONNECT,
+        )
+    };
+    if scm.is_null() {
+        unsafe { winapi_raw::LocalFree(sd); }
+        return Err(format!(
+            "OpenSCManagerW 失败, last_err={}",
+            unsafe { winapi_raw::GetLastError() }
+        )
+        .into());
+    }
+    let svc = unsafe {
+        winapi_raw::OpenServiceW(scm, name_w.as_ptr(), winapi_raw::SERVICE_ALL_ACCESS)
+    };
+    if svc.is_null() {
+        unsafe {
+            winapi_raw::CloseServiceHandle(scm);
+            winapi_raw::LocalFree(sd);
+        }
+        return Err(format!(
+            "OpenServiceW 失败, last_err={}",
+            unsafe { winapi_raw::GetLastError() }
+        )
+        .into());
+    }
+
+    let ok = unsafe {
+        winapi_raw::SetServiceObjectSecurity(
+            svc,
+            winapi_raw::DACL_SECURITY_INFORMATION,
+            sd,
+        )
+    };
+    unsafe {
+        winapi_raw::CloseServiceHandle(svc);
+        winapi_raw::CloseServiceHandle(scm);
+        winapi_raw::LocalFree(sd);
+    }
+    if ok == 0 {
+        return Err(format!(
+            "SetServiceObjectSecurity 失败, last_err={}",
+            unsafe { winapi_raw::GetLastError() }
+        )
+        .into());
+    }
+    println!("✓ 服务 ACL 已授权用户 STOP/START（智能体可自主更新）");
+    Ok(())
+}
+
+/// 自主更新服务二进制（需 install 时已对当前用户授权 STOP/START）。
+///
+/// 流程：停止服务（轮询等待 Stopped）→ 覆盖部署副本 `D:\Kiln\AI-root\ai-root.exe`
+/// → 启动服务 → 自检状态。智能体（用户身份）一条命令完成，全程无需管理员。
+pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(
+        common::SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+    )?;
+
+    // 1) 若在运行，先停止（轮询等待，最多 ~15s；服务优雅停止逻辑见 server.rs CancelIoEx）
+    let st = service.query_status()?;
+    if st.current_state != ServiceState::Stopped {
+        println!("[*] 停止服务...");
+        service.stop()?;
+        for _ in 0..30 {
+            if service.query_status()?.current_state == ServiceState::Stopped {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        if service.query_status()?.current_state != ServiceState::Stopped {
+            return Err("服务停止超时".into());
+        }
+    }
+
+    // 2) 覆盖部署副本（与 install 的 deploy_global 同一路径）
+    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-root");
+    std::fs::create_dir_all(deploy_dir)?;
+    let deploy_exe = deploy_dir.join("ai-root.exe");
+    std::fs::copy(new_exe, &deploy_exe)?;
+    println!("✓ 已覆盖: {}", deploy_exe.display());
+
+    // 3) 启动服务
+    service.start::<OsString>(&[])?;
+    println!("✓ 服务已启动");
+
+    // 4) 自检
+    let s = service.query_status()?;
+    println!("服务状态: {:?}", s.current_state);
     Ok(())
 }
 

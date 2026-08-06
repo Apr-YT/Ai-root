@@ -46,6 +46,14 @@ pub const WAIT_OBJECT_0: u32 = 0;
 /// MultiByteToWideChar 的 CP_OEMCP 特殊值：使用系统 OEM 代码页（中文 Windows 为 GBK 936）
 pub const CP_OEMCP: u32 = 1;
 
+// ---- 服务控制管理器（SCM）----
+/// OpenSCManagerW 的最小访问权：仅连接（查询/打开服务用）
+pub const SC_MANAGER_CONNECT: u32 = 0x0001;
+/// OpenServiceW 的完全访问权（含 WRITE_DAC，改服务安全描述符需要）
+pub const SERVICE_ALL_ACCESS: u32 = 0x000F_01FF;
+/// SetServiceObjectSecurity 的 SECURITY_INFORMATION：只改 DACL（保留所有者的默认 ACL）
+pub const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+
 extern "system" {
     pub fn CreateNamedPipeW(
         lpName: PCWSTR,
@@ -98,6 +106,30 @@ extern "system" {
     ) -> BOOL;
 
     pub fn LocalFree(hMem: *mut c_void) -> *mut c_void;
+
+    // ---- 服务控制管理器（SCM）----
+    pub fn OpenSCManagerW(
+        lpMachineName: PCWSTR,
+        lpDatabaseName: PCWSTR,
+        dwDesiredAccess: u32,
+    ) -> HANDLE;
+
+    pub fn OpenServiceW(
+        hSCManager: HANDLE,
+        lpServiceName: PCWSTR,
+        dwDesiredAccess: u32,
+    ) -> HANDLE;
+
+    pub fn CloseServiceHandle(hSCObject: HANDLE) -> BOOL;
+
+    /// 设置服务对象安全描述符（DACL）。用于 install 时给当前用户 SID 追加
+    /// SERVICE_START(SERVICE_START=0x10=SDDL RP)/SERVICE_STOP(0x20=SDDL WP) 权限，
+    /// 使智能体进程（用户身份）无需管理员即可 stop/start 服务 → 自主更新二进制。
+    pub fn SetServiceObjectSecurity(
+        hService: HANDLE,
+        dwSecurityInformation: u32,
+        lpSecurityDescriptor: *mut c_void,
+    ) -> BOOL;
 
     /// 多字节（OEM/ANSI 代码页）-> UTF-16。用于正确解码命令输出的本地化文本（如中文）。
     pub fn MultiByteToWideChar(

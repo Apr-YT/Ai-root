@@ -34,9 +34,22 @@ fn main() {
     let result: Result<(), String> = match cmd {
         "--service" => service::run_as_service().map_err(|e| e.to_string()),
         "install" => service::install().map_err(|e| e.to_string()),
+        "grant" => {
+            // 对已存在的服务补发用户 STOP/START 授权（需管理员；deploy.ps1 部署后自动调用一次）
+            service::grant_acl().map_err(|e| e.to_string())
+        }
         "uninstall" => service::uninstall().map_err(|e| e.to_string()),
         "start" => service::start_svc().map_err(|e| e.to_string()),
         "stop" => service::stop_svc().map_err(|e| e.to_string()),
+        "update" => {
+            // 自主更新服务二进制（需 install 时已对当前用户授权 STOP/START）：
+            // 停止服务 -> 覆盖 exe -> 启动服务。AI 一条命令完成，无需管理员。
+            if args.len() < 3 {
+                eprintln!("用法: ai-root update <新exe路径>");
+                exit(1);
+            }
+            service::update_self(std::path::Path::new(&args[2])).map_err(|e| e.to_string())
+        }
         "status" => {
             match service::query_status() {
                 Ok(state) => println!("服务状态: {:?}", state),
@@ -207,10 +220,12 @@ fn print_help() {
 AI-root v1.0.0 —— LocalSystem 提权命令中继
 
 用法:
-  ai-root install      注册为 LocalSystem 自启服务（需管理员）
+  ai-root install      注册为 LocalSystem 自启服务（需管理员，首次一次性）
+  ai-root grant        对已存在服务补发用户 STOP/START 授权（需管理员）
   ai-root uninstall    卸载服务（需管理员）
-  ai-root start        启动服务（需管理员）
-  ai-root stop         停止服务（需管理员）
+  ai-root start        启动服务（install 授权后非提权即可）
+  ai-root stop         停止服务（install 授权后非提权即可）
+  ai-root update <exe> 自主更新服务二进制（停服务→覆盖→启服务，无需管理员）
   ai-root status       查询服务状态
   ai-root server       前台管道服务模式（测试用）
   ai-root run <命令>             连接管道并执行命令（非提权即可）
@@ -224,6 +239,7 @@ AI-root v1.0.0 —— LocalSystem 提权命令中继
   ai-root run "pnputil /enum-devices"
   ai-root run --file C:\tmp\batch.cmd           # 多行脚本，&/&&/| 均正常
   echo 命令行 & pnputil /enum-devices | ai-root run --stdin
+  ai-root update D:\wbrelay_target\...\ai-root.exe   # AI 自主更新（零 UAC）
 "#
     );
 }
