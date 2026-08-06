@@ -49,8 +49,7 @@ use crate::protocol;
 // ── 视觉 token「极夜青」方案（v3，2026-08-06）──
 // 深空蓝灰中性阶 + GitHub-Dark 同源语义色 + 冷青活动指示。
 // 设计依据：对比度 ≥7:1（WCAG AAA）、语义不打架（绿=成功/红=危险/蓝=操作/青=活动）。
-const C_BG_WINDOW: egui::Color32 = egui::Color32::from_rgb(11, 15, 20); // 窗口底 #0B0F14
-const C_BG_PANEL: egui::Color32 = egui::Color32::from_rgb(18, 22, 29); // 面板 #12161D
+// 注：窗口底/面板底色不再用常量（install_theme 玻璃拟态直接用 from_rgba_unmultiplied 构造）。
 const C_BG_INPUT: egui::Color32 = egui::Color32::from_rgb(26, 32, 42); // 卡片/输入底 #1A202A
 const C_BG_CARD: egui::Color32 = egui::Color32::from_rgb(26, 32, 42); // 卡片 #1A202A
 const C_BG_HOVER: egui::Color32 = egui::Color32::from_rgb(35, 43, 55); // 悬浮 #232B37
@@ -132,10 +131,11 @@ fn install_theme(ctx: &egui::Context) {
     v.widgets.open.bg_fill = egui::Color32::from_rgba_unmultiplied(34, 42, 54, 212);
     v.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, hairline_brand);
 
-    // 间距节奏（4/6/8/12 网格）
+    // 间距节奏：全局 8px 网格（边距/padding/margin 一律 8px 整数倍）
     ctx.style_mut(|s| {
-        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        s.spacing.button_padding = egui::vec2(10.0, 5.0);
+        s.spacing.item_spacing = egui::vec2(8.0, 8.0); // 控件间距 8
+        s.spacing.button_padding = egui::vec2(16.0, 8.0); // 按钮内 16 水平 × 8 垂直
+        s.spacing.window_margin = egui::Margin::same(8.0); // 面板内边距 8
     });
     v.window_rounding = egui::Rounding::same(0.0);
 
@@ -780,7 +780,9 @@ impl WbRelayApp {
                     1.0_f32,
                     if selected { C_BRAND } else { C_BORDER },
                 ))
-                .rounding(egui::Rounding::same(6.0));
+                // 圆角统一 8px；min_size 高 32px = 8px 网格整数倍，保证三 Tab 绝对等高、文字基线一致
+                .rounding(egui::Rounding::same(8.0))
+                .min_size(egui::vec2(0.0, 32.0));
                 let resp = ui.add(btn);
                 if selected {
                     // 底部 accent 指示条（2px，宽度收缩 8px 内边距，避免顶到圆角）
@@ -864,19 +866,26 @@ impl WbRelayApp {
         ui.add_space(6.0);
 
         // 输入行：Enter 执行 / ↑↓ 历史翻页 / Esc 清空
+        // 输入框与执行按钮等高 32px（8px 网格整数倍），同 horizontal 自动基线对齐
         ui.horizontal(|ui| {
             let input = ui.add_enabled(
                 !self.cmd_busy,
                 egui::TextEdit::singleline(&mut self.run_cmd)
                     .hint_text("输入命令（Enter 执行 · ↑↓ 翻历史 · Esc 清输入）…")
-                    .desired_width((ui.available_width() - 130.0).max(160.0)),
+                    .desired_width((ui.available_width() - 136.0).max(160.0))
+                    .desired_rows(1),
             );
-            let enter_btn = ui
-                .add_enabled(!self.cmd_busy, egui::Button::new("执行"))
-                .on_hover_text("回车或点击执行");
+            let enter_btn = ui.add_enabled(
+                !self.cmd_busy,
+                egui::Button::new("执行")
+                    .min_size(egui::vec2(64.0, 32.0)),
+            );
             // SDF 辉光：执行按钮 hover 时外扩光晕（品牌蓝）
             if enter_btn.hovered() && !self.cmd_busy {
                 sdf_glow(ui, enter_btn.rect, C_BRAND, 9.0);
+            }
+            if enter_btn.clicked() {
+                self.run_cmd_now();
             }
             if input.has_focus() {
                 let (enter, up, down, esc) = ui.input(|i| {
@@ -1430,11 +1439,19 @@ impl eframe::App for WbRelayApp {
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 section(ui, "服务控制", |ui| {
+                    // 并排按钮：各占半宽（减去中间 8px 间距），等高 32px
+                    let half = (ui.available_width() - 8.0) / 2.0;
                     ui.horizontal(|ui| {
-                        if ui.button("启动").clicked() {
+                        if ui
+                            .add_sized([half, 32.0], egui::Button::new("启动"))
+                            .clicked()
+                        {
                             self.svc_start();
                         }
-                        if ui.button("停止").clicked() {
+                        if ui
+                            .add_sized([half, 32.0], egui::Button::new("停止"))
+                            .clicked()
+                        {
                             self.svc_stop();
                         }
                     });
@@ -1447,21 +1464,23 @@ impl eframe::App for WbRelayApp {
                         ui.monospace(&self.token_fp);
                     });
                     ui.label(format!("写入时间: {}", self.token_mtime));
-                    ui.add_space(2.0);
-                    if ui.button("轮换令牌").clicked() {
+                    ui.add_space(8.0);
+                    let w = ui.available_width();
+                    if ui.add_sized([w, 32.0], egui::Button::new("轮换令牌")).clicked() {
                         self.confirm_rotate = true;
                     }
                     if self.confirm_rotate {
-                        ui.add_space(2.0);
+                        ui.add_space(8.0);
                         ui.colored_label(
                             C_ERR,
                             "确认轮换？旧令牌立即失效，持有旧令牌的 AI 客户端将无法执行",
                         );
+                        let half = (ui.available_width() - 8.0) / 2.0;
                         ui.horizontal(|ui| {
-                            if ui.button("确认轮换").clicked() {
+                            if ui.add_sized([half, 32.0], egui::Button::new("确认轮换")).clicked() {
                                 self.rotate_trigger();
                             }
-                            if ui.button("取消").clicked() {
+                            if ui.add_sized([half, 32.0], egui::Button::new("取消")).clicked() {
                                 self.confirm_rotate = false;
                             }
                         });
@@ -1477,8 +1496,9 @@ impl eframe::App for WbRelayApp {
                 )
                 .default_open(false)
                 .show(ui, |ui| {
-                    ui.add_space(2.0);
-                    if ui.button("安装服务 (首次)").clicked() {
+                    ui.add_space(8.0);
+                    let w = ui.available_width();
+                    if ui.add_sized([w, 32.0], egui::Button::new("安装服务 (首次)")).clicked() {
                         if self.elevate("install") {
                             self.hint =
                                 "已请求系统确认，请在弹窗中批准安装。\n首次安装会自动完成授权，此后启停/更新无需再确认"
@@ -1487,11 +1507,12 @@ impl eframe::App for WbRelayApp {
                             self.hint = "✗ 未获系统确认（可能被取消）".to_string();
                         }
                     }
-                    ui.add_space(2.0);
+                    ui.add_space(8.0);
                     if self.confirm_uninstall {
                         ui.colored_label(C_ERR, "确认卸载服务？");
+                        let half = (ui.available_width() - 8.0) / 2.0;
                         ui.horizontal(|ui| {
-                            if ui.button("确认卸载").clicked() {
+                            if ui.add_sized([half, 32.0], egui::Button::new("确认卸载")).clicked() {
                                 if self.elevate("uninstall") {
                                     self.hint = "已请求系统确认，请在弹窗中批准卸载".to_string();
                                 } else {
@@ -1499,11 +1520,11 @@ impl eframe::App for WbRelayApp {
                                 }
                                 self.confirm_uninstall = false;
                             }
-                            if ui.button("取消").clicked() {
+                            if ui.add_sized([half, 32.0], egui::Button::new("取消")).clicked() {
                                 self.confirm_uninstall = false;
                             }
                         });
-                    } else if ui.button("卸载服务").clicked() {
+                    } else if ui.add_sized([w, 32.0], egui::Button::new("卸载服务")).clicked() {
                         self.confirm_uninstall = true;
                     }
                     ui.small("这些操作需管理员确认；日常使用无需进入");
@@ -1750,7 +1771,7 @@ fn parse_event(line: &str) -> ParsedEvent {
                 meta: if preview.is_empty() {
                     format!("exit={exit} · {dur_ms}ms · pid={pid}")
                 } else {
-                    format!("exit={exit} · {dur_ms}ms · {pid}")
+                    format!("exit={exit} · {dur_ms}ms · pid={pid} · 「{}」", preview.chars().take(40).collect::<String>())
                 },
             }
         }
