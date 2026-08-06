@@ -47,8 +47,58 @@ fn deploy_global(src_exe: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// 配置 SCM 失败恢复策略：服务异常终止（7034）后按 60s/300s/600s 间隔自动重启，
+/// 防止进程被意外杀死后中继长时间不可用。install 注册服务后调用一次；失败仅降级（无自动重启）。
+fn configure_failure_actions(svc: &windows_service::service::Service) {
+
+
+    let mut actions = [
+        winapi_raw::SC_ACTION { Type: winapi_raw::SC_ACTION_RESTART, Delay: 60_000 },
+        winapi_raw::SC_ACTION { Type: winapi_raw::SC_ACTION_RESTART, Delay: 300_000 },
+        winapi_raw::SC_ACTION { Type: winapi_raw::SC_ACTION_RESTART, Delay: 600_000 },
+    ];
+    let fa = winapi_raw::SERVICE_FAILURE_ACTIONS {
+        dwResetPeriod: 86_400, // 重置失败计数周期：24h
+        lpRebootMsg: std::ptr::null(),
+        lpCommand: std::ptr::null(),
+        cActions: actions.len() as u32,
+        lpsaActions: actions.as_mut_ptr(),
+    };
+    let ok = unsafe {
+        winapi_raw::ChangeServiceConfig2W(
+            svc.raw_handle() as winapi_raw::HANDLE,
+            winapi_raw::SERVICE_CONFIG_FAILURE_ACTIONS,
+            &fa as *const winapi_raw::SERVICE_FAILURE_ACTIONS as *const core::ffi::c_void,
+        )
+    };
+    if ok != 0 {
+        println!("✓ 已配置失败自动重启（60s/300s/600s）");
+    } else {
+        eprintln!(
+            "[warn] 配置失败恢复策略失败, last_err={}",
+            unsafe { winapi_raw::GetLastError() }
+        );
+    }
+}
+
 /// 注册为 LocalSystem 自启服务（需管理员权限）
 pub fn install() -> Result<(), Box<dyn std::error::Error>> {
+    // 幂等检测：服务已存在时给出明确指引（重装走 uninstall，更新走 update），
+    // 避免 create_service 报笼统的 IO error 让人无从下手。
+    if let Ok(m) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) {
+        if let Ok(svc) = m.open_service(common::SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+            let st = svc.query_status().ok();
+            let state = st
+                .map(|s| format!("{:?}", s.current_state))
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(format!(
+                "服务 {} 已存在（状态: {state}）。重装请先 `ai-root uninstall`；仅更新二进制请用 `ai-root update <新exe>`。",
+                common::SERVICE_NAME
+            )
+            .into());
+        }
+    }
+
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
     let src_exe = std::env::current_exe()?;
     // 部署全局副本并写入包装器（服务指向部署副本，便于后续统一升级）
@@ -67,7 +117,10 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         dependencies: vec![],
     };
 
-    let _service = manager.create_service(&info, ServiceAccess::ALL_ACCESS)?;
+    let service = manager.create_service(&info, ServiceAccess::ALL_ACCESS)?;
+
+    // 配置 SCM 失败恢复策略（异常终止自动重启，防 7034 后中继长时间不可用）
+    configure_failure_actions(&service);
 
     // 给当前用户 SID 追加服务 STOP/START 权限：智能体进程（用户身份）此后可自主
     // stop/start/更新服务，无需每次手动管理员授权（Windows 服务安全描述符标准机制）。

@@ -38,6 +38,9 @@ pub const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 
 /// ConnectNamedPipe 在客户端已抢先连接时返回此错误码（视为已连接）
 pub const ERROR_PIPE_CONNECTED: u32 = 535;
+/// CreateFileW 连接命名管道时，所有实例均忙（服务端尚未 accept）返回此错误码。
+/// 客户端标准做法：WaitNamedPipeW 等待实例就绪后重试。
+pub const ERROR_PIPE_BUSY: u32 = 231;
 
 // ---- 同步对象等待 ----
 pub const INFINITE: u32 = 0xFFFF_FFFF;
@@ -53,6 +56,47 @@ pub const SC_MANAGER_CONNECT: u32 = 0x0001;
 pub const SERVICE_ALL_ACCESS: u32 = 0x000F_01FF;
 /// SetServiceObjectSecurity 的 SECURITY_INFORMATION：只改 DACL（保留所有者的默认 ACL）
 pub const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+
+// ---- 进程身份（审计：记录管道调用者）----
+/// OpenProcess 的受限查询权限（无需管理员即可查询进程身份/路径）
+pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+/// OpenProcessToken 的查询权限
+pub const TOKEN_QUERY: u32 = 0x0008;
+/// GetTokenInformation 的 TokenUser 类（取进程主 SID）
+pub const TOKEN_USER: u32 = 1;
+
+/// TOKEN_USER 结构（GetTokenInformation 输出，仅取 User.Sid）
+#[repr(C)]
+pub struct TOKEN_USER {
+    pub User: SID_AND_ATTRIBUTES,
+}
+
+#[repr(C)]
+pub struct SID_AND_ATTRIBUTES {
+    pub Sid: *mut c_void,
+    pub Attributes: u32,
+}
+
+// ---- SCM 失败恢复策略（ChangeServiceConfig2W）----
+/// dwInfoLevel：SERVICE_CONFIG_FAILURE_ACTIONS
+pub const SERVICE_CONFIG_FAILURE_ACTIONS: u32 = 2;
+/// SC_ACTION.Type：重新启动服务
+pub const SC_ACTION_RESTART: u32 = 1;
+
+#[repr(C)]
+pub struct SC_ACTION {
+    pub Type: u32,
+    pub Delay: u32,
+}
+
+#[repr(C)]
+pub struct SERVICE_FAILURE_ACTIONS {
+    pub dwResetPeriod: u32,
+    pub lpRebootMsg: PCWSTR,
+    pub lpCommand: PCWSTR,
+    pub cActions: u32,
+    pub lpsaActions: *mut SC_ACTION,
+}
 
 extern "system" {
     pub fn CreateNamedPipeW(
@@ -79,6 +123,9 @@ extern "system" {
     ) -> HANDLE;
 
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
+    /// 等待命名管道实例可用（客户端在 CreateFileW 遇 ERROR_PIPE_BUSY 时调用）。
+    /// nTimeOut=0 表示永久等待；返回 0 表示超时或管道已消失。
+    pub fn WaitNamedPipeW(lpNamedPipeName: PCWSTR, nTimeOut: u32) -> BOOL;
 
     /// 取消指定句柄上所有进行中的 I/O（用于在不关闭管道句柄的前提下，
     /// 中断阻塞中的 ConnectNamedPipe，避免监控线程 CloseHandle 引发 use-after-free）。
@@ -140,4 +187,38 @@ extern "system" {
         lpWideCharStr: *mut u16,
         cchWideChar: i32,
     ) -> i32;
+
+    // ---- 进程身份（审计）----
+    /// 获取命名管道客户端的进程 ID（服务端审计"谁在调用"）
+    pub fn GetNamedPipeClientProcessId(Pipe: HANDLE, ClientProcessId: *mut u32) -> BOOL;
+
+    pub fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: BOOL, dwProcessId: u32) -> HANDLE;
+
+    pub fn OpenProcessToken(
+        ProcessHandle: HANDLE,
+        DesiredAccess: u32,
+        TokenHandle: *mut HANDLE,
+    ) -> BOOL;
+
+    pub fn GetTokenInformation(
+        TokenHandle: HANDLE,
+        TokenInformationClass: u32,
+        TokenInformation: *mut c_void,
+        TokenInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> BOOL;
+
+    /// SID -> 账户名（domain\user），用于把客户端进程主 SID 转成可读用户名
+    pub fn LookupAccountSidW(
+        lpSystemName: PCWSTR,
+        Sid: *const c_void,
+        Name: *mut u16,
+        cchName: *mut u32,
+        ReferencedDomainName: *mut u16,
+        cchReferencedDomainName: *mut u32,
+        peUse: *mut u32,
+    ) -> BOOL;
+
+    /// 配置服务失败恢复策略（SCM Recovery Actions，防异常终止后不重启）
+    pub fn ChangeServiceConfig2W(hService: HANDLE, dwInfoLevel: u32, lpInfo: *const c_void) -> BOOL;
 }

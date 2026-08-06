@@ -176,7 +176,7 @@ fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
         decode_output(&buf)
     });
 
-    // 轮询退出状态，超时则杀进程
+    // 轮询退出状态，超时则杀进程树
     let start = Instant::now();
     let mut timed_out = false;
     let status = loop {
@@ -184,7 +184,12 @@ fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
             Ok(Some(s)) => break s,
             Ok(None) => {
                 if start.elapsed().as_millis() as u64 >= timeout_ms {
-                    let _ = child.kill();
+                    // 杀整棵进程树：child.kill() 只杀 cmd 外壳，其子进程（ping 等）会残留
+                    // 至自然结束（实测 2s 超时要 5s 才返回）。taskkill /T 递归终止全部后代。
+                    let pid = child.id();
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .output();
                     timed_out = true;
                     match child.wait() {
                         Ok(s) => break s,

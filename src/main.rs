@@ -39,6 +39,19 @@ fn main() {
             service::grant_acl().map_err(|e| e.to_string())
         }
         "uninstall" => service::uninstall().map_err(|e| e.to_string()),
+        "rotate-token" => {
+            // 轮换共享令牌：生成新令牌写盘，服务端下一请求自动热加载（无需重启）。
+            // 需对 token.txt 有写权限（管理员/SYSTEM）；输出仅打印一次，勿写入日志。
+            match common::rotate_token() {
+                Ok(tok) => {
+                    println!("✓ 令牌已轮换（服务端自动热加载，旧令牌立即失效）");
+                    println!("新令牌: {tok}");
+                    println!("[安全] 令牌等同 SYSTEM 凭据，请妥善传递，勿写入日志/提交仓库");
+                    Ok(())
+                }
+                Err(e) => Err(format!("令牌轮换失败: {e}")),
+            }
+        }
         "start" => service::start_svc().map_err(|e| e.to_string()),
         "stop" => service::stop_svc().map_err(|e| e.to_string()),
         "update" => {
@@ -64,6 +77,9 @@ fn main() {
         "--test-pipe-server" => {
             // [内部测试] 以服务模式逻辑常驻，10 秒后自动触发 stop，用于本地复现/验证
             // 7034 竞态修复（CancelIoEx 替代 CloseHandle）。非提权亦可运行，便于无 SCM 下验证。
+            // 注意：此路径不走 service_run()，不会自动创建 enabled.flag → 显式默认启用，
+            // 否则新数据目录下 is_enabled()=false，所有请求返回「中继已禁用」。
+            common::set_enabled(true);
             let stop_event = unsafe { winapi_raw::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
             let ev = stop_event as usize;
             thread::spawn(move || {
@@ -100,7 +116,7 @@ fn main() {
 }
 
 /// 客户端执行：连接管道、鉴权、打印结果、传播退出码
-fn client_run(command: &str) {
+fn client_run(command: &str, timeout_ms: u64) {
     let token = match common::read_token() {
         Some(t) => t,
         None => {
@@ -121,7 +137,7 @@ fn client_run(command: &str) {
         token,
         command: command.to_string(),
         cwd: None,
-        timeout_ms: Some(60000),
+        timeout_ms: Some(timeout_ms),
     };
     let bytes = match serde_json::to_vec(&req) {
         Ok(b) => b,
@@ -171,6 +187,7 @@ fn client_run(command: &str) {
 ///   ai-root run "单行命令"
 ///   ai-root run --file <脚本路径>   读取脚本文件（多行）
 ///   ai-root run --stdin            从标准输入读取脚本（多行）
+///   ai-root run --timeout <毫秒>   覆盖默认 60s 超时
 ///
 /// 含换行符的内容会被服务端识别为「脚本模式」，此时 `&`/`&&`/`|`/`()` 恢复 cmd 正常语义，
 /// 这是 AI 批量自治多命令时的推荐路径。
@@ -178,6 +195,7 @@ fn parse_and_run(args: &[String]) -> Result<(), String> {
     use std::io::Read;
     let mut file_path: Option<String> = None;
     let mut stdin_mode = false;
+    let mut timeout_ms: u64 = 60_000;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -192,6 +210,15 @@ fn parse_and_run(args: &[String]) -> Result<(), String> {
             }
             "--stdin" | "-" => {
                 stdin_mode = true;
+            }
+            "--timeout" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("缺少 --timeout 参数值".to_string());
+                }
+                timeout_ms = args[i]
+                    .parse::<u64>()
+                    .map_err(|_| format!("--timeout 参数无效: {}", args[i]))?;
             }
             other => positional.push(other.to_string()),
         }
@@ -210,7 +237,7 @@ fn parse_and_run(args: &[String]) -> Result<(), String> {
         positional.join(" ")
     };
 
-    client_run(&command);
+    client_run(&command, timeout_ms);
     Ok(())
 }
 
@@ -223,6 +250,7 @@ AI-root v1.0.0 —— LocalSystem 提权命令中继
   ai-root install      注册为 LocalSystem 自启服务（需管理员，首次一次性）
   ai-root grant        对已存在服务补发用户 STOP/START 授权（需管理员）
   ai-root uninstall    卸载服务（需管理员）
+  ai-root rotate-token 轮换共享令牌（服务端自动热加载，旧令牌立即失效）
   ai-root start        启动服务（install 授权后非提权即可）
   ai-root stop         停止服务（install 授权后非提权即可）
   ai-root update <exe> 自主更新服务二进制（停服务→覆盖→启服务，无需管理员）
@@ -231,6 +259,7 @@ AI-root v1.0.0 —— LocalSystem 提权命令中继
   ai-root run <命令>             连接管道并执行命令（非提权即可）
   ai-root run --file <脚本>      以脚本模式执行多行命令（&/&& 正常）
   ai-root run --stdin            从标准输入读取脚本执行
+  ai-root run --timeout <毫秒>   覆盖默认 60s 超时
   ai-root gui          打开 GUI 控制面板
   ai-root --service    [内部] SCM 派发入口
 
@@ -239,7 +268,9 @@ AI-root v1.0.0 —— LocalSystem 提权命令中继
   ai-root run "pnputil /enum-devices"
   ai-root run --file C:\tmp\batch.cmd           # 多行脚本，&/&&/| 均正常
   echo 命令行 & pnputil /enum-devices | ai-root run --stdin
+  ai-root run --timeout 5000 "ping -n 10 127.0.0.1"   # 5 秒超时杀进程树
   ai-root update D:\wbrelay_target\...\ai-root.exe   # AI 自主更新（零 UAC）
+  ai-root rotate-token                             # 轮换令牌（SYSTEM 凭据，勿入日志）
 "#
     );
 }

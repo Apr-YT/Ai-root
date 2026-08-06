@@ -47,14 +47,18 @@ powershell -ExecutionPolicy Bypass -File deploy.ps1
 安装后服务自启。常用管理命令：
 
 ```text
-ai-root install     # 注册为 LocalSystem 自启服务（管理员，仅首次）
+ai-root install     # 注册为 LocalSystem 自启服务（管理员，仅首次；已存在时给出指引）
 ai-root uninstall   # 卸载服务（管理员）
+ai-root rotate-token  # 轮换共享令牌（写盘后服务端自动热加载，旧令牌立即失效）
 ai-root start       # 启动服务（install 授权后非提权即可）
 ai-root stop        # 停止服务（install 授权后非提权即可）
 ai-root update <新exe路径>  # 自主更新服务二进制：停服务→覆盖→启服务（无需管理员）
 ai-root status      # 查询服务状态
 ai-root gui         # 原生 GUI 控制面板（人工巡检用）
 ```
+
+> **失败自动重启**：`install` 会配置 SCM Recovery Actions（异常终止后 60s/300s/600s 依次自动重启），
+> 即使进程被意外杀死（7034）也会在 1 分钟内自愈，AI 无人值守不受影响。
 
 ---
 
@@ -73,6 +77,9 @@ ai-root gui         # 原生 GUI 控制面板（人工巡检用）
 ```text
 # 单行命令（默认，非提权即可）
 ai-root run "whoami"
+
+# 覆盖默认 60s 超时（超时后整棵进程树被杀）
+ai-root run --timeout 5000 "ping -n 10 127.0.0.1"
 
 # 多行脚本（文件）：&/&&/|/() 全部正常，推荐用于批量自治
 ai-root run --file C:\tmp\batch.cmd
@@ -108,7 +115,7 @@ type C:\tmp\batch.cmd | ai-root run --stdin
   "token": "<32字节十六进制令牌>",
   "command": "<命令或脚本文本，含 \\n 即脚本模式>",
   "cwd": "<可选工作目录>",
-  "timeout_ms": 60000          // 可选，默认 60000
+  "timeout_ms": 60000          // 可选，默认 60000；超时后服务端 taskkill /T 杀整棵进程树
 }
 
 // 服务端 -> 客户端：Response
@@ -143,6 +150,8 @@ type C:\tmp\batch.cmd | ai-root run --stdin
 ## 4. 安全模型
 
 - 令牌仅安装时生成一次；目录 ACL `SYSTEM(F) + 当前用户(R)`，其余账户不可访问。
+- **令牌轮换**：`ai-root rotate-token`（管理员/SYSTEM）生成新令牌写盘，服务端按文件 mtime 变化**自动热加载**（无需重启），旧令牌立即失效。泄露后的标准处置流程：rotate → 更新 AI 侧令牌引用。
+- **审计日志**：`C:\ProgramData\ai-root\exec.log` 逐行记录 `[时间] caller=DOMAIN\user pid=xxx exit=code cmd=...`。`caller` 来自服务端 `GetNamedPipeClientProcessId` 解析的**管道对端进程身份**（非服务自身环境变量），可精确追溯"谁在什么进程里执行了什么"。
 - 管道 SDDL 追加安装用户 SID，使以该用户身份运行的智能体（可能非交互登录）也能稳定连接。
 - 服务 DACL 在 install 时追加安装用户 SID 的 `GRGX`（GENERIC_READ|GENERIC_EXECUTE，含 QUERY_STATUS/START/STOP）——仅授权 status/stop/start/update 自身服务，不授予 CHANGE_CONFIG/WRITE_DAC 等管理权限、不涉及其他服务或系统级权限。
 - 受「启用开关」约束（`C:\ProgramData\ai-root\enabled.flag` 存在即启用），删除即禁用中继（服务端拒绝一切命令，`ok=false, error="中继已禁用"`）。
@@ -160,11 +169,27 @@ type C:\tmp\batch.cmd | ai-root run --stdin
 
 ---
 
-## 6. 构建
+## 6. 构建与测试
+
+```powershell
+# 一键构建（已固定 rustup 真实 toolchain，规避本机代理二进制坑，见 build.ps1 注释）
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
+```
+
+等价手动命令（需注意本机 PATH 里的 `D:\Kiln\rust\cargo\bin` 是代理二进制，cargo spawn rustc 会报 `os error 193`）：
 
 ```bash
 export CARGO_TARGET_DIR=D:/wbrelay_target
-cargo build --release --target x86_64-pc-windows-msvc
+"C:/Users/AprYT/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe" build --release --target x86_64-pc-windows-msvc
 ```
+
+集成测试（spawn `--test-pipe-server` + `AIROOT_DATA_DIR` 隔离，不触碰生产数据）：
+
+```bash
+export CARGO_TARGET_DIR=D:/wbrelay_target
+"C:/Users/AprYT/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe" test --release
+```
+
+覆盖：鉴权（错误/正确令牌）、脚本模式与单行转义、退出码传播、超时杀进程树、200KB 大输出、cwd、**令牌轮换热加载**、启用开关、CLI `--timeout`/`--stdin`、10 并发。
 
 依赖：`serde` / `serde_json` / `rand` / `chrono` / `eframe`+`egui`（GUI）。

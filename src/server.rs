@@ -46,7 +46,7 @@ fn create_pipe() -> io::Result<winapi_raw::HANDLE> {
         bInheritHandle: 0,
     };
 
-    let name_w = common::to_wide(common::PIPE_NAME);
+    let name_w = common::to_wide(&common::pipe_name());
     let handle = unsafe {
         winapi_raw::CreateNamedPipeW(
             name_w.as_ptr(),
@@ -93,9 +93,89 @@ fn accept_one() -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
 }
 
+/// 获取管道对端进程身份：GetNamedPipeClientProcessId → OpenProcess → TokenUser → LookupAccountSid。
+/// 返回 (domain\user, pid)。任一步失败降级返回仅 PID 或 None（不影响执行，仅日志降级）。
+fn client_identity(file: &File) -> Option<(String, u32)> {
+    use core::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    let handle = file.as_raw_handle() as winapi_raw::HANDLE;
+    let mut pid: u32 = 0;
+    if unsafe { winapi_raw::GetNamedPipeClientProcessId(handle, &mut pid) } == 0 || pid == 0 {
+        return None;
+    }
+
+    let proc = unsafe {
+        winapi_raw::OpenProcess(winapi_raw::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+    };
+    if proc.is_null() {
+        return Some((format!("pid={pid}"), pid));
+    }
+    let mut token: winapi_raw::HANDLE = std::ptr::null_mut();
+    let tok_ok = unsafe { winapi_raw::OpenProcessToken(proc, winapi_raw::TOKEN_QUERY, &mut token) };
+    unsafe { winapi_raw::CloseHandle(proc); }
+    if tok_ok == 0 || token.is_null() {
+        return Some((format!("pid={pid}"), pid));
+    }
+
+    // 先查 TokenUser 所需缓冲大小（期望 ERROR_INSUFFICIENT_BUFFER + need）
+    let mut need: u32 = 0;
+    unsafe {
+        winapi_raw::GetTokenInformation(token, winapi_raw::TOKEN_USER, std::ptr::null_mut(), 0, &mut need);
+    }
+    let mut buf = vec![0u8; need.max(1) as usize];
+    let got = unsafe {
+        winapi_raw::GetTokenInformation(
+            token,
+            winapi_raw::TOKEN_USER,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            &mut need,
+        )
+    };
+    unsafe { winapi_raw::CloseHandle(token); }
+    if got == 0 {
+        return Some((format!("pid={pid}"), pid));
+    }
+
+    let tu = unsafe { &*(buf.as_ptr() as *const winapi_raw::TOKEN_USER) };
+    let sid = tu.User.Sid;
+    if sid.is_null() {
+        return Some((format!("pid={pid}"), pid));
+    }
+
+    let mut name = [0u16; 256];
+    let mut domain = [0u16; 256];
+    let mut name_len = name.len() as u32;
+    let mut domain_len = domain.len() as u32;
+    let mut use_: u32 = 0;
+    let lok = unsafe {
+        winapi_raw::LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut use_,
+        )
+    };
+    if lok == 0 {
+        return Some((format!("pid={pid}"), pid));
+    }
+    let user = String::from_utf16_lossy(&name[..name_len as usize]);
+    let dom = String::from_utf16_lossy(&domain[..domain_len as usize]);
+    Some((format!("{dom}\\{user}"), pid))
+}
+
 /// 处理单个客户端：读请求 -> 鉴权 -> 执行 -> 回写
 fn handle_client(mut file: File) {
     let token = common::cached_token();
+    // 审计：先解析管道对端调用者身份（PID + 用户名），供日志记录；失败降级为 pid 或 unknown
+    let (caller, caller_pid) = match client_identity(&file) {
+        Some((u, p)) => (u, p),
+        None => ("unknown".to_string(), 0),
+    };
 
     let frame = match protocol::read_frame(&mut file) {
         Ok(f) => f,
@@ -153,8 +233,8 @@ fn handle_client(mut file: File) {
         let _ = protocol::write_frame(&mut file, &bytes);
     }
 
-    // 落盘执行日志（仅记录命令与退出码，不记输出）
-    common::log_exec(&req.command, r.exit_code);
+    // 落盘执行日志（记录调用者身份、命令与退出码，不记输出）
+    common::log_exec(&caller, caller_pid, &req.command, r.exit_code);
 }
 
 /// 前台（测试）模式：持续接受连接，直到进程被终止
@@ -162,7 +242,7 @@ pub fn run_pipe_server_forever() {
     let tok = common::read_or_create_token();
     common::cache_token(tok);
     common::set_enabled(true); // 前台模式默认启用
-    println!("[ai-root] 前台管道服务已启动: {}", common::PIPE_NAME);
+    println!("[ai-root] 前台管道服务已启动: {}", common::pipe_name());
     loop {
         match accept_one() {
             Ok(file) => {
@@ -234,7 +314,8 @@ pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
 
         let handle = match create_pipe() {
             Ok(h) => h,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("[ai-root] create_pipe 错误: {e}");
                 thread::sleep(Duration::from_millis(300));
                 continue;
             }

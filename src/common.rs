@@ -9,16 +9,34 @@
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// 命名管道名称（Windows 格式：\\.\pipe\ai-root）
 pub const PIPE_NAME: &str = "\\\\.\\pipe\\ai-root";
 
+/// 实际使用的管道名：默认 PIPE_NAME；可用 AIROOT_PIPE_NAME 环境变量覆盖
+/// （集成测试隔离用，避免与生产服务争用同名管道导致串扰）。
+pub fn pipe_name() -> String {
+    if let Ok(n) = std::env::var("AIROOT_PIPE_NAME") {
+        if !n.trim().is_empty() {
+            return n;
+        }
+    }
+    PIPE_NAME.to_string()
+}
+
+
 /// 服务名（需与 service_dispatcher 注册名一致）
 pub const SERVICE_NAME: &str = "ai-root";
 
-/// 数据目录：C:\ProgramData\ai-root
+/// 数据目录：默认 C:\ProgramData\ai-root；可用 AIROOT_DATA_DIR 环境变量覆盖（集成测试隔离用）
 pub fn data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("AIROOT_DATA_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
     PathBuf::from(base).join("ai-root")
 }
@@ -36,8 +54,10 @@ pub fn enabled_flag_path() -> PathBuf {
     data_dir().join("enabled.flag")
 }
 
-/// 进程内令牌缓存（服务启动时填充）
-static TOKEN: OnceLock<String> = OnceLock::new();
+/// 进程内令牌缓存：懒加载 + 每次请求比对 token.txt 的 mtime，文件变化即重读。
+/// 这样 `ai-root rotate-token`（管理员写盘）后，服务端无需重启即可热加载新令牌。
+/// 键为 `(文件mtime, 令牌)`；mtime 读取失败时视为 None（每次请求都重读，兜底正确性）。
+static TOKEN_CACHE: Mutex<Option<(Option<SystemTime>, String)>> = Mutex::new(None);
 
 /// 将 Rust 字符串转为 UTF-16 宽字符串（含结尾 0）
 pub fn to_wide(s: &str) -> Vec<u16> {
@@ -156,14 +176,46 @@ pub fn read_or_create_token() -> String {
     ensure_token().unwrap_or_default()
 }
 
-/// 填充进程内令牌缓存
+/// 填充进程内令牌缓存（兼容旧调用；服务启动时调用，缓存 mtime 与文件一致）
 pub fn cache_token(tok: String) {
-    let _ = TOKEN.set(tok);
+    let mtime = std::fs::metadata(token_path()).and_then(|m| m.modified()).ok();
+    if let Ok(mut c) = TOKEN_CACHE.lock() {
+        *c = Some((mtime, tok));
+    }
 }
 
-/// 取进程内令牌（客户端鉴权比对用）
+/// 取进程内令牌（客户端鉴权比对用）。
+/// 每次请求比对 token.txt 的 mtime：`rotate-token` 写盘后自动重读新值 → 服务端热加载。
 pub fn cached_token() -> String {
-    TOKEN.get().cloned().unwrap_or_default()
+    let tp = token_path();
+    let mtime = std::fs::metadata(&tp).and_then(|m| m.modified()).ok();
+    if let Ok(mut cache) = TOKEN_CACHE.lock() {
+        if let Some((t, tok)) = cache.as_ref() {
+            if *t == mtime {
+                return tok.clone();
+            }
+        }
+        let tok = std::fs::read_to_string(&tp).unwrap_or_default().trim().to_string();
+        *cache = Some((mtime, tok.clone()));
+        tok
+    } else {
+        // 缓存锁不可用（poison）：直接读文件，兜底正确性
+        std::fs::read_to_string(&tp).unwrap_or_default().trim().to_string()
+    }
+}
+
+/// 轮换令牌：生成新随机令牌写盘并失效进程缓存，服务端下一请求自动加载新值，旧令牌立即失效。
+/// 需对 token.txt 有写权限（SYSTEM / 管理员 / 安装用户）；调用方应妥善传递新令牌（勿入日志）。
+pub fn rotate_token() -> io::Result<String> {
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let tok = gen_token();
+    std::fs::write(token_path(), &tok)?;
+    set_dir_acl(&dir);
+    if let Ok(mut c) = TOKEN_CACHE.lock() {
+        *c = None; // 失效缓存，下一次 cached_token() 按新 mtime 重读
+    }
+    Ok(tok)
 }
 
 /// 是否启用（启用标志文件存在即启用，缺省启用）
@@ -188,10 +240,17 @@ pub fn now_str() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// 追加一行执行日志：时间 | 用户 | 命令 | 退出码
-pub fn log_exec(command: &str, exit_code: i32) {
-    let user = std::env::var("USERNAME").unwrap_or_else(|_| "unknown".into());
-    let line = format!("[{}] user={} exit={} cmd={}\n", now_str(), user, exit_code, command);
+/// 追加一行执行日志：时间 | 调用者(domain\user) | 客户端PID | 命令 | 退出码
+/// 调用者身份来自管道对端进程（GetNamedPipeClientProcessId 审计），非服务自身环境变量。
+pub fn log_exec(caller: &str, pid: u32, command: &str, exit_code: i32) {
+    let line = format!(
+        "[{}] caller={} pid={} exit={} cmd={}\n",
+        now_str(),
+        caller,
+        pid,
+        exit_code,
+        command
+    );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

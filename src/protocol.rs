@@ -59,29 +59,53 @@ pub fn write_frame(file: &mut File, data: &[u8]) -> io::Result<()> {
 }
 
 /// 客户端：连接到命名管道，返回包装后的 File 句柄
+///
+/// 服务端（run_pipe_server）单线程 accept，同一时刻只阻塞等待一个实例；
+/// 多个客户端并发连接时，CreateFileW 会撞 ERROR_PIPE_BUSY(231)。
+/// 标准处理：WaitNamedPipeW 等待实例就绪后重试（最多约 3s），
+/// 保证 AI 并发调用 `run` 时不会偶发「连接失败」。
 pub fn connect_client() -> io::Result<File> {
     use std::os::windows::io::{FromRawHandle, RawHandle};
+    use std::time::Duration;
 
-    let name = common::to_wide(common::PIPE_NAME);
-    let handle = unsafe {
-        winapi_raw::CreateFileW(
-            name.as_ptr(),
-            winapi_raw::GENERIC_READ | winapi_raw::GENERIC_WRITE,
-            winapi_raw::FILE_SHARE_READ | winapi_raw::FILE_SHARE_WRITE,
-            std::ptr::null(),
-            winapi_raw::OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == winapi_raw::INVALID_HANDLE_VALUE {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "无法连接管道，中继服务是否运行？",
-        ));
+    let name = common::to_wide(&common::pipe_name());
+    for attempt in 0..6 {
+        let handle = unsafe {
+            winapi_raw::CreateFileW(
+                name.as_ptr(),
+                winapi_raw::GENERIC_READ | winapi_raw::GENERIC_WRITE,
+                winapi_raw::FILE_SHARE_READ | winapi_raw::FILE_SHARE_WRITE,
+                std::ptr::null(),
+                winapi_raw::OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != winapi_raw::INVALID_HANDLE_VALUE {
+            // 将原生 HANDLE 封装为 Rust File（所有权转移，Drop 时自动 close）
+            return Ok(unsafe { File::from_raw_handle(handle as RawHandle) });
+        }
+        let err = unsafe { winapi_raw::GetLastError() };
+        if err != winapi_raw::ERROR_PIPE_BUSY {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("无法连接管道（last_err={err}），中继服务是否运行？"),
+            ));
+        }
+        // 等待服务端创建可用实例；管道已消失则快速失败
+        let waited = unsafe { winapi_raw::WaitNamedPipeW(name.as_ptr(), 500) };
+        if waited == 0 && attempt >= 5 {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "连接管道超时（持续忙），中继服务是否运行？",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    // 将原生 HANDLE 封装为 Rust File（所有权转移，Drop 时自动 close）
-    Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+    Err(io::Error::new(
+        io::ErrorKind::ConnectionRefused,
+        "无法连接管道，中继服务是否运行？",
+    ))
 }
 
 /// 构造标准错误响应
