@@ -43,12 +43,12 @@ extern "system" {
     fn WaitNamedPipeW(lpNamedPipeName: *const u16, nTimeOut: u32) -> i32;
 }
 
-/// 连接命名管道并返回句柄；遇 ERROR_PIPE_BUSY 时按标准流程 WaitNamedPipeW 等待实例就绪后重试。
-/// 连接失败返回 null（由调用方决定是否视为「未就绪」）。
+/// 连接命名管道并返回句柄；遇 ERROR_PIPE_BUSY 时按标准流程 WaitNamedPipeW 等待实例就绪后重试，
+/// 非 busy 的瞬态错误（如服务端实例创建间隙）也短退避重试。连接失败返回 null（由调用方决定）。
 unsafe fn connect_pipe_raw() -> *mut core::ffi::c_void {
     let pipe_name = std::env::var("AIROOT_PIPE_NAME").unwrap_or_else(|_| r"\\.\pipe\ai-root".into());
     let name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
-    for _ in 0..5 {
+    for _ in 0..20 {
         let h = CreateFileW(
             name.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
@@ -61,10 +61,13 @@ unsafe fn connect_pipe_raw() -> *mut core::ffi::c_void {
         if !h.is_null() && h != usize::MAX as *mut _ {
             return h;
         }
-        if GetLastError() != ERROR_PIPE_BUSY {
-            return std::ptr::null_mut();
+        let err = GetLastError();
+        if err != ERROR_PIPE_BUSY {
+            // 瞬态非 busy 错误：短退避后继续（服务端单线程 accept 的创建间隙）
+            std::thread::sleep(Duration::from_millis(30));
+            continue;
         }
-        WaitNamedPipeW(name.as_ptr(), 500);
+        WaitNamedPipeW(name.as_ptr(), 300);
     }
     std::ptr::null_mut()
 }

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # 构建/测试产物统一放 runner 临时目录, 不污染 checkout
+  CARGO_TARGET_DIR: ${{ runner.temp }}\ai-root-target
+
+jobs:
+  build-test:
+    name: Build & Test (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable / x86_64-pc-windows-msvc)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+
+      - name: Build (release)
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Integration tests (9 cases, isolated via AIROOT_*)
+        shell: pwsh
+        run: cargo test --release --target x86_64-pc-windows-msvc
