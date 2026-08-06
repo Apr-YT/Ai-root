@@ -1166,19 +1166,23 @@ impl WbRelayApp {
 
     /// Tab 3 · 审计日志：关键字 + PID 精确过滤 + 着色条
     fn render_log_tab(&mut self, ui: &mut egui::Ui) {
+        // 显式 id：清空过滤时据此重置 TextEditState（有焦点时外部字符串变更不会自动同步）
+        let filter_id = egui::Id::new("log_filter_input");
+        let pid_input_id = egui::Id::new("log_pid_input");
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("命令日志").strong());
             ui.add(
                 egui::TextEdit::singleline(&mut self.log_filter)
+                    .id(filter_id)
                     .hint_text("过滤关键字…")
                     .desired_width(160.0),
             );
             ui.add(
                 egui::TextEdit::singleline(&mut self.log_pid)
+                    .id(pid_input_id)
                     .hint_text("PID 精确匹配…")
                     .desired_width(110.0),
             );
-            ui.label(format!("{} 行", self.log.lines().count()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("刷新日志").clicked() {
                     self.refresh();
@@ -1190,18 +1194,26 @@ impl WbRelayApp {
                 {
                     self.log_filter.clear();
                     self.log_pid.clear();
+                    // 手动清掉两个输入框的 TextEditState：否则聚焦中的输入框
+                    // 不会用外部空字符串刷新显示（egui 已知行为），看起来像「没清掉」
+                    let ctx = ui.ctx().clone();
+                    ctx.data_mut(|d| {
+                        d.remove::<egui::text_edit::TextEditState>(filter_id);
+                        d.remove::<egui::text_edit::TextEditState>(pid_input_id);
+                    });
+                    ctx.request_repaint();
                 }
             });
         });
         ui.add_space(4.0);
         let avail_h = (ui.available_height() - 8.0).max(100.0);
+        let mut shown = 0usize;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .max_height(avail_h)
             .show(ui, |ui| {
                 ui.style_mut().spacing.item_spacing.y = 2.0;
-                let mut shown = 0;
                 for line in self.log.lines() {
                     if !self.log_matches(line) {
                         continue;
@@ -1243,6 +1255,15 @@ impl WbRelayApp {
                     );
                 }
             });
+        // 显示「过滤后行数 / 总行数」（替换原总行数——清空过滤后总行数不变会造成「没清掉」错觉）
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("显示 {shown} / 共 {} 行", self.log.lines().count()))
+                    .small()
+                    .color(C_TEXT_DIM),
+            );
+        });
         ui.add_space(4.0);
     }
 }
