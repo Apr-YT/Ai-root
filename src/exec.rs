@@ -64,17 +64,57 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
     run_child(builder, timeout_ms)
 }
 
-/// 脚本模式：将多行命令写入临时 `.cmd`（UTF-8），经「ASCII 包装脚本」以 `cmd /C <wrap>` 执行，不转义。
+/// 脚本模式：将多行命令以 `cmd /C` **直接传参**执行（首选，中文 100% 可靠），
+/// 仅对含括号块或超长脚本回退到文件方案。
 ///
-/// 双文件结构（已实测验证）：
+/// 首选方案（已实测，Python subprocess 验证）：
+/// 把多行命令用 ` & ` 连接成单行，经 CreateProcessW（UTF-16）直接交给 cmd——
+/// **不落盘、不读文件**。cmd 读 `.cmd` 文件时代码页继承父进程且不稳定（UTF-8/GBK
+/// 反复翻转，包装脚本 + chcp 也只能做到「大概率对」）是历史死结；而命令行以 UTF-16
+/// 传递，中文命令解析 100% 正确。输出编码由 `decode_output`（UTF-8 优先→GBK 回退）兜底。
+///
+/// 注意（脚本作者须知，README 已写明）：
+/// - `&`/`&&`/`|`/`()` 均为 cmd 正常语义（不转义）；同一行内 `set x=1 & echo %x%`
+///   的 `%x%` 在解析期展开为空，需写 `& call echo %x%`；
+/// - 含 `(`/`)` 的括号块（`if (...)` / `for ... do (...)`）无法拼接为单行，自动回退文件方案；
+/// - 拼接后长度超过 6000 字符回退文件方案（cmd 命令行上限 8191）。
+fn run_script(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
+    let norm = script.replace("\r\n", "\n");
+    let has_paren = norm.contains('(') || norm.contains(')');
+    let joined = norm
+        .split('\n')
+        .map(|l| l.trim_end())
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" & ");
+
+    if !has_paren && !joined.is_empty() && joined.len() <= 6000 {
+        let mut builder = Command::new("cmd");
+        // raw_arg 原样传参、不 escape_cmd_meta：脚本模式中 `&` 是命令分隔符（cmd 原生语义），
+        // 中文经 UTF-16 命令行传递无乱码
+        builder.raw_arg("/C").raw_arg(&joined);
+        builder.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(c) = cwd {
+            builder.current_dir(c);
+        }
+        return run_child(builder, timeout_ms);
+    }
+
+    // 回退：文件方案（括号块 / 超长脚本；中文可靠性与主路径不同，属尽力而为）
+    run_script_file(script, cwd, timeout_ms)
+}
+
+/// 文件方案（回退）：本体 UTF-8 写入临时 `.cmd`，经「ASCII 包装脚本」以 `cmd /C <wrap>` 执行。
+///
+/// 双文件结构（实测验证）：
 /// - 本体 `ai-root-<pid>-<n>.cmd`：脚本内容，UTF-8 + CRLF（见 `encode_script`）。
 /// - 包装 `ai-root-<pid>-<n>.wrap.cmd`：**纯 ASCII**，内容为
 ///   `@echo off` / `chcp 65001 >nul` / `call "<本体路径>"`。
 /// 原理：cmd 顶层批处理存在「预读缓冲」怪癖——`chcp` 生效前的行已按旧代码页读入，
 /// 导致 UTF-8 中文在某些行乱码；且 `cmd /C "chcp & call \"path\""` 单行形式会因
 /// `/C` 引号剥离把 `call` 参数拆坏（实测失败）。而包装脚本全 ASCII（顶层读取无中文问题），
-/// 本体在 `chcp 65001` 生效后经 `call` 才被读取 → UTF-8 中文必然正确解析，跨代码页稳定。
-fn run_script(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
+/// 本体在 `chcp 65001` 生效后经 `call` 才被读取 → UTF-8 中文在多数情况下可正确解析。
+fn run_script_file(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
