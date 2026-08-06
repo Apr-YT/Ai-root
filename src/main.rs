@@ -11,6 +11,11 @@
 //!   gui        打开原生 GUI 控制面板
 //!   --service  SCM 派发进入服务主循环（用户勿直接调用）
 
+// GUI 变体声明为 Windows GUI 子系统：双击启动时不弹黑色终端窗口。
+// headless（--no-default-features）保持 console 子系统，CLI 输出正常；
+// GUI 版的 CLI 输出可见性由 attach_parent_console()（AttachConsole）兜底。
+#![cfg_attr(feature = "gui", windows_subsystem = "windows")]
+
 mod common;
 mod exec;
 #[cfg(feature = "gui")]
