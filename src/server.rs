@@ -9,14 +9,59 @@
 use std::fs::File;
 use std::io;
 use std::os::windows::io::{FromRawHandle, RawHandle};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::common;
 use crate::exec;
 use crate::protocol::{self, Request, Response};
 use crate::winapi_raw;
+
+/// 鉴权失败节流：30s 窗口内最多失败 5 次，超出则拒绝所有请求 60s（防暴力尝试）。
+struct AuthThrottle {
+    window_start: Instant,
+    fail_count: u32,
+    locked_until: Option<Instant>,
+}
+
+impl AuthThrottle {
+    fn new() -> Self {
+        AuthThrottle {
+            window_start: Instant::now(),
+            fail_count: 0,
+            locked_until: None,
+        }
+    }
+    /// 记录一次失败；返回是否已触发锁定
+    fn record_fail(&mut self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.window_start) > Duration::from_secs(30) {
+            self.window_start = now;
+            self.fail_count = 0;
+        }
+        self.fail_count += 1;
+        if self.fail_count >= 5 {
+            self.locked_until = Some(now + Duration::from_secs(60));
+            return true;
+        }
+        false
+    }
+    /// 是否处于锁定态
+    fn is_locked(&self) -> bool {
+        match self.locked_until {
+            Some(t) if Instant::now() < t => true,
+            _ => false,
+        }
+    }
+}
+
+/// 全局鉴权节流器 + 并发信号量计数
+static AUTH_THROTTLE: Mutex<Option<AuthThrottle>> = Mutex::new(None);
+/// 当前在执行的连接数（并发上限 8，防失控 AI 线程轰炸拖垮 SYSTEM 服务）
+static ACTIVE_CONNS: AtomicU32 = AtomicU32::new(0);
+const MAX_CONNS: u32 = 8;
 
 /// 创建带安全描述符的命名管道实例，返回原生 HANDLE
 ///
@@ -168,16 +213,66 @@ fn client_identity(file: &File) -> Option<(String, u32)> {
     Some((format!("{dom}\\{user}"), pid))
 }
 
+/// 恒定时间字符串比较（防时序侧信道逐字符猜测令牌）。
+/// 逐字节 XOR 累加，任意位置差异都会使结果非零；长度差异视为不等。
+fn ct_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..ab.len() {
+        diff |= ab[i] ^ bb[i];
+    }
+    diff == 0
+}
+
 /// 处理单个客户端：读请求 -> 鉴权 -> 执行 -> 回写
 fn handle_client(mut file: File) {
+    // 并发信号量：超出上限直接拒绝（防线程轰炸）
+    if ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+        ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+        let _ = protocol::write_frame(
+            &mut file,
+            &serde_json::to_vec(&protocol::err_response("服务繁忙（并发超限），请稍后重试")).unwrap(),
+        );
+        return;
+    }
+    // 作用域结束自动释放并发计数
+    struct ConnGuard;
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let _guard = ConnGuard;
+
     let token = common::cached_token();
-    // 审计：先解析管道对端调用者身份（PID + 用户名），供日志记录；失败降级为 pid 或 unknown
+    // 审计：先解析管道对端调用者身份（PID + 用户名）
     let (caller, caller_pid) = match client_identity(&file) {
         Some((u, p)) => (u, p),
         None => ("unknown".to_string(), 0),
     };
 
-    let frame = match protocol::read_frame(&mut file) {
+    // 鉴权节流：锁定期间拒绝一切请求
+    {
+        let mut th = AUTH_THROTTLE.lock().unwrap_or_else(|e| e.into_inner());
+        if th.get_or_insert_with(AuthThrottle::new).is_locked() {
+            let _ = protocol::write_frame(
+                &mut file,
+                &serde_json::to_vec(&protocol::err_response(
+                    "鉴权失败次数过多，已临时锁定（60s），请稍后再试",
+                ))
+                .unwrap(),
+            );
+            common::log_exec(&caller, caller_pid, "<locked>", -403);
+            return;
+        }
+    }
+
+    // 读请求（带 10s 读超时，防客户端连接后不发数据导致线程泄漏）
+    let frame = match protocol::read_frame_timeout(&mut file, 10_000) {
         Ok(f) => f,
         Err(_) => return,
     };
@@ -192,13 +287,33 @@ fn handle_client(mut file: File) {
         }
     };
 
-    // 令牌鉴权
-    if req.token != token {
+    // 令牌鉴权（恒定时间比较）
+    if !ct_eq(&req.token, &token) {
+        // 记录失败 + 审计（暴力尝试必须可追溯）
+        let locked = {
+            let mut th = AUTH_THROTTLE.lock().unwrap_or_else(|e| e.into_inner());
+            th.get_or_insert_with(AuthThrottle::new).record_fail()
+        };
+        common::log_exec(&caller, caller_pid, &format!("<auth-fail cmd={}>", req.command), -401);
+        let msg = if locked {
+            "令牌鉴权失败（多次失败已锁定 60s）".to_string()
+        } else {
+            "令牌鉴权失败".to_string()
+        };
         let _ = protocol::write_frame(
             &mut file,
-            &serde_json::to_vec(&protocol::err_response("令牌鉴权失败")).unwrap(),
+            &serde_json::to_vec(&protocol::err_response(&msg)).unwrap(),
         );
         return;
+    }
+    // 鉴权成功后重置失败计数（防正常用户被历史失败误锁）
+    {
+        let mut th = AUTH_THROTTLE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = th.as_mut() {
+            if !t.is_locked() {
+                t.fail_count = 0;
+            }
+        }
     }
 
     // 启用开关
@@ -210,12 +325,23 @@ fn handle_client(mut file: File) {
         return;
     }
 
+    // 超时钳制：客户端可传超时，但上限 10 分钟（防持令牌客户端长期占用 SYSTEM 服务）
+    let timeout_ms = req.timeout_ms.unwrap_or(60_000).min(600_000);
+
+    // GUI 实时信息流：执行开始事件
+    common::log_event(serde_json::json!({
+        "ts": common::now_str(),
+        "type": "exec_start",
+        "caller": caller,
+        "pid": caller_pid,
+        "cmd": req.command,
+        "timeout_ms": timeout_ms,
+    }));
+
     // 执行
-    let r = exec::run_command(
-        &req.command,
-        req.cwd.as_deref(),
-        req.timeout_ms.unwrap_or(60000),
-    );
+    let start = std::time::Instant::now();
+    let r = exec::run_command(&req.command, req.cwd.as_deref(), timeout_ms);
+    let duration_ms = start.elapsed().as_millis() as u64;
 
     let resp = Response {
         ok: r.error.is_none() && !r.timed_out,
@@ -227,13 +353,29 @@ fn handle_client(mut file: File) {
         } else {
             r.error.clone()
         },
+        truncated: r.truncated,
     };
+
+    // GUI 实时信息流：执行完成事件
+    let out_preview: String = r.stdout.chars().take(200).collect();
+    common::log_event(serde_json::json!({
+        "ts": common::now_str(),
+        "type": "exec_done",
+        "caller": caller,
+        "pid": caller_pid,
+        "cmd": req.command,
+        "exit": r.exit_code,
+        "timed_out": r.timed_out,
+        "truncated": r.truncated,
+        "duration_ms": duration_ms,
+        "out_preview": out_preview,
+    }));
 
     if let Ok(bytes) = serde_json::to_vec(&resp) {
         let _ = protocol::write_frame(&mut file, &bytes);
     }
 
-    // 落盘执行日志（记录调用者身份、命令与退出码，不记输出）
+    // 落盘执行日志
     common::log_exec(&caller, caller_pid, &req.command, r.exit_code);
 }
 
@@ -287,6 +429,18 @@ fn dispatch_connection(handle: winapi_raw::HANDLE) {
 pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
     let tok = common::read_or_create_token();
     common::cache_token(tok);
+
+    // 重新固化目录 ACL（含 /inheritance:e），确保 SYSTEM 创建的事件文件可被 GUI 用户读取
+    let dir = common::data_dir();
+    std::fs::create_dir_all(&dir).ok();
+    common::set_dir_acl(&dir);
+
+    // 服务启动即写一条事件——确保 events.jsonl 按当前（含继承）DACL 被创建
+    common::log_event(serde_json::json!({
+        "ts": common::now_str(),
+        "type": "service_start",
+        "pipe": common::pipe_name(),
+    }));
 
     let stop_event_usize = stop_event as usize;
 

@@ -142,12 +142,40 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 卸载服务（需管理员权限）
+/// 卸载服务（需管理员权限）。删除服务 + 清理部署残留（令牌/部署目录/包装器/用户SID）。
+/// 令牌是 SYSTEM 凭据，卸载后必须清除，避免最高权限凭据残留盘上。
 pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(common::SERVICE_NAME, ServiceAccess::ALL_ACCESS)?;
     service.delete()?;
     println!("✓ 服务已卸载: {}", common::SERVICE_NAME);
+
+    // 清理部署残留（尽力而为，失败仅提示）
+    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-root");
+    if deploy_dir.exists() {
+        let _ = std::fs::remove_dir_all(deploy_dir);
+        println!("✓ 已清理部署目录: {}", deploy_dir.display());
+    }
+    let wrapper = std::path::Path::new("C:\\Windows\\ai-root.cmd");
+    if wrapper.exists() {
+        let _ = std::fs::remove_file(wrapper);
+        println!("✓ 已清理全局包装器: {}", wrapper.display());
+    }
+    // 令牌（SYSTEM 凭据）必须清除；数据目录保留日志供审计查阅
+    let tok = common::token_path();
+    if tok.exists() {
+        let _ = std::fs::remove_file(&tok);
+        println!("✓ 已清除令牌文件（SYSTEM 凭据不残留）");
+    }
+    let sid = common::user_sid_path();
+    if sid.exists() {
+        let _ = std::fs::remove_file(&sid);
+        println!("✓ 已清除安装用户 SID 记录");
+    }
+    println!(
+        "提示: 执行日志/事件流保留于 {}（如需彻底清除请手动删除目录）",
+        common::data_dir().display()
+    );
     Ok(())
 }
 
@@ -158,7 +186,15 @@ pub fn start_svc() -> Result<(), Box<dyn std::error::Error>> {
         ServiceAccess::START | ServiceAccess::QUERY_STATUS,
     )?;
     service.start::<OsString>(&[])?;
-    println!("✓ 服务已启动");
+    // 轮询等待 Running（最多 15s，防「报成功但未真正起来」）
+    for _ in 0..30 {
+        if service.query_status()?.current_state == ServiceState::Running {
+            println!("✓ 服务已启动");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    println!("✓ 启动指令已下发（服务状态: {:?}）", service.query_status()?.current_state);
     Ok(())
 }
 
@@ -259,11 +295,88 @@ pub fn grant_acl() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 校验文件是否为有效 PE 可执行文件（MZ 头 + PE 签名 + 机器码段）。
+/// update 前调用，防止把非可执行文件（损坏/纯数据）覆盖成 SYSTEM 服务。
+fn is_valid_pe(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 0x40];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    // DOS 头 MZ 签名
+    if &head[0..2] != b"MZ" {
+        return false;
+    }
+    // e_lfanew 偏移（0x3C 处 4 字节 LE）→ PE 签名
+    let pe_off = u32::from_le_bytes([head[0x3C], head[0x3D], head[0x3E], head[0x3F]]) as usize;
+    if pe_off > 0x1000 {
+        return false; // 异常偏移防御
+    }
+    let mut pe = [0u8; 0x18];
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    use std::io::Seek;
+    if f.seek(std::io::SeekFrom::Start(pe_off as u64)).is_err() {
+        return false;
+    }
+    if f.read_exact(&mut pe).is_err() {
+        return false;
+    }
+    // PE\0\0 签名 + Machine（0x8664=x64 / 0x014C=x86）
+    if &pe[0..4] != b"PE\0\0" {
+        return false;
+    }
+    let machine = u16::from_le_bytes([pe[4], pe[5]]);
+    matches!(machine, 0x8664 | 0x014C)
+}
+
+/// 计算文件 SHA-256（certutil -hashfile），返回 hex 字符串；失败返回空。
+/// 供 update 自检输出，便于审计新二进制指纹。
+fn file_sha256(path: &std::path::Path) -> String {
+    let out = match std::process::Command::new("certutil")
+        .args(["-hashfile", &path.to_string_lossy(), "SHA256"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return String::new(),
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    // certutil 输出格式：文件 + 空行 + 64 hex + 空行
+    for line in s.lines() {
+        let t = line.trim();
+        if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return t.to_lowercase();
+        }
+    }
+    String::new()
+}
+
 /// 自主更新服务二进制（需 install 时已对当前用户授权 STOP/START）。
 ///
-/// 流程：停止服务（轮询等待 Stopped）→ 覆盖部署副本 `D:\Kiln\AI-root\ai-root.exe`
-/// → 启动服务 → 自检状态。智能体（用户身份）一条命令完成，全程无需管理员。
+/// ⚠ 安全说明：本命令将任意 exe 替换为 SYSTEM 服务并启动，等效于 SYSTEM 代码执行。
+/// 仅应授予可信进程（如本机智能体）。防护仅为 PE 有效性校验 + SHA256 指纹输出，
+/// 如需强校验请对发布物做 Authenticode 签名并在外部流程中核验。
+///
+/// 流程：停止服务（轮询等待 Stopped）→ 覆盖部署副本 → 启动服务 → 自检状态。
 pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    // 0) 新 exe 有效性校验（防覆盖成垃圾文件导致服务无法启动）
+    if !is_valid_pe(new_exe) {
+        return Err(format!(
+            "拒绝更新：{} 不是有效的 PE 可执行文件（MZ/PE 头校验失败）",
+            new_exe.display()
+        )
+        .into());
+    }
+    let sha = file_sha256(new_exe);
+    if !sha.is_empty() {
+        println!("新二进制 SHA256: {sha}");
+    }
+
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(
         common::SERVICE_NAME,

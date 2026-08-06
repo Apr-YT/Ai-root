@@ -35,19 +35,104 @@ pub struct Response {
     pub stderr: String,
     /// 中继层错误信息（鉴权失败 / 超时 / spawn 失败）
     pub error: Option<String>,
+    /// 输出是否因超过 1MB 上限被截断（默认 false，兼容旧客户端）
+    #[serde(default)]
+    pub truncated: bool,
 }
 
-/// 从文件（包装的管道句柄）读取一帧
-pub fn read_frame(file: &mut File) -> io::Result<Vec<u8>> {
+/// 从文件（包装的管道句柄）读取一帧，带读超时（毫秒）
+///
+/// 防线程泄漏：客户端连接后若不发送数据，read_exact 会永久阻塞工作线程。
+/// 通过 PeekNamedPipe 轮询可用字节数实现超时：帧头 4 字节等待 + 帧体等待，
+/// 超时返回 TimedOut 错误，调用方据此释放线程。
+pub fn read_frame_timeout(file: &mut File, timeout_ms: u64) -> io::Result<Vec<u8>> {
+    use std::os::windows::io::AsRawHandle;
+    use std::time::{Duration, Instant};
+
+    let handle = file.as_raw_handle() as winapi_raw::HANDLE;
+    let start = Instant::now();
+    let deadline = Duration::from_millis(timeout_ms);
+
+    // 等待帧头 4 字节可用
+    loop {
+        let mut total: u32 = 0;
+        let ok = unsafe {
+            winapi_raw::PeekNamedPipe(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut total,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "PeekNamedPipe 失败（对端关闭）",
+            ));
+        }
+        if total >= 4 {
+            break;
+        }
+        if start.elapsed() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("读帧头超时（>{timeout_ms}ms 无数据，客户端可能连接后未发送）"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 读帧头
     let mut len_buf = [0u8; 4];
     file.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > 16 * 1024 * 1024 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
     }
+
+    // 等待帧体 len 字节可用（Peek 轮询）
     let mut buf = vec![0u8; len];
-    file.read_exact(&mut buf)?;
+    let mut filled = 0usize;
+    loop {
+        if filled >= len {
+            break;
+        }
+        let mut total: u32 = 0;
+        let ok = unsafe {
+            winapi_raw::PeekNamedPipe(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut total,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "对端关闭"));
+        }
+        if total == 0 {
+            if start.elapsed() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("读帧体超时（>{timeout_ms}ms）"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let n = (total as usize).min(len - filled);
+        file.read_exact(&mut buf[filled..filled + n])?;
+        filled += n;
+    }
     Ok(buf)
+}
+
+/// 兼容旧调用：默认 60s 读超时
+pub fn read_frame(file: &mut File) -> io::Result<Vec<u8>> {
+    read_frame_timeout(file, 60_000)
 }
 
 /// 向文件写入一帧
@@ -116,5 +201,6 @@ pub fn err_response(msg: &str) -> Response {
         stdout: String::new(),
         stderr: String::new(),
         error: Some(msg.to_string()),
+        truncated: false,
     }
 }

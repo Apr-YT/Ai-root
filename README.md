@@ -179,14 +179,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 等价手动命令（需注意本机 PATH 里的 `D:\Kiln\rust\cargo\bin` 是代理二进制，cargo spawn rustc 会报 `os error 193`）：
 
 ```bash
-export CARGO_TARGET_DIR=D:/wbrelay_target
+export CARGO_TARGET_DIR=D:/ai-root-target
 "C:/Users/AprYT/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe" build --release --target x86_64-pc-windows-msvc
 ```
 
 集成测试（spawn `--test-pipe-server` + `AIROOT_DATA_DIR` 隔离，不触碰生产数据）：
 
 ```bash
-export CARGO_TARGET_DIR=D:/wbrelay_target
+export CARGO_TARGET_DIR=D:/ai-root-target
 "C:/Users/AprYT/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe" test --release
 ```
 

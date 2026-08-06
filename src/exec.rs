@@ -22,6 +22,8 @@ pub struct ExecResult {
     pub stderr: String,
     pub timed_out: bool,
     pub error: Option<String>,
+    /// stdout/stderr 是否因超过 1MB 上限被截断
+    pub truncated: bool,
 }
 
 impl ExecResult {
@@ -32,9 +34,13 @@ impl ExecResult {
             stderr: String::new(),
             timed_out: false,
             error: Some(msg),
+            truncated: false,
         }
     }
 }
+
+/// 单流输出上限（字节）。防止 `dir /s C:\` 等命令产出 GB 级输出拖垮 SYSTEM 内存。
+const OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// 执行命令，带超时（毫秒）。超时则终止进程。
 pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
@@ -158,22 +164,48 @@ fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
         }
     };
 
-    // 取出 stdout/stderr 管道，交给读取线程
+    // 取出 stdout/stderr 管道，交给读取线程（各自截断至 OUTPUT_LIMIT）
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
     let out_t = thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut p) = stdout_pipe {
-            let _ = p.read_to_end(&mut buf);
+            let mut chunk = [0u8; 8192];
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.len() >= OUTPUT_LIMIT {
+                            break; // 截断，丢弃后续
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         }
-        decode_output(&buf)
+        let truncated = buf.len() >= OUTPUT_LIMIT;
+        (decode_output(&buf), truncated)
     });
     let err_t = thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut p) = stderr_pipe {
-            let _ = p.read_to_end(&mut buf);
+            let mut chunk = [0u8; 8192];
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.len() >= OUTPUT_LIMIT {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         }
-        decode_output(&buf)
+        let truncated = buf.len() >= OUTPUT_LIMIT;
+        (decode_output(&buf), truncated)
     });
 
     // 轮询退出状态，超时则杀进程树
@@ -206,14 +238,15 @@ fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
         }
     };
 
-    let stdout = out_t.join().unwrap_or_default();
-    let stderr = err_t.join().unwrap_or_default();
+    let (stdout, out_trunc) = out_t.join().unwrap_or_default();
+    let (stderr, err_trunc) = err_t.join().unwrap_or_default();
     ExecResult {
         exit_code: status.code().unwrap_or(-1),
         stdout,
         stderr,
         timed_out,
         error: None,
+        truncated: out_trunc || err_trunc,
     }
 }
 

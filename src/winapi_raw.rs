@@ -42,6 +42,10 @@ pub const ERROR_PIPE_CONNECTED: u32 = 535;
 /// 客户端标准做法：WaitNamedPipeW 等待实例就绪后重试。
 pub const ERROR_PIPE_BUSY: u32 = 231;
 
+// ---- 控制台附加（GUI 子系统程序 CLI 输出可见性）----
+/// AttachConsole 的 dwProcessId 特殊值：附加调用进程的父进程控制台
+pub const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+
 // ---- 同步对象等待 ----
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 pub const WAIT_OBJECT_0: u32 = 0;
@@ -123,6 +127,18 @@ extern "system" {
     ) -> HANDLE;
 
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
+
+    /// 查询命名管道中待读字节数（非阻塞，不消耗数据）。
+    /// 参数：管道句柄、输出缓冲(可为空)、缓冲大小、已读字节数(可为空)、
+    /// 可用总字节数、剩余消息字节数。返回 0 表示管道无效/已关闭。
+    pub fn PeekNamedPipe(
+        hNamedPipe: HANDLE,
+        lpBuffer: *mut c_void,
+        nBufferSize: u32,
+        lpBytesRead: *mut u32,
+        lpTotalBytesAvail: *mut u32,
+        lpBytesLeftThisMessage: *mut u32,
+    ) -> BOOL;
     /// 等待命名管道实例可用（客户端在 CreateFileW 遇 ERROR_PIPE_BUSY 时调用）。
     /// nTimeOut=0 表示永久等待；返回 0 表示超时或管道已消失。
     pub fn WaitNamedPipeW(lpNamedPipeName: PCWSTR, nTimeOut: u32) -> BOOL;
@@ -144,6 +160,10 @@ extern "system" {
     pub fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) -> u32;
 
     pub fn GetLastError() -> u32;
+    /// 将当前进程附加到父进程（或指定进程）的控制台。
+    /// GUI 子系统程序本身无控制台，附加后 GetStdHandle 返回控制台句柄，CLI 输出可见。
+    /// 失败（ERROR_ACCESS_DENIED=已有控制台 / ERROR_INVALID_HANDLE=父进程无控制台）通常可忽略。
+    pub fn AttachConsole(dwProcessId: u32) -> BOOL;
 
     pub fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
         StringSecurityDescriptor: PCWSTR,

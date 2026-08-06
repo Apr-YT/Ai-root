@@ -49,6 +49,71 @@ pub fn log_path() -> PathBuf {
     data_dir().join("exec.log")
 }
 
+/// GUI 实时事件流文件（JSONL，追加写）。服务端在 exec_start/exec_done/token_rotate 等
+/// 关键节点写入；GUI 按字节偏移增量读取实现「AI 操控实时信息流」。
+/// 与 exec.log（审计，命令+退出码）互补：本文件含执行中状态、时长与输出摘要。
+pub fn events_path() -> PathBuf {
+    data_dir().join("events.jsonl")
+}
+
+/// 追加一条 GUI 实时事件（调用方构造 JSON 对象；禁止写入令牌明文/命令输出全文）。
+/// 超 2MB 自动轮转（改名 .1）。
+pub fn log_event(event: serde_json::Value) {
+    let mut line = serde_json::to_string(&event).unwrap_or_default();
+    line.push('\n');
+    append_with_rotate(events_path(), line.as_bytes());
+}
+
+/// 追加写入，超过 2MB 先改名 .1 再写（日志轮转，防无限增长）
+fn append_with_rotate(path: std::path::PathBuf, data: &[u8]) {
+    const MAX_LOG: u64 = 2 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_LOG {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".1");
+            let backup = std::path::PathBuf::from(name);
+            let _ = std::fs::rename(&path, &backup);
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = f.write_all(data);
+    }
+}
+
+/// 从 offset 字节处读取 events.jsonl 新增行，返回（新增行, 新的文件长度）。
+/// GUI 每 ~1s 调用一次实现增量实时刷新；offset 越界/文件被截断时安全回退。
+/// （headless 构建无 GUI，未引用时允许 dead_code）
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn read_events_since(offset: u64) -> (Vec<String>, u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = events_path();
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return (Vec::new(), 0);
+    };
+    let size = meta.len();
+    if size <= offset {
+        return (Vec::new(), size);
+    }
+    let Ok(mut f) = std::fs::File::open(&path) else {
+        return (Vec::new(), size);
+    };
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        return (Vec::new(), size);
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return (Vec::new(), size);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    (lines, size)
+}
+
 /// 启用开关文件：存在即「启用」，删除即「禁用」
 pub fn enabled_flag_path() -> PathBuf {
     data_dir().join("enabled.flag")
@@ -123,12 +188,15 @@ pub fn pipe_sddl() -> String {
 
 /// 设置目录 ACL：仅 SYSTEM 完全控制 + 指定用户只读
 /// 失败则退化为「SYSTEM + Interactive 只读」，保证至少可用
-fn set_dir_acl(dir: &std::path::Path) {
+///
+/// 注意：保留目录继承（`/inheritance:e`），新创建的文件自动继承目录 DACL（SYSTEM F + user R），
+/// 否则 SYSTEM 进程创建的事件文件（如 events.jsonl）会带 SYSTEM 默认 DACL，GUI 用户进程无法读取。
+pub fn set_dir_acl(dir: &std::path::Path) {
     let dir_str = dir.to_string_lossy().to_string();
     if let Some(sid) = get_user_sid() {
         let _ = Command::new("icacls")
             .arg(&dir_str)
-            .arg("/inheritance:r")
+            .arg("/inheritance:e")
             .arg("/grant")
             .arg(format!("*S-1-5-18:(OI)(CI)F")) // LocalSystem 完全控制
             .arg("/grant")
@@ -138,7 +206,7 @@ fn set_dir_acl(dir: &std::path::Path) {
         // 退化方案：Interactive 用户只读（仅本机交互登录者可读取令牌）
         let _ = Command::new("icacls")
             .arg(&dir_str)
-            .arg("/inheritance:r")
+            .arg("/inheritance:e")
             .arg("/grant")
             .arg("*S-1-5-18:(OI)(CI)F")
             .arg("/grant")
@@ -215,6 +283,11 @@ pub fn rotate_token() -> io::Result<String> {
     if let Ok(mut c) = TOKEN_CACHE.lock() {
         *c = None; // 失效缓存，下一次 cached_token() 按新 mtime 重读
     }
+    // GUI 实时信息流：令牌轮换事件（绝不记录令牌明文）
+    log_event(serde_json::json!({
+        "ts": now_str(),
+        "type": "token_rotate",
+    }));
     Ok(tok)
 }
 
@@ -242,6 +315,7 @@ pub fn now_str() -> String {
 
 /// 追加一行执行日志：时间 | 调用者(domain\user) | 客户端PID | 命令 | 退出码
 /// 调用者身份来自管道对端进程（GetNamedPipeClientProcessId 审计），非服务自身环境变量。
+/// 超 2MB 自动轮转（改名 .1，避免无限增长）。
 pub fn log_exec(caller: &str, pid: u32, command: &str, exit_code: i32) {
     let line = format!(
         "[{}] caller={} pid={} exit={} cmd={}\n",
@@ -251,17 +325,11 @@ pub fn log_exec(caller: &str, pid: u32, command: &str, exit_code: i32) {
         exit_code,
         command
     );
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path())
-    {
-        use std::io::Write;
-        let _ = f.write_all(line.as_bytes());
-    }
+    append_with_rotate(log_path(), line.as_bytes());
 }
 
-/// 读取最近 N 行执行日志（GUI 用）
+/// 读取最近 N 行执行日志（GUI 用；headless 构建下未引用，允许 dead_code）
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn read_log_tail(n: usize) -> String {
     match std::fs::read_to_string(log_path()) {
         Ok(s) => {
@@ -271,4 +339,33 @@ pub fn read_log_tail(n: usize) -> String {
         }
         Err(_) => String::new(),
     }
+}
+
+/// 从 offset 字节处读取 exec.log 新增行，返回（新增行, 新的文件长度）。
+/// GUI 增量追加实现「日志实时刷新」，避免大文件整读（read_log_tail 是整读，文件大时开销高）。
+/// offset 越界/文件被截断时安全回退到文件末尾。
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn read_log_since(offset: u64) -> (Vec<String>, u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = log_path();
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return (Vec::new(), 0);
+    };
+    let size = meta.len();
+    if size <= offset {
+        return (Vec::new(), size);
+    }
+    let Ok(mut f) = std::fs::File::open(&path) else {
+        return (Vec::new(), size);
+    };
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        return (Vec::new(), size);
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return (Vec::new(), size);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    (lines, size)
 }

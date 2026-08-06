@@ -19,12 +19,12 @@ if (-not (Test-Path $rustupCargo)) {
     $rustupCargo = (Get-Command cargo -ErrorAction Stop).Source
 }
 
-# 2) 目标目录: 环境变量优先(CI 可注入), 否则本机惯例 D:\wbrelay_target, 否则仓库内 target
+# 2) 目标目录: 环境变量优先(CI 可注入), 否则本机惯例 D:\ai-root-target, 否则仓库内 target
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ($env:CARGO_TARGET_DIR) {
     $targetDir = $env:CARGO_TARGET_DIR
 } elseif (Test-Path "D:\") {
-    $targetDir = "D:\wbrelay_target"
+    $targetDir = "D:\ai-root-target"
 } else {
     $targetDir = Join-Path $repoRoot "target"
 }
