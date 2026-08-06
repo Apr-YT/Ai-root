@@ -3,6 +3,12 @@
 //! 以 `cmd /C <command>` 方式运行命令。由于服务端以 LocalSystem 运行，
 //! 因此执行结果天然具备 SYSTEM 最高权限。
 //! 通过 try_wait 轮询 + 超时杀进程实现超时控制，避免跨线程移动 Child 所有权。
+//!
+//! 两种执行模式：
+//! - 单行命令：经 `escape_cmd_meta` 把 `^`/`&` 转义为字面量，避免 cmd /C 二次解析
+//!   把设备实例 ID 等含 `&` 的字面量拆成多段命令。代价：`&`/`&&` 串联在单行内失效。
+//! - 多行脚本（命令含换行 `\n`）：写入临时 `.cmd` 文件并以 `cmd /C <file>` 执行，
+//!   **不转义**，`&`/`&&`/`|`/`()` 均按正常 cmd 语义工作。这是 AI 批量自治多命令时的推荐路径。
 
 use std::io::Read;
 use std::os::windows::process::CommandExt;
@@ -18,8 +24,26 @@ pub struct ExecResult {
     pub error: Option<String>,
 }
 
+impl ExecResult {
+    fn error(msg: String) -> Self {
+        ExecResult {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            error: Some(msg),
+        }
+    }
+}
+
 /// 执行命令，带超时（毫秒）。超时则终止进程。
 pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
+    // 多行命令（含换行）走脚本模式：写入临时 .cmd，不转义 cmd 元字符，
+    // 使 `&`/`&&`/`|`/`()` 作为正常命令分隔符/运算符工作（引号内的 `&` 仍按字面处理）。
+    if command.contains('\n') {
+        return run_script(command, cwd, timeout_ms);
+    }
+
     let mut builder = Command::new("cmd");
     // 关键：用 raw_arg 原样拼接命令，禁止 Rust 对引号/`&`/结尾反斜杠二次转义。
     // 否则 `cmd /C` 会把内层引号转义成 `\"` 且无法还原，导致 `dir "C:\x"`、
@@ -27,7 +51,9 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
     // 进一步：`cmd /C <command>` 会对命令行**二次解析**，把 `&` 误判为命令分隔符，
     // 使含 `&` 的设备实例 ID（`VID_373B&PID_1216&MI_00&COL0x`）被拆成多段、
     // 只有首段送达 pnputil。故在交给 cmd 前对 `^`/`&` 做 `^` 转义为字面量。
-    // 代价：单个 `&` 串联失效（退化为字面 `&`），但 `&&` 串联与 `|`/`<`/`>`/`()` 运算符语义保留。
+    // 代价：`^`/`&` 均被转义为字面量，故单行内 `&` 与 `&&` 串联**全部失效**（退化为字面 `&`/`&&`）；
+    // 仅 `|`/`<`/`>`/`()` 运算符语义保留。需要 `&`/`&&` 串联请改用多行脚本模式（命令含 `\n`、
+    // 或 `ai-root run --file <脚本>` / `ai-root run --stdin`）。
     let escaped = escape_cmd_meta(command);
     builder.raw_arg("/C").raw_arg(&escaped);
     builder.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -35,16 +61,40 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
         builder.current_dir(c);
     }
 
+    run_child(builder, timeout_ms)
+}
+
+/// 脚本模式：将多行命令写入临时 `.cmd`（GBK 编码），以 `cmd /C "<file>"` 执行，不转义。
+fn run_script(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("ai-root-{}-{}.cmd", std::process::id(), nanos));
+    // 以 GBK（系统 OEM/ANSI 代码页）编码写入，确保 cmd 正确读取含中文的脚本
+    let bytes = encode_gbk(script);
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
+        return ExecResult::error(format!("写临时脚本失败: {e}"));
+    }
+    let path = tmp.to_string_lossy().to_string();
+    let mut builder = Command::new("cmd");
+    // 文件路径用引号包裹，兼容含空格的路径；此处不调用 escape_cmd_meta
+    builder.raw_arg("/C").raw_arg(format!("\"{path}\""));
+    builder.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(c) = cwd {
+        builder.current_dir(c);
+    }
+    let res = run_child(builder, timeout_ms);
+    let _ = std::fs::remove_file(&tmp);
+    res
+}
+
+/// spawn 子进程、读取 stdout/stderr、轮询退出状态并在超时时杀进程
+fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
     let mut child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return ExecResult {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: String::new(),
-                timed_out: false,
-                error: Some(format!("spawn 失败: {e}")),
-            }
+            return ExecResult::error(format!("spawn 失败: {e}"));
         }
     };
 
@@ -79,26 +129,14 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
                     match child.wait() {
                         Ok(s) => break s,
                         Err(e) => {
-                            return ExecResult {
-                                exit_code: -1,
-                                stdout: String::new(),
-                                stderr: String::new(),
-                                timed_out: true,
-                                error: Some(format!("wait 失败: {e}")),
-                            }
+                            return ExecResult::error(format!("wait 失败: {e}"));
                         }
                     }
                 }
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                return ExecResult {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    timed_out: false,
-                    error: Some(format!("try_wait 失败: {e}")),
-                }
+                return ExecResult::error(format!("try_wait 失败: {e}"));
             }
         }
     };
@@ -114,12 +152,13 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
     }
 }
 
-/// 对传入 `cmd /C` 的命令做 cmd.exe 元字符转义。
+/// 对传入 `cmd /C` 的单行命令做 cmd.exe 元字符转义。
 ///
 /// `cmd /C <command>` 会二次解析命令行，把 `&` 当作命令分隔符
 /// （如设备实例 ID `VID_373B&PID_1216&MI_00&COL0x` 中的 `&` 会被拆段）。
 /// 在 `^`/`&` 前加 `^` 转义为字面量，确保整条命令原样送达目标程序。
 /// 注意：`^` 必须先于 `&` 处理，否则 `^` 自身也会被误转义。
+/// 仅在单行模式下调用；多行脚本模式不转义（见 `run_script`）。
 fn escape_cmd_meta(cmd: &str) -> String {
     let mut out = String::with_capacity(cmd.len() + 8);
     for c in cmd.chars() {
@@ -182,5 +221,42 @@ fn decode_codepage(bytes: &[u8], codepage: u32) -> String {
             return String::from_utf8_lossy(bytes).into_owned();
         }
         String::from_utf16_lossy(&wide[..written as usize])
+    }
+}
+
+/// 将脚本内容以系统 OEM/ANSI 代码页（GBK）编码为字节，供写入临时 `.cmd` 文件。
+/// 使 cmd.exe 以系统代码页正确读取脚本（含中文不乱码）。
+fn encode_gbk(s: &str) -> Vec<u8> {
+    let wide: Vec<u16> = s.encode_utf16().collect();
+    unsafe {
+        let needed = crate::winapi_raw::WideCharToMultiByte(
+            crate::winapi_raw::CP_OEMCP,
+            0,
+            wide.as_ptr(),
+            wide.len() as i32,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        if needed <= 0 {
+            return s.as_bytes().to_vec();
+        }
+        let mut out = vec![0u8; needed as usize];
+        let written = crate::winapi_raw::WideCharToMultiByte(
+            crate::winapi_raw::CP_OEMCP,
+            0,
+            wide.as_ptr(),
+            wide.len() as i32,
+            out.as_mut_ptr(),
+            needed,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        if written <= 0 {
+            return s.as_bytes().to_vec();
+        }
+        out.truncate(written as usize);
+        out
     }
 }

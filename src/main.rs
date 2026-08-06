@@ -47,12 +47,13 @@ fn main() {
             Ok(())
         }
         "run" => {
-            if args.len() < 3 {
-                eprintln!("用法: ai-root run <命令>");
-                return;
+            match parse_and_run(&args[2..]) {
+                Ok(()) => return, // client_run 内部决定退出码
+                Err(e) => {
+                    eprintln!("[错误] {e}");
+                    exit(1);
+                }
             }
-            client_run(&args[2..].join(" "));
-            return; // client_run 内部决定退出码
         }
         "gui" => {
             gui::run();
@@ -136,6 +137,55 @@ fn client_run(command: &str) {
     exit(resp.exit_code);
 }
 
+/// 解析 `run` 子命令参数，装载命令文本后交给 client_run。
+///
+/// 支持三种调用形态：
+///   ai-root run "单行命令"
+///   ai-root run --file <脚本路径>   读取脚本文件（多行）
+///   ai-root run --stdin            从标准输入读取脚本（多行）
+///
+/// 含换行符的内容会被服务端识别为「脚本模式」，此时 `&`/`&&`/`|`/`()` 恢复 cmd 正常语义，
+/// 这是 AI 批量自治多命令时的推荐路径。
+fn parse_and_run(args: &[String]) -> Result<(), String> {
+    use std::io::Read;
+    let mut file_path: Option<String> = None;
+    let mut stdin_mode = false;
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-f" | "--file" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("缺少 -f/--file 参数".to_string());
+                }
+                file_path = Some(args[i].clone());
+            }
+            "--stdin" | "-" => {
+                stdin_mode = true;
+            }
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let command = if stdin_mode {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("读取标准输入失败: {e}"))?;
+        buf
+    } else if let Some(p) = file_path {
+        std::fs::read_to_string(&p).map_err(|e| format!("读取脚本文件失败: {e}"))?
+    } else {
+        positional.join(" ")
+    };
+
+    client_run(&command);
+    Ok(())
+}
+
 fn print_help() {
     println!(
         r#"
@@ -148,13 +198,17 @@ AI-root v1.0.0 —— LocalSystem 提权命令中继
   ai-root stop         停止服务（需管理员）
   ai-root status       查询服务状态
   ai-root server       前台管道服务模式（测试用）
-  ai-root run <命令>   连接管道并执行命令（非提权即可）
+  ai-root run <命令>             连接管道并执行命令（非提权即可）
+  ai-root run --file <脚本>      以脚本模式执行多行命令（&/&& 正常）
+  ai-root run --stdin            从标准输入读取脚本执行
   ai-root gui          打开 GUI 控制面板
   ai-root --service    [内部] SCM 派发入口
 
 示例:
-  ai-root run "whoami"            # 应以 NT AUTHORITY\SYSTEM 身份返回
+  ai-root run "whoami"                          # 应以 NT AUTHORITY\SYSTEM 身份返回
   ai-root run "pnputil /enum-devices"
+  ai-root run --file C:\tmp\batch.cmd           # 多行脚本，&/&&/| 均正常
+  echo 命令行 & pnputil /enum-devices | ai-root run --stdin
 "#
     );
 }

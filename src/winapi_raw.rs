@@ -104,4 +104,17 @@ extern "system" {
         lpWideCharStr: *mut u16,
         cchWideChar: i32,
     ) -> i32;
+
+    /// UTF-16 -> 多字节（OEM/ANSI 代码页）。用于将脚本内容以 GBK 写入临时 .cmd，
+    /// 使 cmd.exe 以系统代码页正确读取（含中文不乱码）。
+    pub fn WideCharToMultiByte(
+        CodePage: u32,
+        dwFlags: u32,
+        lpWideCharStr: *const u16,
+        cchWideChar: i32,
+        lpMultiByteStr: *mut u8,
+        cbMultiByte: i32,
+        lpDefaultChar: *const u8,
+        lpUsedDefaultChar: *mut i32,
+    ) -> i32;
 }
