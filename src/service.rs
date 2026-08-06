@@ -122,15 +122,17 @@ pub fn grant_acl() -> Result<(), Box<dyn std::error::Error>> {
     let Some(sid) = common::get_user_sid() else {
         return Ok(());
     };
-    // 保留默认 ACE（SYSTEM/Administrators 完全控制），追加用户 GRGX。
+    // 保留默认 ACE（SYSTEM/Administrators 完整权限），追加用户 GRGX。
     // 服务对象 GENERIC 映射：GENERIC_READ = QUERY_CONFIG|QUERY_STATUS|INTERROGATE|READ_CONTROL；
     // GENERIC_EXECUTE = START|STOP|PAUSE_CONTINUE|READ_CONTROL。
     // 必须覆盖 QUERY_STATUS：`status`/`stop`/`start`/`update` 均需以 SERVICE_QUERY_STATUS 打开服务，
     // 缺它会导致非提权用户 OpenService 失败（status 误报未安装、update 报 IO error）。
     // 注意：不要用 RP/WP/LO 等零散位组合——实测 SDDL 字母 LO 并非 SERVICE_QUERY_STATUS(0x04)，
     // 授予 RPLOWP 后 START/STOP 生效但 QUERY_STATUS 仍被拒；GRGX 组合经 sc sdset 实测全部通过。
+    // BA 必须保持 CCDCLCSWRPWPDTLOCRSDRCWDWO（Administrators 标准权限，含 DELETE/DC/WD/WO）：
+    // 若像 SYSTEM 一样只写 CCLCSWRPWPDTLOCRRC，会降级 BA 导致二次 grant / uninstall 被拒(last_err=5)。
     let sddl = format!(
-        "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCLCSWRPWPDTLOCRRC;;;BA)(A;;GRGX;;;{sid})"
+        "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;GRGX;;;{sid})"
     );
     let sddl_w = common::to_wide(&sddl);
     let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
