@@ -1,0 +1,18 @@
+# Rust 构建产物（外部 CARGO_TARGET_DIR 亦已隔离，双保险）
+/target/
+
+# 运行时生成的鉴权 / 身份产物（绝不提交）
+token.txt
+sid.txt
+
+# 操作系统 / 编辑器噪音
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 旧版部署脚本（已移出工作区，防止误提交）
+deploy.ps1
