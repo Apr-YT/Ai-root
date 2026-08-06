@@ -56,13 +56,50 @@ const C_BG_HOVER: egui::Color32 = egui::Color32::from_rgb(35, 43, 55); // 悬浮
 const C_BORDER: egui::Color32 = egui::Color32::from_rgb(46, 58, 74); // 描边 #2E3A4A
 const C_TEXT: egui::Color32 = egui::Color32::from_rgb(230, 237, 243); // 主文本 #E6EDF3
 const C_TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(154, 167, 180); // 次要 #9AA7B4
-const C_OK: egui::Color32 = egui::Color32::from_rgb(63, 185, 80); // success #3FB950
-const C_WARN: egui::Color32 = egui::Color32::from_rgb(210, 153, 34); // warning #D29922
-const C_ERR: egui::Color32 = egui::Color32::from_rgb(248, 81, 73); // danger #F85149
+// 状态语义色（规范：不改变字号，仅着色）：
+//   成功绿 rgba(0.25,0.85,0.45,0.95) / 警告黄 rgba(0.92,0.72,0.22,0.95) / 错误红 rgba(0.90,0.32,0.32,0.95)
+// 注：Color32::from_rgba_unmultiplied 非 const、字段私有 → 用运行时求值函数
+fn c_ok() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(64, 217, 115, 242)
+}
+fn c_warn() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(235, 184, 56, 242)
+}
+fn c_err() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(230, 82, 82, 242)
+}
 const C_INFO: egui::Color32 = egui::Color32::from_rgb(88, 166, 255); // info #58A6FF
 const C_NEUTRAL: egui::Color32 = egui::Color32::from_rgb(139, 148, 158); // 中性灰 #8B949E
 const C_BRAND: egui::Color32 = egui::Color32::from_rgb(61, 139, 255); // brand #3D8BFF
 const C_ACCENT: egui::Color32 = egui::Color32::from_rgb(45, 212, 191); // 活动指示 #2DD4BF
+
+// ── 5 级文字层级（暗色终端控制台，RGBA 0-1 浮点换算 0-255）──
+// L1 主标题 16px 粗体 rgba(0.95,0.95,0.97,1.0) —— 窗口大标题
+// L2 模块标题/Tab 14px medium rgba(0.85,0.87,0.90,0.95) —— 面板标题、Tab 标签
+// L3 主体正文 13px 常规 rgba(0.80,0.82,0.85,0.90) —— 按钮/输入框/表格主列/输出日志
+// L4 次要辅助 12px 常规 rgba(0.60,0.63,0.68,0.75) —— 说明文本/描述列/状态栏次要
+// L5 弱占位 11px rgba(0.45,0.48,0.52,0.55) —— 输入框占位符
+const FS_L1: f32 = 16.0;
+const FS_L2: f32 = 14.0;
+const FS_L3: f32 = 13.0;
+const FS_L4: f32 = 12.0;
+const FS_L5: f32 = 11.0;
+// 文字层级颜色（运行时求值，见上：Color32::from_rgba_unmultiplied 非 const）
+fn txt_l1() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(242, 242, 247, 255)
+}
+fn txt_l2() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(217, 222, 230, 242)
+}
+fn txt_l3() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(204, 209, 217, 230)
+}
+fn txt_l4() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(153, 161, 173, 191)
+}
+fn txt_l5() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(115, 122, 133, 140)
+}
 
 /// 输出历史环形缓冲容量
 const OUTPUT_HISTORY: usize = 20;
@@ -96,7 +133,17 @@ fn install_theme(ctx: &egui::Context) {
     v.faint_bg_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 7); // 玻璃高光
     v.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(8, 11, 15, 208); // 输入框底
     v.code_bg_color = egui::Color32::from_rgba_unmultiplied(10, 13, 18, 205);
-    v.override_text_color = Some(C_TEXT);
+    v.override_text_color = Some(txt_l3()); // L3 正文为全局默认；输入框占位符由 override gamma 弱化（≈L5）
+
+    // 5 级字号层级：Heading16/Body13/Button13/Small12/Monospace13（px）
+    ctx.style_mut(|s| {
+        use egui::{FontId, TextStyle};
+        s.text_styles.insert(TextStyle::Heading, FontId::proportional(FS_L1));
+        s.text_styles.insert(TextStyle::Body, FontId::proportional(FS_L3));
+        s.text_styles.insert(TextStyle::Button, FontId::proportional(FS_L3));
+        s.text_styles.insert(TextStyle::Small, FontId::proportional(FS_L4));
+        s.text_styles.insert(TextStyle::Monospace, FontId::monospace(FS_L3));
+    });
 
     // 选区 / 链接：品牌蓝（低饱和细边）
     v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(61, 139, 255, 150);
@@ -773,7 +820,8 @@ impl WbRelayApp {
                 let btn = egui::Button::new(
                     egui::RichText::new(label)
                         .strong()
-                        .color(if selected { C_TEXT } else { C_TEXT_DIM }),
+                        .size(FS_L2) // L2 模块标题/Tab 14px
+                        .color(if selected { txt_l1() } else { txt_l2() }),
                 )
                 .fill(if selected { C_BG_CARD } else { C_BG_CARD })
                 .stroke(egui::Stroke::new(
@@ -946,7 +994,7 @@ impl WbRelayApp {
         // 历史命令下拉（点击回放）
         if !self.cmd_history.is_empty() {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("命令历史:").strong().color(C_TEXT_DIM));
+                ui.label(egui::RichText::new("命令历史:").strong().size(FS_L2).color(txt_l2()));
                 egui::ComboBox::from_id_salt("hist_combo")
                     .selected_text("点击回放…")
                     .width(ui.available_width())
@@ -964,7 +1012,7 @@ impl WbRelayApp {
 
         // 输出区：徽章行 + 输出历史选择 + 只读输出
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("输出:").strong());
+            ui.label(egui::RichText::new("输出:").strong().size(FS_L2).color(txt_l2()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut as_ = self.output_autoscroll;
                 let as_btn = egui::Button::new(if as_ { "⏸ 暂停滚动" } else { "▶ 恢复滚动" })
@@ -995,7 +1043,7 @@ impl WbRelayApp {
         // 输出历史选择（下拉切换查看）
         if self.outputs.len() > 1 {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("查看输出:").strong().color(C_TEXT_DIM));
+                ui.label(egui::RichText::new("查看输出:").strong().size(FS_L2).color(txt_l2()));
                 let cur = &self.outputs[self.output_idx];
                 egui::ComboBox::from_id_salt("output_hist")
                     .selected_text(cur.summary())
@@ -1018,18 +1066,18 @@ impl WbRelayApp {
         if let Some(r) = self.outputs.get(self.output_idx) {
             ui.horizontal(|ui| {
                 let (ec_color, ec_text) = if r.exit_code == 0 {
-                    (C_OK, "exit=0".to_string())
+                    (c_ok(), "exit=0".to_string())
                 } else {
-                    (C_ERR, format!("exit={}", r.exit_code))
+                    (c_err(), format!("exit={}", r.exit_code))
                 };
                 pill(ui, ec_color, &ec_text);
                 pill(ui, C_TEXT_DIM, &format!("{}ms", r.dur_ms));
                 if !r.stderr.is_empty() {
-                    pill(ui, C_WARN, "含错误输出");
+                    pill(ui, c_warn(), "含错误输出");
                 }
                 if let Some(e) = &r.relay_err {
-                    pill(ui, C_ERR, "中继错误");
-                    ui.label(egui::RichText::new(e).color(C_ERR).small().monospace());
+                    pill(ui, c_err(), "中继错误");
+                    ui.label(egui::RichText::new(e).color(c_err()).small().monospace());
                 }
             });
             ui.add_space(2.0);
@@ -1070,7 +1118,7 @@ impl WbRelayApp {
                                 ui.label(
                                     egui::RichText::new(format!("[stderr]\n{}", r.stderr))
                                         .monospace()
-                                        .color(C_WARN)
+                                        .color(c_warn())
                                         .size(13.0),
                                 );
                             }
@@ -1079,7 +1127,7 @@ impl WbRelayApp {
                                 ui.label(
                                     egui::RichText::new(format!("[中继错误]\n{e}"))
                                         .monospace()
-                                        .color(C_ERR)
+                                        .color(c_err())
                                         .size(13.0),
                                 );
                             }
@@ -1098,7 +1146,7 @@ impl WbRelayApp {
     /// Tab 2 · 实时信息流：等级筛选 + 增量事件（开始/完成/轮换/服务启动）
     fn render_events_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("AI 执行动态").strong());
+            ui.label(egui::RichText::new("AI 执行动态").strong().size(FS_L2).color(txt_l2()));
             ui.label(format!("{} 条", self.events.len()));
             egui::ComboBox::from_id_salt("event_level")
                 .selected_text(self.event_level.label())
@@ -1187,7 +1235,7 @@ impl WbRelayApp {
         let filter_id = egui::Id::new("log_filter_input");
         let pid_input_id = egui::Id::new("log_pid_input");
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("命令日志").strong());
+            ui.label(egui::RichText::new("命令日志").strong().size(FS_L2).color(txt_l2()));
             ui.add(
                 egui::TextEdit::singleline(&mut self.log_filter)
                     .id(filter_id)
@@ -1243,8 +1291,8 @@ impl WbRelayApp {
                             C_BORDER,
                         ),
                         Some(_) => (
-                            egui::RichText::new(line).color(C_ERR).monospace().size(13.0),
-                            C_ERR,
+                            egui::RichText::new(line).color(c_err()).monospace().size(13.0),
+                            c_err(),
                         ),
                         None => (
                             egui::RichText::new(line).color(C_TEXT).monospace().size(13.0),
@@ -1356,11 +1404,17 @@ impl eframe::App for WbRelayApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.heading("AI-root 控制台");
+                // L1 主标题 16px 粗体；L4 副标题 12px 次要
+                ui.label(
+                    egui::RichText::new("AI-root 控制台")
+                        .size(FS_L1)
+                        .strong()
+                        .color(txt_l1()),
+                );
                 ui.label(
                     egui::RichText::new("SYSTEM 提权通道 · 已授权 AI 远程执行命令")
-                        .color(C_TEXT_DIM)
-                        .size(13.0),
+                        .color(txt_l4())
+                        .size(FS_L4),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("刷新").clicked() {
@@ -1387,7 +1441,7 @@ impl eframe::App for WbRelayApp {
                         "中继已禁用 · AI 无法执行命令"
                     })
                     .strong()
-                    .color(if en { C_OK } else { C_ERR }),
+                    .color(if en { c_ok() } else { c_err() }),
                 );
                 if !self.hint.is_empty() {
                     ui.colored_label(hint_color(&self.hint), &self.hint);
@@ -1402,14 +1456,14 @@ impl eframe::App for WbRelayApp {
             ui.horizontal(|ui| {
                 if let Some(r) = self.outputs.get(self.output_idx) {
                     let (c, t) = if r.exit_code == 0 {
-                        (C_OK, format!("exit={}", r.exit_code))
+                        (c_ok(), format!("exit={}", r.exit_code))
                     } else {
-                        (C_ERR, format!("exit={}", r.exit_code))
+                        (c_err(), format!("exit={}", r.exit_code))
                     };
                     pill(ui, c, &t);
                     pill(ui, C_TEXT_DIM, &format!("{}ms", r.dur_ms));
                     if r.relay_err.is_some() {
-                        pill(ui, C_ERR, "中继错误");
+                        pill(ui, c_err(), "中继错误");
                     }
                 } else {
                     pill(ui, C_TEXT_DIM, "就绪 — 等待命令");
@@ -1472,7 +1526,7 @@ impl eframe::App for WbRelayApp {
                     if self.confirm_rotate {
                         ui.add_space(8.0);
                         ui.colored_label(
-                            C_ERR,
+                            c_err(),
                             "确认轮换？旧令牌立即失效，持有旧令牌的 AI 客户端将无法执行",
                         );
                         let half = (ui.available_width() - 8.0) / 2.0;
@@ -1492,7 +1546,8 @@ impl eframe::App for WbRelayApp {
                 egui::CollapsingHeader::new(
                     egui::RichText::new("管理员操作（仅首次 / 应急）")
                         .strong()
-                        .color(C_WARN),
+                        .size(FS_L2)
+                        .color(c_warn()),
                 )
                 .default_open(false)
                 .show(ui, |ui| {
@@ -1509,7 +1564,7 @@ impl eframe::App for WbRelayApp {
                     }
                     ui.add_space(8.0);
                     if self.confirm_uninstall {
-                        ui.colored_label(C_ERR, "确认卸载服务？");
+                        ui.colored_label(c_err(), "确认卸载服务？");
                         let half = (ui.available_width() - 8.0) / 2.0;
                         ui.horizontal(|ui| {
                             if ui.add_sized([half, 32.0], egui::Button::new("确认卸载")).clicked() {
@@ -1698,7 +1753,7 @@ fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8.0))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(title).strong().size(14.0));
+            ui.label(egui::RichText::new(title).strong().size(FS_L2).color(txt_l2()));
             ui.add_space(4.0);
             add_contents(ui);
         });
@@ -1719,11 +1774,11 @@ fn extract_exit(line: &str) -> Option<i32> {
 /// 操作提示着色：✓绿 / ⚠琥珀 / 其余错误红
 fn hint_color(hint: &str) -> egui::Color32 {
     if hint.starts_with('✓') {
-        C_OK
+        c_ok()
     } else if hint.starts_with('⚠') {
-        C_WARN
+        c_warn()
     } else {
-        C_ERR
+        c_err()
     }
 }
 
@@ -1764,7 +1819,7 @@ fn parse_event(line: &str) -> ParsedEvent {
             let ok = exit == 0;
             ParsedEvent {
                 level: if ok { EventLevel::DoneOk } else { EventLevel::DoneErr },
-                color: if ok { C_OK } else { C_ERR },
+                color: if ok { c_ok() } else { c_err() },
                 ts,
                 sym: if ok { "✔ 完成".to_string() } else { "✘ 完成".to_string() },
                 cmd,
@@ -1777,7 +1832,7 @@ fn parse_event(line: &str) -> ParsedEvent {
         }
         "token_rotate" => ParsedEvent {
             level: EventLevel::Service,
-            color: C_WARN,
+            color: c_warn(),
             ts,
             sym: "⚠ 轮换".to_string(),
             cmd: "令牌".to_string(),
@@ -1804,7 +1859,7 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
         resp.mark_changed();
     }
     let track_color = if *on {
-        C_OK
+        c_ok()
     } else {
         C_BORDER
     };
