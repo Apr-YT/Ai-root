@@ -31,8 +31,9 @@ powershell -ExecutionPolicy Bypass -File deploy.ps1
 ```
 
 > **一次性管理员，之后零介入**：`install` 除注册服务外，还会给**当前用户 SID** 追加服务的
-> `STOP/START` 权限（Windows 服务安全描述符标准机制）。此后智能体（用户身份、非提权）
-> 可自主执行 `ai-root stop/start/update`，**更新服务二进制不再需要管理员**。
+> `GRGX` 权限（GENERIC_READ|GENERIC_EXECUTE，含 QUERY_STATUS/START/STOP，Windows 服务安全描述符
+> 标准机制；实测 SDDL 零散位 `RP/WP/LO` 组合不含 QUERY_STATUS，勿用）。此后智能体（用户身份、非提权）
+> 可自主执行 `ai-root status/stop/start/update`，**更新服务二进制不再需要管理员**。
 
 部署产物：
 
@@ -143,7 +144,7 @@ type C:\tmp\batch.cmd | ai-root run --stdin
 
 - 令牌仅安装时生成一次；目录 ACL `SYSTEM(F) + 当前用户(R)`，其余账户不可访问。
 - 管道 SDDL 追加安装用户 SID，使以该用户身份运行的智能体（可能非交互登录）也能稳定连接。
-- 服务 DACL 在 install 时追加安装用户 SID 的 `SERVICE_START | SERVICE_STOP`——仅授权 stop/start/update 自身服务，不授予其他服务或系统级权限。
+- 服务 DACL 在 install 时追加安装用户 SID 的 `GRGX`（GENERIC_READ|GENERIC_EXECUTE，含 QUERY_STATUS/START/STOP）——仅授权 status/stop/start/update 自身服务，不授予 CHANGE_CONFIG/WRITE_DAC 等管理权限、不涉及其他服务或系统级权限。
 - 受「启用开关」约束（`C:\ProgramData\ai-root\enabled.flag` 存在即启用），删除即禁用中继。
 - 服务运行时（SYSTEM 身份）不会改写令牌/SID，避免错误写入 `S-1-5-18`。
 

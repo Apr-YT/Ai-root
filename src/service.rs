@@ -122,9 +122,15 @@ pub fn grant_acl() -> Result<(), Box<dyn std::error::Error>> {
     let Some(sid) = common::get_user_sid() else {
         return Ok(());
     };
-    // 保留默认 ACE（SYSTEM/Administrators 完全控制），追加用户 RPWP(START|STOP)
+    // 保留默认 ACE（SYSTEM/Administrators 完全控制），追加用户 GRGX。
+    // 服务对象 GENERIC 映射：GENERIC_READ = QUERY_CONFIG|QUERY_STATUS|INTERROGATE|READ_CONTROL；
+    // GENERIC_EXECUTE = START|STOP|PAUSE_CONTINUE|READ_CONTROL。
+    // 必须覆盖 QUERY_STATUS：`status`/`stop`/`start`/`update` 均需以 SERVICE_QUERY_STATUS 打开服务，
+    // 缺它会导致非提权用户 OpenService 失败（status 误报未安装、update 报 IO error）。
+    // 注意：不要用 RP/WP/LO 等零散位组合——实测 SDDL 字母 LO 并非 SERVICE_QUERY_STATUS(0x04)，
+    // 授予 RPLOWP 后 START/STOP 生效但 QUERY_STATUS 仍被拒；GRGX 组合经 sc sdset 实测全部通过。
     let sddl = format!(
-        "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCLCSWRPWPDTLOCRRC;;;BA)(A;;RPWP;;;{sid})"
+        "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCLCSWRPWPDTLOCRRC;;;BA)(A;;GRGX;;;{sid})"
     );
     let sddl_w = common::to_wide(&sddl);
     let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -229,8 +235,24 @@ pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::
     let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-root");
     std::fs::create_dir_all(deploy_dir)?;
     let deploy_exe = deploy_dir.join("ai-root.exe");
-    std::fs::copy(new_exe, &deploy_exe)?;
-    println!("✓ 已覆盖: {}", deploy_exe.display());
+    // 自锁处理：update 若由部署 exe 自身运行，直接 copy 会因「映像被占用」报 os error 32。
+    // Windows 允许重命名运行中 exe（映像以 FILE_SHARE_DELETE 打开），先改名 .old 腾出路径，
+    // 再复制新文件；失败回滚，启动后清理 .old（残留可被下轮 update 清理）。
+    let old_exe = deploy_dir.join("ai-root.exe.old");
+    let _ = std::fs::remove_file(&old_exe);
+    match std::fs::rename(&deploy_exe, &old_exe) {
+        Ok(_) => {
+            if let Err(e) = std::fs::copy(new_exe, &deploy_exe) {
+                let _ = std::fs::rename(&old_exe, &deploy_exe); // 回滚旧文件
+                return Err(format!("复制新二进制失败（已回滚旧版本）: {e}").into());
+            }
+            println!("✓ 已覆盖: {}（旧文件保留为 .old）", deploy_exe.display());
+        }
+        Err(_) => {
+            std::fs::copy(new_exe, &deploy_exe)?;
+            println!("✓ 已覆盖: {}", deploy_exe.display());
+        }
+    }
 
     // 3) 启动服务
     service.start::<OsString>(&[])?;
@@ -239,6 +261,9 @@ pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::
     // 4) 自检
     let s = service.query_status()?;
     println!("服务状态: {:?}", s.current_state);
+
+    // 5) 清理 .old（映像句柄允许删除；失败留待下轮 update 清理）
+    let _ = std::fs::remove_file(&old_exe);
     Ok(())
 }
 
