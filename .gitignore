@@ -16,3 +16,7 @@ Desktop.ini
 
 # 旧版部署脚本（已移出工作区，防止误提交）
 deploy.ps1
+
+# 调试符号
+*.pdb
+*.dll
