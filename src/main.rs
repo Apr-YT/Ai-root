@@ -42,7 +42,16 @@ fn main() {
         }
         #[cfg(not(feature = "gui"))]
         {
+            // headless 版无参数（典型：双击）：打印帮助并等待按键，防止终端一闪而过。
+            // 管道/重定向场景 stdin 为 EOF，read 立即返回，不阻塞 AI 调用。
+            println!();
+            println!("ai-root headless 版：无 GUI。请双击 ai-root-gui.exe 打开可视化控制台；");
+            println!("命令行用法见下方帮助；实时查看 AI 操作可用 `ai-root tail`。");
+            println!();
             print_help();
+            println!();
+            println!("按任意键退出...");
+            wait_key();
             return;
         }
     }
@@ -134,6 +143,12 @@ fn main() {
             "本构建为 headless（--no-default-features），未包含 GUI。请使用默认构建的 ai-root.exe 运行 `ai-root gui`"
                 .to_string(),
         ),
+        "tail" => {
+            // 实时跟随 events.jsonl（增量读），终端实时显示 AI 操作（exec_start/exec_done 等）。
+            // Ctrl+C 退出；Ctrl+C 无法在 Rust 中优雅捕获，直接终止即可（无副作用）。
+            tail_events();
+            Ok(())
+        }
         _ => {
             print_help();
             Ok(())
@@ -333,6 +348,57 @@ fn attach_parent_console() {
     }
 }
 
+/// 从 stdin 读取一个字节（双击场景下等待用户按键，避免终端一闪而过）。
+/// 管道/重定向场景 stdin 立即 EOF，read 返回 0，不阻塞 AI 自动化调用。
+fn wait_key() {
+    use std::io::Read;
+    let mut b = [0u8; 1];
+    let _ = std::io::stdin().read(&mut b);
+}
+
+/// `ai-root tail`：实时跟随 events.jsonl，终端打印 AI 操作信息流。
+/// 先打印已有事件（历史），再每 500ms 增量读取新增事件，直到 Ctrl+C。
+fn tail_events() {
+    let mut offset: u64 = 0;
+    println!("[ai-root tail] 实时事件流（Ctrl+C 退出）: {}", common::events_path().display());
+    loop {
+        let (lines, new_off) = common::read_events_since(offset);
+        offset = new_off;
+        for l in lines {
+            println!("{}", event_line_text(&l));
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// events.jsonl 单行 → 终端可读文本（headless 无 GUI 着色，用符号区分状态）
+fn event_line_text(line: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_string();
+    };
+    let ts = v["ts"].as_str().unwrap_or("--:--:--");
+    let ty = v["type"].as_str().unwrap_or("");
+    let cmd = v["cmd"].as_str().unwrap_or("").replace('\n', " ");
+    let caller = v["caller"].as_str().unwrap_or("");
+    match ty {
+        "exec_start" => format!("{ts} ▶ 开始  {cmd}   (caller={caller})"),
+        "exec_done" => {
+            let exit = v["exit"].as_i64().unwrap_or(-1);
+            let dur = v["duration_ms"].as_i64().unwrap_or(0);
+            let preview: String = v["out_preview"].as_str().unwrap_or("").chars().take(40).collect();
+            let mark = if exit == 0 { "✔ 完成" } else { "✘ 失败" };
+            let mut s = format!("{ts} {mark}  {cmd}   → exit={exit} ({dur}ms, caller={caller})");
+            if !preview.is_empty() {
+                s.push_str(&format!("   [{}]", preview));
+            }
+            s
+        }
+        "token_rotate" => format!("{ts} ⚠ 令牌轮换（旧令牌立即失效）"),
+        "service_start" => format!("{ts} ◇ 服务启动 (pipe={})", v["pipe"].as_str().unwrap_or("")),
+        _ => line.to_string(),
+    }
+}
+
 fn print_help() {
     println!(
         r#"
@@ -355,6 +421,7 @@ AI-root v1.0.0 —— LocalSystem 提权命令中继
   ai-root run --cwd <目录>       指定命令工作目录（默认 SYSTEM 的 System32）
   ai-root run --json             结构化 JSON 输出（AI 消费方推荐）
   ai-root run -- <命令>          `--` 后全部原样作为命令（含 - 开头参数）
+  ai-root tail                   实时跟随事件流（终端实时查看 AI 操作，Ctrl+C 退出）
   ai-root gui          打开 GUI 控制面板
   ai-root --service    [内部] SCM 派发入口
 
