@@ -176,10 +176,14 @@ pub fn run_pipe_server_forever() {
     }
 }
 
-/// 将已连接的管道句柄移交工作线程处理（句柄所有权转移给 File，由线程负责读写）
+/// 将已连接的管道句柄移交工作线程处理（句柄所有权转移给 File，由线程负责读写）。
+/// 用 catch_unwind 包裹，确保任何命令处理 panic 都被限制在单连接线程内，
+/// 不会导致整个中继服务进程崩溃（SCM 记 7034）。
 fn dispatch_connection(handle: winapi_raw::HANDLE) {
     let file = unsafe { File::from_raw_handle(handle as RawHandle) };
-    thread::spawn(|| handle_client(file));
+    thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle_client(file)));
+    });
 }
 
 /// 服务模式：持续接受连接，可被 stop_event 随时优雅中断退出。
@@ -188,26 +192,37 @@ fn dispatch_connection(handle: winapi_raw::HANDLE) {
 /// 若仅在循环顶部轮询 shutdown 信道，则停止信号永远无法被“看到”，
 /// 导致 Stop-Service 超时、服务卡在 Stop Pending、exe 被文件锁占用。
 ///
-/// 修复：启动监控线程等待 stop_event；一旦触发即关闭当前管道句柄，
-/// 使阻塞中的 ConnectNamedPipe 立即失败返回，主循环据此退出并置 Stopped 状态。
+/// 早期修复：监控线程等待 stop 后 `CloseHandle` 当前管道句柄，使阻塞的
+/// ConnectNamedPipe 立即失败返回。但该做法存在竞态——主循环可能在 CloseHandle
+/// 与 ConnectNamedPipe 返回之间的窗口把同一句柄 `dispatch` 给工作线程，造成
+/// use-after-free（句柄被关闭后仍在读写）→ 段错误 → SCM 记「意外停止」(7034)。
+///
+/// 现采用 `CancelIoEx`：stop 时仅取消阻塞中的 I/O（不关闭句柄），ConnectNamedPipe
+/// 返回 ERROR_OPERATION_ABORTED；主循环据此退出并自行关闭句柄。句柄所有权始终
+/// 只属于主循环或单一工作线程，杜绝双重关闭 / use-after-free。
 ///
 /// 注意：HANDLE（*mut c_void）不是 Send，跨线程传递统一以 usize 整数形式，
-/// 使用时再 cast 回 HANDLE。
+/// 使用时再 cast 回 HANDLE。Mutex 取锁统一用 `unwrap_or_else(|e| e.into_inner())`
+/// 防止 poison 导致主循环 panic 拖垮进程。
 pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
     let tok = common::read_or_create_token();
     common::cache_token(tok);
 
     let stop_event_usize = stop_event as usize;
 
-    // 当前正被 ConnectNamedPipe 阻塞的管道句柄（usize）；stop 时由监控线程取走并关闭以中断阻塞
+    // 当前正被 ConnectNamedPipe 阻塞的管道句柄（usize）；stop 时由监控线程 CancelIoEx 以中断阻塞
     let current_pipe: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
 
-    // 监控线程：等待 stop 信号，触发后关闭当前管道句柄以中断 ConnectNamedPipe
+    // 监控线程：等待 stop 信号，触发后 CancelIoEx 当前管道句柄（不关闭），中断阻塞的 ConnectNamedPipe
     let monitor_pipe = current_pipe.clone();
     let monitor = thread::spawn(move || {
         unsafe { winapi_raw::WaitForSingleObject(stop_event_usize as winapi_raw::HANDLE, winapi_raw::INFINITE); }
-        if let Some(h) = monitor_pipe.lock().unwrap().take() {
-            unsafe { winapi_raw::CloseHandle(h as winapi_raw::HANDLE); }
+        if let Some(h) = monitor_pipe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            unsafe { winapi_raw::CancelIoEx(h as winapi_raw::HANDLE, std::ptr::null_mut()); }
         }
     });
 
@@ -224,25 +239,29 @@ pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
                 continue;
             }
         };
-        *current_pipe.lock().unwrap() = Some(handle as usize);
+        *current_pipe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle as usize);
 
         let connected = unsafe { winapi_raw::ConnectNamedPipe(handle, std::ptr::null_mut()) };
-        // 连接已返回（成功或失败），清空 current，避免监控线程误关已移交的句柄
-        let owned = current_pipe.lock().unwrap().take().is_some();
+        // 连接已返回（成功或失败），清空 current（取走），避免监控线程误 Cancel 已移交的句柄
+        let _ = current_pipe.lock().unwrap_or_else(|e| e.into_inner()).take();
 
-        if connected != 0 || unsafe { winapi_raw::GetLastError() } == winapi_raw::ERROR_PIPE_CONNECTED {
-            // 客户端已连接：移交工作线程处理
-            dispatch_connection(handle);
-        } else if owned {
-            // 真实错误，本线程仍持有句柄：关闭后重试；若同时收到 stop 则退出
+        // stop 已触发：CancelIoEx 已中断本次 ConnectNamedPipe；放弃本连接并退出（不 dispatch）
+        if unsafe { winapi_raw::WaitForSingleObject(stop_event, 0) } == winapi_raw::WAIT_OBJECT_0 {
             unsafe { winapi_raw::CloseHandle(handle); }
-            if unsafe { winapi_raw::WaitForSingleObject(stop_event, 0) } == winapi_raw::WAIT_OBJECT_0 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(300));
-        } else {
-            // 句柄已被监控线程取走并关闭（stop 触发），直接退出
             break;
+        }
+
+        if connected != 0
+            || unsafe { winapi_raw::GetLastError() } == winapi_raw::ERROR_PIPE_CONNECTED
+        {
+            // 客户端已连接：移交工作线程处理（句柄所有权转移，主循环不再触碰）
+            dispatch_connection(handle);
+        } else {
+            // 真实连接错误：关闭后重试
+            unsafe { winapi_raw::CloseHandle(handle); }
+            thread::sleep(Duration::from_millis(300));
         }
     }
 

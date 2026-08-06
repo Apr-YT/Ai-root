@@ -72,6 +72,10 @@ extern "system" {
 
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
 
+    /// 取消指定句柄上所有进行中的 I/O（用于在不关闭管道句柄的前提下，
+    /// 中断阻塞中的 ConnectNamedPipe，避免监控线程 CloseHandle 引发 use-after-free）。
+    pub fn CancelIoEx(hObject: HANDLE, lpOverlapped: *mut c_void) -> BOOL;
+
     pub fn CreateEventW(
         lpEventAttributes: *const SECURITY_ATTRIBUTES,
         bManualReset: BOOL,
@@ -103,18 +107,5 @@ extern "system" {
         cbMultiByte: i32,
         lpWideCharStr: *mut u16,
         cchWideChar: i32,
-    ) -> i32;
-
-    /// UTF-16 -> 多字节（OEM/ANSI 代码页）。用于将脚本内容以 GBK 写入临时 .cmd，
-    /// 使 cmd.exe 以系统代码页正确读取（含中文不乱码）。
-    pub fn WideCharToMultiByte(
-        CodePage: u32,
-        dwFlags: u32,
-        lpWideCharStr: *const u16,
-        cchWideChar: i32,
-        lpMultiByteStr: *mut u8,
-        cbMultiByte: i32,
-        lpDefaultChar: *const u8,
-        lpUsedDefaultChar: *mut i32,
     ) -> i32;
 }

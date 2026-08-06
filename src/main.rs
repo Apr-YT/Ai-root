@@ -20,6 +20,8 @@ mod service;
 mod winapi_raw;
 
 use std::process::exit;
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -44,6 +46,19 @@ fn main() {
         }
         "server" => {
             server::run_pipe_server_forever();
+            Ok(())
+        }
+        "--test-pipe-server" => {
+            // [内部测试] 以服务模式逻辑常驻，10 秒后自动触发 stop，用于本地复现/验证
+            // 7034 竞态修复（CancelIoEx 替代 CloseHandle）。非提权亦可运行，便于无 SCM 下验证。
+            let stop_event = unsafe { winapi_raw::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            let ev = stop_event as usize;
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(30));
+                unsafe { winapi_raw::SetEvent(ev as winapi_raw::HANDLE); }
+            });
+            server::run_pipe_server(stop_event);
+            println!("[test] 服务模式优雅退出（未崩溃）");
             Ok(())
         }
         "run" => {

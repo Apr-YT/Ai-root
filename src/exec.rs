@@ -64,28 +64,48 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
     run_child(builder, timeout_ms)
 }
 
-/// 脚本模式：将多行命令写入临时 `.cmd`（GBK 编码），以 `cmd /C "<file>"` 执行，不转义。
+/// 脚本模式：将多行命令写入临时 `.cmd`（UTF-8），经「ASCII 包装脚本」以 `cmd /C <wrap>` 执行，不转义。
+///
+/// 双文件结构（已实测验证）：
+/// - 本体 `ai-root-<pid>-<n>.cmd`：脚本内容，UTF-8 + CRLF（见 `encode_script`）。
+/// - 包装 `ai-root-<pid>-<n>.wrap.cmd`：**纯 ASCII**，内容为
+///   `@echo off` / `chcp 65001 >nul` / `call "<本体路径>"`。
+/// 原理：cmd 顶层批处理存在「预读缓冲」怪癖——`chcp` 生效前的行已按旧代码页读入，
+/// 导致 UTF-8 中文在某些行乱码；且 `cmd /C "chcp & call \"path\""` 单行形式会因
+/// `/C` 引号剥离把 `call` 参数拆坏（实测失败）。而包装脚本全 ASCII（顶层读取无中文问题），
+/// 本体在 `chcp 65001` 生效后经 `call` 才被读取 → UTF-8 中文必然正确解析，跨代码页稳定。
 fn run_script(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let tmp = std::env::temp_dir().join(format!("ai-root-{}-{}.cmd", std::process::id(), nanos));
-    // 以 GBK（系统 OEM/ANSI 代码页）编码写入，确保 cmd 正确读取含中文的脚本
-    let bytes = encode_gbk(script);
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir().join(format!("ai-root-{}-{}.cmd", pid, nanos));
+    let wrap = std::env::temp_dir().join(format!("ai-root-{}-{}.wrap.cmd", pid, nanos));
+
+    // 本体：脚本内容（UTF-8 + CRLF）
+    let bytes = encode_script(script);
     if let Err(e) = std::fs::write(&tmp, &bytes) {
         return ExecResult::error(format!("写临时脚本失败: {e}"));
     }
-    let path = tmp.to_string_lossy().to_string();
+    // 包装：纯 ASCII；@echo off 抑制回显，chcp 65001 先切换代码页，再 call 本体
+    let inner = tmp.to_string_lossy().to_string();
+    let wrapper = format!("@echo off\r\nchcp 65001 >nul\r\ncall \"{inner}\"\r\n");
+    if let Err(e) = std::fs::write(&wrap, wrapper.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return ExecResult::error(format!("写包装脚本失败: {e}"));
+    }
+    let wrap_path = wrap.to_string_lossy().to_string();
+
     let mut builder = Command::new("cmd");
-    // 文件路径用引号包裹，兼容含空格的路径；此处不调用 escape_cmd_meta
-    builder.raw_arg("/C").raw_arg(format!("\"{path}\""));
+    builder.raw_arg("/C").raw_arg(format!("\"{wrap_path}\""));
     builder.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(c) = cwd {
         builder.current_dir(c);
     }
     let res = run_child(builder, timeout_ms);
     let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&wrap);
     res
 }
 
@@ -224,39 +244,16 @@ fn decode_codepage(bytes: &[u8], codepage: u32) -> String {
     }
 }
 
-/// 将脚本内容以系统 OEM/ANSI 代码页（GBK）编码为字节，供写入临时 `.cmd` 文件。
-/// 使 cmd.exe 以系统代码页正确读取脚本（含中文不乱码）。
-fn encode_gbk(s: &str) -> Vec<u8> {
-    let wide: Vec<u16> = s.encode_utf16().collect();
-    unsafe {
-        let needed = crate::winapi_raw::WideCharToMultiByte(
-            crate::winapi_raw::CP_OEMCP,
-            0,
-            wide.as_ptr(),
-            wide.len() as i32,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-        );
-        if needed <= 0 {
-            return s.as_bytes().to_vec();
-        }
-        let mut out = vec![0u8; needed as usize];
-        let written = crate::winapi_raw::WideCharToMultiByte(
-            crate::winapi_raw::CP_OEMCP,
-            0,
-            wide.as_ptr(),
-            wide.len() as i32,
-            out.as_mut_ptr(),
-            needed,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-        );
-        if written <= 0 {
-            return s.as_bytes().to_vec();
-        }
-        out.truncate(written as usize);
-        out
-    }
+/// 将脚本内容编码为字节，供写入临时 `.cmd` 文件。
+///
+/// 方案：写**纯 UTF-8（无 BOM）+ CRLF 换行**，不注入 chcp、不依赖系统代码页探测。
+/// 实测结论（本机 ACP=65001，即开启「使用 Unicode UTF-8 提供全球语言支持」）：
+/// - cmd 原生以 UTF-8 读取 .cmd 文件 → 纯 UTF-8 脚本的中文命令正确解析、stdout 亦为 UTF-8；
+/// - GBK 编码脚本反而乱码（cmd 按 UTF-8 读 GBK 字节）；
+/// - `@chcp 65001` 前置会触发 cmd 批处理「预读缓冲」怪癖，部分行被按旧代码页读入而乱码；
+/// - UTF-8 BOM 在部分 cmd 版本下会被当 GBK 读成「锘」前缀，同样不可靠。
+/// 统一 CRLF 换行，避免 cmd 对 LF 的兼容性问题。
+fn encode_script(s: &str) -> Vec<u8> {
+    let normalized: String = s.replace("\r\n", "\n").replace('\n', "\r\n");
+    normalized.into_bytes()
 }
