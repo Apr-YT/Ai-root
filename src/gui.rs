@@ -50,7 +50,6 @@ use crate::protocol;
 // 深空蓝灰中性阶 + GitHub-Dark 同源语义色 + 冷青活动指示。
 // 设计依据：对比度 ≥7:1（WCAG AAA）、语义不打架（绿=成功/红=危险/蓝=操作/青=活动）。
 // 注：窗口底/面板底色不再用常量（install_theme 玻璃拟态直接用 from_rgba_unmultiplied 构造）。
-const C_BG_INPUT: egui::Color32 = egui::Color32::from_rgb(26, 32, 42); // 卡片/输入底 #1A202A
 const C_BG_CARD: egui::Color32 = egui::Color32::from_rgb(26, 32, 42); // 卡片 #1A202A
 const C_BG_HOVER: egui::Color32 = egui::Color32::from_rgb(35, 43, 55); // 悬浮 #232B37
 const C_BORDER: egui::Color32 = egui::Color32::from_rgb(46, 58, 74); // 描边 #2E3A4A
@@ -83,7 +82,6 @@ const FS_L1: f32 = 16.0;
 const FS_L2: f32 = 14.0;
 const FS_L3: f32 = 13.0;
 const FS_L4: f32 = 12.0;
-const FS_L5: f32 = 11.0;
 // 文字层级颜色（运行时求值，见上：Color32::from_rgba_unmultiplied 非 const）
 fn txt_l1() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(242, 242, 247, 255)
@@ -96,9 +94,6 @@ fn txt_l3() -> egui::Color32 {
 }
 fn txt_l4() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(153, 161, 173, 191)
-}
-fn txt_l5() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(115, 122, 133, 140)
 }
 
 /// 输出历史环形缓冲容量

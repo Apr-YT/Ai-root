@@ -6,7 +6,7 @@
 //!   start      启动服务（需管理员）
 //!   stop       停止服务（需管理员）
 //!   status     查询服务状态
-//!   server     前台管道服务模式（测试用，当前进程直接运行）
+//!   server     前台管道服务模式（当前进程直接运行，演练/多实例用）
 //!   run <cmd>  以客户端身份连接管道并执行命令（非提权即可）
 //!   gui        打开原生 GUI 控制面板
 //!   --service  SCM 派发进入服务主循环（用户勿直接调用）
@@ -106,22 +106,6 @@ fn main() {
         }
         "server" => {
             server::run_pipe_server_forever();
-            Ok(())
-        }
-        "--test-pipe-server" => {
-            // [内部测试] 以服务模式逻辑常驻，10 秒后自动触发 stop，用于本地复现/验证
-            // 7034 竞态修复（CancelIoEx 替代 CloseHandle）。非提权亦可运行，便于无 SCM 下验证。
-            // 注意：此路径不走 service_run()，不会自动创建 enabled.flag → 显式默认启用，
-            // 否则新数据目录下 is_enabled()=false，所有请求返回「中继已禁用」。
-            common::set_enabled(true);
-            let stop_event = unsafe { winapi_raw::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-            let ev = stop_event as usize;
-            thread::spawn(move || {
-                thread::sleep(Duration::from_secs(30));
-                unsafe { winapi_raw::SetEvent(ev as winapi_raw::HANDLE); }
-            });
-            server::run_pipe_server(stop_event);
-            println!("[test] 服务模式优雅退出（未崩溃）");
             Ok(())
         }
         "run" => {
@@ -350,6 +334,8 @@ fn attach_parent_console() {
 
 /// 从 stdin 读取一个字节（双击场景下等待用户按键，避免终端一闪而过）。
 /// 管道/重定向场景 stdin 立即 EOF，read 返回 0，不阻塞 AI 自动化调用。
+/// 仅 headless 无参数分支（`#[cfg(not(feature = "gui"))]`）使用；GUI 变体下允许 dead_code。
+#[cfg_attr(feature = "gui", allow(dead_code))]
 fn wait_key() {
     use std::io::Read;
     let mut b = [0u8; 1];

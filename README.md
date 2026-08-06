@@ -259,16 +259,7 @@ export CARGO_TARGET_DIR=D:/wbrelay_target_gui      # GUI
 | `ai-root.exe` | headless 服务端（部署用，`update` 热更新到 `D:\Kiln\AI-root\`） |
 | `ai-root-gui.exe` | GUI 桌面成品（双击开控制台） |
 
-集成测试（spawn `--test-pipe-server` + `AIROOT_DATA_DIR` 隔离，不触碰生产数据）：
-
-```bash
-export CARGO_TARGET_DIR=D:/wbrelay_target
-"/c/Users/AprYT/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe" test --release --no-default-features
-```
-
-覆盖：鉴权（错误/正确令牌）、脚本模式与单行转义、退出码传播、超时杀进程树、200KB 大输出、cwd、**令牌轮换热加载**、启用开关、CLI `--timeout`/`--stdin`、10 并发、生产目录零污染。
-
-**CI**：`.github/workflows/ci.yml` 在 GitHub Actions `windows-latest` 上自动执行 `build.ps1` + `cargo test --release`（提交到 main 或 PR 时触发）。
+**CI**：`.github/workflows/ci.yml` 在 GitHub Actions `windows-latest` 上自动执行 `build.ps1`（MSVC release 构建产物校验，提交到 main 或 PR 时触发）。
 
 依赖：`serde` / `serde_json` / `rand` / `chrono` / `eframe`+`egui` / `tray-icon`（均为 GUI feature，headless 构建不含）。
 
@@ -281,21 +272,15 @@ export CARGO_TARGET_DIR=D:/wbrelay_target
 | `AIROOT_DATA_DIR` | `C:\ProgramData\ai-root` | 覆盖数据目录（token / exec.log / enabled.flag / sid.txt） |
 | `AIROOT_PIPE_NAME` | `\\.\pipe\ai-root` | 覆盖命名管道名 |
 
-**为什么需要**：ai-root 的鉴权凭据（令牌）与监听管道名都是进程内唯一的。测试套件与「临时演练中继」需要与生产服务完全隔离，否则会串到生产实例（实测教训：测试曾连到生产管道导致数据串扰）。
-
-**集成测试自动使用**（`tests/integration.rs` 无需任何配置）：
-
-- 每次测试 spawn `--test-pipe-server` 时自动设置随机的 `AIROOT_DATA_DIR`（临时目录）与 `AIROOT_PIPE_NAME`（`\\.\pipe\ai-root-it-<随机数>`），服务端与客户端双向隔离；
-- 断言「测试令牌不得写入生产目录」（`t_09_no_production_touch`），杜绝污染；
-- 测试结束后 RAII 守卫 kill 服务进程并删除临时目录。
+**为什么需要**：ai-root 的鉴权凭据（令牌）与监听管道名都是进程内唯一的。「临时演练中继」需要与生产服务完全隔离，否则会串到生产实例（实测教训：测试曾连到生产管道导致数据串扰）。
 
 **手动起隔离实例**（演练 / 压测 / 临时中继，不影响生产）：
 
 ```powershell
-# 终端 A：起隔离服务（前台模式）
+# 终端 A：起隔离服务（前台模式，Ctrl+C 退出）
 $env:AIROOT_DATA_DIR = "C:\temp\airoot-demo"
 $env:AIROOT_PIPE_NAME = "\\.\pipe\ai-root-demo"
-ai-root.exe --test-pipe-server
+ai-root.exe server
 
 # 终端 B：连接隔离实例（读写都走 demo 数据目录与管道）
 $env:AIROOT_DATA_DIR = "C:\temp\airoot-demo"
@@ -303,4 +288,4 @@ $env:AIROOT_PIPE_NAME = "\\.\pipe\ai-root-demo"
 ai-root.exe run "whoami"
 ```
 
-> 注意：`install` 注册的**服务模式**固定使用默认数据目录与管道名；环境变量覆盖主要服务于测试、前台 `server`/`--test-pipe-server` 模式与多实例演练场景。
+> 注意：`install` 注册的**服务模式**固定使用默认数据目录与管道名；环境变量覆盖主要服务于前台 `server` 模式与多实例演练场景。
