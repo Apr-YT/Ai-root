@@ -145,7 +145,8 @@ type C:\tmp\batch.cmd | ai-root run --stdin
 - 令牌仅安装时生成一次；目录 ACL `SYSTEM(F) + 当前用户(R)`，其余账户不可访问。
 - 管道 SDDL 追加安装用户 SID，使以该用户身份运行的智能体（可能非交互登录）也能稳定连接。
 - 服务 DACL 在 install 时追加安装用户 SID 的 `GRGX`（GENERIC_READ|GENERIC_EXECUTE，含 QUERY_STATUS/START/STOP）——仅授权 status/stop/start/update 自身服务，不授予 CHANGE_CONFIG/WRITE_DAC 等管理权限、不涉及其他服务或系统级权限。
-- 受「启用开关」约束（`C:\ProgramData\ai-root\enabled.flag` 存在即启用），删除即禁用中继。
+- 受「启用开关」约束（`C:\ProgramData\ai-root\enabled.flag` 存在即启用），删除即禁用中继（服务端拒绝一切命令，`ok=false, error="中继已禁用"`）。
+  **开关是运行期语义**：禁用后无法通过中继自身恢复（拒绝执行），需本地/管理员重建 flag，或直接非提权 `ai-root stop` + `ai-root start`（服务启动时自动重建 flag，已实测）。
 - 服务运行时（SYSTEM 身份）不会改写令牌/SID，避免错误写入 `S-1-5-18`。
 
 ---
