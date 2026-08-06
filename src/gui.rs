@@ -1083,19 +1083,14 @@ impl WbRelayApp {
             ui.add_space(2.0);
         }
 
-        // 只读输出（可选中复制）：高度自适应
+        // 只读输出（可选中复制）：高度自适应；统一卡片容器（与其他两个面板一致）
         let avail_h = (ui.available_height() - 8.0).max(100.0);
-        egui::Frame::group(ui.style())
-            .fill(C_BG_INPUT)
-            .stroke(egui::Stroke::new(1.0_f32, C_BORDER))
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::same(8.0))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(self.output_autoscroll)
-                    .max_height(avail_h)
-                    .show(ui, |ui| {
+        panel_frame(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .stick_to_bottom(self.output_autoscroll)
+                .max_height(avail_h)
+                .show(ui, |ui| {
                         ui.style_mut().spacing.item_spacing.y = 4.0;
                         if let Some(r) = self.outputs.get(self.output_idx) {
                             if r.stdout.is_empty() && r.stderr.is_empty() && r.relay_err.is_none() {
@@ -1183,49 +1178,82 @@ impl WbRelayApp {
         });
         ui.add_space(4.0);
         let avail_h = (ui.available_height() - 8.0).max(100.0);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .stick_to_bottom(self.events_autoscroll)
-            .max_height(avail_h)
-            .show(ui, |ui| {
-                ui.style_mut().spacing.item_spacing.y = 2.0;
-                let mut shown = 0;
-                for ev in &self.events {
-                    if !self.event_matches(ev) {
-                        continue;
+        // 统一卡片容器：与命令输出/审计日志外观一致
+        panel_frame(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .stick_to_bottom(self.events_autoscroll)
+                .max_height(avail_h)
+                .show(ui, |ui| {
+                    ui.style_mut().spacing.item_spacing.y = 2.0;
+                    let mut shown = 0;
+                    for ev in &self.events {
+                        if !self.event_matches(ev) {
+                            continue;
+                        }
+                        shown += 1;
+                        ui.add_space(2.0);
+                        // 固定列宽表格行：时间戳(172)｜符号(56)｜命令(flex, 省略号)｜元数据(右对齐)
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add_sized(
+                                    [172.0, 18.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(&ev.ts)
+                                            .monospace()
+                                            .color(txt_l4())
+                                            .size(12.5),
+                                    ),
+                                );
+                                ui.add_sized(
+                                    [56.0, 18.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(&ev.sym)
+                                            .strong()
+                                            .color(ev.color)
+                                            .size(13.0),
+                                    ),
+                                );
+                                let cmd_w = (ui.available_width() - 120.0).max(40.0);
+                                ui.add_sized(
+                                    [cmd_w, 18.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(&ev.cmd).strong().size(13.0),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_sized(
+                                            [110.0, 18.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(&ev.meta)
+                                                    .color(txt_l4())
+                                                    .small(),
+                                            )
+                                            .truncate(),
+                                        );
+                                    },
+                                );
+                            },
+                        );
                     }
-                    shown += 1;
-                    ui.add_space(2.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 18.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.label(
-                                egui::RichText::new(&ev.ts).monospace().color(C_TEXT_DIM).size(12.5),
-                            );
-                            ui.label(egui::RichText::new(&ev.sym).strong().color(ev.color).size(13.0));
-                            ui.label(egui::RichText::new(&ev.cmd).strong().size(13.0));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(egui::RichText::new(&ev.meta).color(C_TEXT_DIM).small());
-                                },
-                            );
-                        },
-                    );
-                }
-                if shown == 0 {
-                    ui.label(
-                        egui::RichText::new(if self.events.is_empty() {
-                            "暂无动态 — AI 执行命令后将在此实时展示"
-                        } else {
-                            "当前筛选无匹配事件"
-                        })
-                        .color(C_TEXT_DIM)
-                        .italics(),
-                    );
-                }
-            });
+                    if shown == 0 {
+                        ui.label(
+                            egui::RichText::new(if self.events.is_empty() {
+                                "暂无动态 — AI 执行命令后将在此实时展示"
+                            } else {
+                                "当前筛选无匹配事件"
+                            })
+                            .color(txt_l4())
+                            .italics(),
+                        );
+                    }
+                });
+        });
         ui.add_space(4.0);
     }
 
@@ -1273,60 +1301,94 @@ impl WbRelayApp {
         ui.add_space(4.0);
         let avail_h = (ui.available_height() - 8.0).max(100.0);
         let mut shown = 0usize;
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .max_height(avail_h)
-            .show(ui, |ui| {
-                ui.style_mut().spacing.item_spacing.y = 2.0;
-                for line in self.log.lines() {
-                    if !self.log_matches(line) {
-                        continue;
+        // 统一卡片容器：与命令输出/实时信息流外观一致
+        panel_frame(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .max_height(avail_h)
+                .show(ui, |ui| {
+                    ui.style_mut().spacing.item_spacing.y = 2.0;
+                    for line in self.log.lines() {
+                        if !self.log_matches(line) {
+                            continue;
+                        }
+                        shown += 1;
+                        let (ts, id, exit, cmd) = parse_log_row(line);
+                        let stripe = match exit {
+                            Some(0) => C_BORDER,
+                            Some(_) => c_err(),
+                            None => C_BG_HOVER,
+                        };
+                        let exit_color = match exit {
+                            Some(0) => c_ok(),
+                            Some(_) => c_err(),
+                            None => txt_l4(),
+                        };
+                        // 固定列宽表格行：色条(3)｜时间戳(172)｜身份(240)｜退出码(64)｜命令(flex, 省略号)
+                        ui.horizontal(|ui| {
+                            let (stripe_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                            ui.painter()
+                                .rect_filled(stripe_rect, egui::Rounding::same(1.0), stripe);
+                            ui.add_space(4.0);
+                            ui.add_sized(
+                                [172.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(ts).monospace().color(txt_l4()).size(12.5),
+                                ),
+                            );
+                            ui.add_sized(
+                                [240.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(id).monospace().color(txt_l4()).size(12.5),
+                                )
+                                .truncate(),
+                            );
+                            let exit_text = match exit {
+                                Some(c) => format!("exit={c}"),
+                                None => "---".to_string(),
+                            };
+                            ui.add_sized(
+                                [64.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(exit_text)
+                                        .monospace()
+                                        .strong()
+                                        .color(exit_color)
+                                        .size(12.5),
+                                ),
+                            );
+                            let cmd_w = (ui.available_width() - 12.0).max(40.0);
+                            ui.add_sized(
+                                [cmd_w, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(cmd).monospace().color(txt_l3()).size(13.0),
+                                )
+                                .truncate(),
+                            );
+                        });
                     }
-                    shown += 1;
-                    let exit = extract_exit(line);
-                    let (rich, stripe) = match exit {
-                        Some(0) => (
-                            egui::RichText::new(line).color(C_TEXT_DIM).monospace().size(13.0),
-                            C_BORDER,
-                        ),
-                        Some(_) => (
-                            egui::RichText::new(line).color(c_err()).monospace().size(13.0),
-                            c_err(),
-                        ),
-                        None => (
-                            egui::RichText::new(line).color(C_TEXT).monospace().size(13.0),
-                            C_BG_HOVER,
-                        ),
-                    };
-                    // 左侧色条 + 缩进文本
-                    ui.horizontal(|ui| {
-                        let (stripe_rect, _) =
-                            ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(stripe_rect, egui::Rounding::same(1.0), stripe);
-                        ui.add_space(4.0);
-                        ui.label(rich);
-                    });
-                }
-                if shown == 0 {
-                    ui.label(
-                        egui::RichText::new(if self.log.is_empty() {
-                            "暂无记录 — 每次命令执行后自动生成"
-                        } else {
-                            "当前过滤无匹配行"
-                        })
-                        .color(C_TEXT_DIM)
-                        .italics(),
-                    );
-                }
-            });
+                    if shown == 0 {
+                        ui.label(
+                            egui::RichText::new(if self.log.is_empty() {
+                                "暂无记录 — 每次命令执行后自动生成"
+                            } else {
+                                "当前过滤无匹配行"
+                            })
+                            .color(txt_l4())
+                            .italics(),
+                        );
+                    }
+                });
+        });
         // 显示「过滤后行数 / 总行数」（替换原总行数——清空过滤后总行数不变会造成「没清掉」错觉）
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!("显示 {shown} / 共 {} 行", self.log.lines().count()))
                     .small()
-                    .color(C_TEXT_DIM),
+                    .color(txt_l4()),
             );
         });
         ui.add_space(4.0);
@@ -1758,6 +1820,53 @@ fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::
             add_contents(ui);
         });
     ui.add_space(6.0);
+}
+
+/// 统一「内容显示面板」容器（命令输出 / 实时信息流 / 审计日志共用）：
+/// 圆角 8px + 1px 细描边（white 6%）+ 深底 #1F242B + 内边距 12×10。
+/// 保证三个只读面板外观完全一致。
+fn panel_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style())
+        .fill(egui::Color32::from_rgba_unmultiplied(31, 36, 43, 255)) // #1F242B
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+        ))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin {
+            left: 12.0,
+            right: 12.0,
+            top: 10.0,
+            bottom: 10.0,
+        })
+        .show(ui, add_contents);
+}
+
+/// 解析审计日志单行 →（时间戳, 身份, 退出码, 命令），用于固定列宽渲染对齐。
+/// 兼容新格式 `[ts] caller=DOMAIN\user pid=N exit=N cmd=...` 与旧格式 `[ts] user=XXX exit=N cmd=...`。
+fn parse_log_row(line: &str) -> (String, String, Option<i32>, String) {
+    let ts = line
+        .chars()
+        .skip(1)
+        .take(19)
+        .collect::<String>();
+    // 身份段：caller=... pid=N（或旧式 user=...）
+    let id_part = line
+        .split(" pid=")
+        .next()
+        .unwrap_or("")
+        .split(" exit=")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let exit = extract_exit(line);
+    let cmd = line
+        .split("cmd=")
+        .nth(1)
+        .unwrap_or("")
+        .to_string();
+    (ts, id_part, exit, cmd)
 }
 
 /// 从审计日志行提取退出码（`... exit=0 cmd=...`），无则 None
