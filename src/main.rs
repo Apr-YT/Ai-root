@@ -260,7 +260,7 @@ fn parse_and_run(args: &[String]) -> Result<(), String> {
     use std::io::Read;
     let mut file_path: Option<String> = None;
     let mut stdin_mode = false;
-    let mut timeout_ms: u64 = 60_000;
+    let mut timeout_ms: u64 = common::DEFAULT_COMMAND_TIMEOUT_MS;
     let mut json_mode = false;
     let mut cwd: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
@@ -318,6 +318,16 @@ fn parse_and_run(args: &[String]) -> Result<(), String> {
     } else {
         positional.join(" ")
     };
+
+    // 空命令校验：run 后无命令、或仅带 flag 不带命令、或 --stdin/--file 内容为空，
+    // 都会得到空字符串，最终以 SYSTEM 执行 `cmd /C ""`（无害但无意义）。
+    // 在此（命令组装完成后）统一拦截，避免无谓的管道连接与 SYSTEM 提权调用。
+    if command.trim().is_empty() {
+        return Err(
+            "命令为空：请在 `run` 后传入命令，或用 --file/--stdin 提供脚本"
+                .to_string(),
+        );
+    }
 
     client_run(&command, timeout_ms, json_mode, cwd.as_deref());
     Ok(())

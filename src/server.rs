@@ -6,6 +6,7 @@
 //! - 每个连接须携带正确共享令牌，否则拒绝
 //! - 受「启用开关」约束，禁用时不执行
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::os::windows::io::{FromRawHandle, RawHandle};
@@ -59,9 +60,8 @@ impl AuthThrottle {
 
 /// 全局鉴权节流器 + 并发信号量计数
 static AUTH_THROTTLE: Mutex<Option<AuthThrottle>> = Mutex::new(None);
-/// 当前在执行的连接数（并发上限 8，防失控 AI 线程轰炸拖垮 SYSTEM 服务）
+/// 当前在执行的连接数（并发上限见 `common::MAX_CONNS`，防失控 AI 线程轰炸拖垮 SYSTEM 服务）
 static ACTIVE_CONNS: AtomicU32 = AtomicU32::new(0);
-const MAX_CONNS: u32 = 8;
 
 /// 创建带安全描述符的命名管道实例，返回原生 HANDLE
 ///
@@ -138,29 +138,45 @@ fn accept_one() -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
 }
 
-/// 获取管道对端进程身份：GetNamedPipeClientProcessId → OpenProcess → TokenUser → LookupAccountSid。
-/// 返回 (domain\user, pid)。任一步失败降级返回仅 PID 或 None（不影响执行，仅日志降级）。
-fn client_identity(file: &File) -> Option<(String, u32)> {
+/// SID 字符串 → 可读账户名 的进程内缓存（C2 优化核心）。
+///
+/// `LookupAccountSidW` 在域环境下可能触发域控（DC）网络查询，延迟高且不稳定。
+/// 同一主体（用户 / 服务账户）的 SID→名称映射恒定不变，故解析一次后缓存复用。
+/// 机器上会「成功鉴权」的主体数量极少（通常 < 20），缓存自然有界，无需淘汰策略。
+/// 取锁统一用 `unwrap_or_else(|e| e.into_inner())`，防 poison 拖垮工作线程。
+static SID_NAME_CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// 【低成本身份获取，鉴权前调用】管道对端 PID + 主 SID 字符串。
+///
+/// 全程仅本地调用（GetNamedPipeClientProcessId → OpenProcess → OpenProcessToken →
+/// GetTokenInformation → ConvertSidToStringSidW），**不含 `LookupAccountSidW`，无域控往返**。
+/// 因此即便对暴力尝试 / 无效连接执行本函数，也不会引入域环境下的每连接延迟，
+/// 同时保留精确的审计标识（SID 全局唯一，可离线反解为账户名）。
+///
+/// 返回 `(显示串, pid, Option<sid_string>)`：
+/// - 正常：显示串 = SID 字符串（如 `S-1-5-21-...`），第三项 `Some(sid)` 供鉴权成功后升级为账户名；
+/// - 逐级降级：取不到 SID 显示 `pid=N`，取不到 PID 显示 `unknown`，第三项 `None`。
+fn client_identity_cheap(file: &File) -> (String, u32, Option<String>) {
     use core::ffi::c_void;
     use std::os::windows::io::AsRawHandle;
 
     let handle = file.as_raw_handle() as winapi_raw::HANDLE;
     let mut pid: u32 = 0;
     if unsafe { winapi_raw::GetNamedPipeClientProcessId(handle, &mut pid) } == 0 || pid == 0 {
-        return None;
+        return ("unknown".to_string(), 0, None);
     }
 
     let proc = unsafe {
         winapi_raw::OpenProcess(winapi_raw::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
     };
     if proc.is_null() {
-        return Some((format!("pid={pid}"), pid));
+        return (format!("pid={pid}"), pid, None);
     }
     let mut token: winapi_raw::HANDLE = std::ptr::null_mut();
     let tok_ok = unsafe { winapi_raw::OpenProcessToken(proc, winapi_raw::TOKEN_QUERY, &mut token) };
     unsafe { winapi_raw::CloseHandle(proc); }
     if tok_ok == 0 || token.is_null() {
-        return Some((format!("pid={pid}"), pid));
+        return (format!("pid={pid}"), pid, None);
     }
 
     // 先查 TokenUser 所需缓冲大小（期望 ERROR_INSUFFICIENT_BUFFER + need）
@@ -180,13 +196,60 @@ fn client_identity(file: &File) -> Option<(String, u32)> {
     };
     unsafe { winapi_raw::CloseHandle(token); }
     if got == 0 {
-        return Some((format!("pid={pid}"), pid));
+        return (format!("pid={pid}"), pid, None);
     }
 
     let tu = unsafe { &*(buf.as_ptr() as *const winapi_raw::TOKEN_USER) };
     let sid = tu.User.Sid;
     if sid.is_null() {
-        return Some((format!("pid={pid}"), pid));
+        return (format!("pid={pid}"), pid, None);
+    }
+
+    // SID → 字符串（纯本地格式化，无 DC 往返）：既作鉴权前的审计标识，也作名称解析缓存键
+    let mut psz: *mut u16 = std::ptr::null_mut();
+    if unsafe { winapi_raw::ConvertSidToStringSidW(sid, &mut psz) } == 0 || psz.is_null() {
+        return (format!("pid={pid}"), pid, None);
+    }
+    let sid_str = unsafe { wide_ptr_to_string(psz) };
+    unsafe { winapi_raw::LocalFree(psz as *mut c_void); }
+    (sid_str.clone(), pid, Some(sid_str))
+}
+
+/// 【昂贵身份解析，仅鉴权成功后调用】SID 字符串 → 可读账户名（`domain\user`），带进程内缓存。
+///
+/// 命中缓存直接返回；未命中才执行 `ConvertStringSidToSidW` + `LookupAccountSidW`
+/// （后者在域环境可能查询域控）。解析失败时回退返回原 SID 字符串（仍可追溯）。
+fn resolve_sid_display(sid: &str) -> String {
+    // 命中缓存：跳过潜在的域控查询
+    {
+        let cache = SID_NAME_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = cache.as_ref() {
+            if let Some(name) = map.get(sid) {
+                return name.clone();
+            }
+        }
+    }
+    // 未命中：真正解析（可能触发 DC 查询），失败回退为 SID 字符串
+    let name = lookup_account_name(sid).unwrap_or_else(|| sid.to_string());
+    {
+        let mut cache = SID_NAME_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .get_or_insert_with(HashMap::new)
+            .insert(sid.to_string(), name.clone());
+    }
+    name
+}
+
+/// SID 字符串 → `domain\user`。内部先把字符串 SID 还原为 PSID，再调用 LookupAccountSidW。
+/// 任一步失败返回 None（由调用方决定回退显示）。
+fn lookup_account_name(sid_str: &str) -> Option<String> {
+    use core::ffi::c_void;
+
+    let sid_w = common::to_wide(sid_str);
+    let mut psid: *mut c_void = std::ptr::null_mut();
+    if unsafe { winapi_raw::ConvertStringSidToSidW(sid_w.as_ptr(), &mut psid) } == 0 || psid.is_null()
+    {
+        return None;
     }
 
     let mut name = [0u16; 256];
@@ -197,7 +260,7 @@ fn client_identity(file: &File) -> Option<(String, u32)> {
     let lok = unsafe {
         winapi_raw::LookupAccountSidW(
             std::ptr::null(),
-            sid,
+            psid,
             name.as_mut_ptr(),
             &mut name_len,
             domain.as_mut_ptr(),
@@ -205,12 +268,22 @@ fn client_identity(file: &File) -> Option<(String, u32)> {
             &mut use_,
         )
     };
+    unsafe { winapi_raw::LocalFree(psid); }
     if lok == 0 {
-        return Some((format!("pid={pid}"), pid));
+        return None;
     }
     let user = String::from_utf16_lossy(&name[..name_len as usize]);
     let dom = String::from_utf16_lossy(&domain[..domain_len as usize]);
-    Some((format!("{dom}\\{user}"), pid))
+    Some(format!("{dom}\\{user}"))
+}
+
+/// 读取以 NUL 结尾的宽字符串指针为 String（用于系统分配的字符串 SID）。
+unsafe fn wide_ptr_to_string(p: *const u16) -> String {
+    let mut len = 0usize;
+    while *p.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
 }
 
 /// 恒定时间字符串比较（防时序侧信道逐字符猜测令牌）。
@@ -231,7 +304,7 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// 处理单个客户端：读请求 -> 鉴权 -> 执行 -> 回写
 fn handle_client(mut file: File) {
     // 并发信号量：超出上限直接拒绝（防线程轰炸）
-    if ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+    if ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst) >= common::MAX_CONNS {
         ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
         let _ = protocol::write_frame(
             &mut file,
@@ -249,11 +322,10 @@ fn handle_client(mut file: File) {
     let _guard = ConnGuard;
 
     let token = common::cached_token();
-    // 审计：先解析管道对端调用者身份（PID + 用户名）
-    let (caller, caller_pid) = match client_identity(&file) {
-        Some((u, p)) => (u, p),
-        None => ("unknown".to_string(), 0),
-    };
+    // 审计（C2 优化）：鉴权前仅做「低成本」身份解析——PID + SID 字符串（纯本地，无域控往返）。
+    // 昂贵的 SID→账户名解析（LookupAccountSidW，域环境可能查询域控）推迟到鉴权成功后再做，
+    // 避免暴力尝试 / 无效连接放大每连接延迟；失败尝试仍以 SID 精确留痕（可离线反解）。
+    let (mut caller, caller_pid, caller_sid) = client_identity_cheap(&file);
 
     // 鉴权节流：锁定期间拒绝一切请求
     {
@@ -271,8 +343,9 @@ fn handle_client(mut file: File) {
         }
     }
 
-    // 读请求（带 10s 读超时，防客户端连接后不发数据导致线程泄漏）
-    let frame = match protocol::read_frame_timeout(&mut file, 10_000) {
+    // 读请求（10s 空闲读超时：连续 10s 无新数据才断开；大请求按 payload 放宽绝对上限，
+    // 既防客户端连接后不发数据导致的线程泄漏，又不误伤慢速管道上的大负载。见 protocol.rs）
+    let frame = match protocol::read_frame_timeout(&mut file, common::PIPE_READ_TIMEOUT_MS) {
         Ok(f) => f,
         Err(_) => return,
     };
@@ -316,6 +389,12 @@ fn handle_client(mut file: File) {
         }
     }
 
+    // C2 优化：鉴权成功后才把 SID 升级为可读账户名（LookupAccountSidW + 进程内缓存），
+    // 供审计日志与 GUI 实时事件流展示。失败 / 锁定路径已在上方以 SID 留痕，不触发此昂贵解析。
+    if let Some(sid) = caller_sid.as_deref() {
+        caller = resolve_sid_display(sid);
+    }
+
     // 启用开关
     if !common::is_enabled() {
         let _ = protocol::write_frame(
@@ -326,7 +405,9 @@ fn handle_client(mut file: File) {
     }
 
     // 超时钳制：客户端可传超时，但上限 10 分钟（防持令牌客户端长期占用 SYSTEM 服务）
-    let timeout_ms = req.timeout_ms.unwrap_or(60_000).min(600_000);
+    let timeout_ms = req.timeout_ms
+        .unwrap_or(common::DEFAULT_COMMAND_TIMEOUT_MS)
+        .min(common::MAX_COMMAND_TIMEOUT_MS);
 
     // GUI 实时信息流：执行开始事件
     common::log_event(serde_json::json!({

@@ -41,6 +41,12 @@ pub const ERROR_PIPE_CONNECTED: u32 = 535;
 /// CreateFileW 连接命名管道时，所有实例均忙（服务端尚未 accept）返回此错误码。
 /// 客户端标准做法：WaitNamedPipeW 等待实例就绪后重试。
 pub const ERROR_PIPE_BUSY: u32 = 231;
+/// CreateFileW / WaitNamedPipeW 在命名管道根本不存在时返回此错误码，
+/// 即「中继服务未运行」。客户端应立即精准失败，不再重试。
+pub const ERROR_FILE_NOT_FOUND: u32 = 2;
+/// WaitNamedPipeW 等待超时（管道存在但实例持续忙、未在超时窗口内释放）返回此错误码。
+/// 与 ERROR_FILE_NOT_FOUND 区分：这是「实例忙」，应继续重试。
+pub const ERROR_SEM_TIMEOUT: u32 = 121;
 
 // ---- 控制台附加（GUI 子系统程序 CLI 输出可见性）----
 /// AttachConsole 的 dwProcessId 特殊值：附加调用进程的父进程控制台
@@ -238,6 +244,16 @@ extern "system" {
         cchReferencedDomainName: *mut u32,
         peUse: *mut u32,
     ) -> BOOL;
+
+    /// SID -> 字符串 SID（"S-1-5-21-..."）。纯本地格式化，无域控往返。
+    /// 用于鉴权前的低成本审计标识：失败尝试也可精确留痕，且不触发 LookupAccountSidW 的域控查询。
+    /// 输出字符串由系统分配（LocalAlloc），使用完毕须 LocalFree 释放。
+    pub fn ConvertSidToStringSidW(Sid: *const c_void, StringSid: *mut *mut u16) -> BOOL;
+
+    /// 字符串 SID（"S-1-5-21-..."）-> PSID。LookupAccountSidW 需要 PSID 而非字符串，
+    /// 故鉴权成功后由缓存键（SID 字符串）还原 PSID 再解析账户名。
+    /// 输出 PSID 由系统分配（LocalAlloc），使用完毕须 LocalFree 释放。
+    pub fn ConvertStringSidToSidW(StringSid: PCWSTR, Sid: *mut *mut c_void) -> BOOL;
 
     /// 配置服务失败恢复策略（SCM Recovery Actions，防异常终止后不重启）
     pub fn ChangeServiceConfig2W(hService: HANDLE, dwInfoLevel: u32, lpInfo: *const c_void) -> BOOL;

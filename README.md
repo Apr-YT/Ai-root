@@ -40,6 +40,7 @@ powershell -ExecutionPolicy Bypass -File deploy.ps1
 | 项 | 路径 |
 |---|---|
 | 服务二进制 | `D:\Kiln\AI-root\ai-root.exe` |
+| GUI 成品 | `D:\Kiln\AI-root\ai-root-gui.exe`（双击打开控制台） |
 | 全局包装器 | `C:\Windows\ai-root.cmd` |
 | 数据/令牌目录 | `C:\ProgramData\ai-root\` |
 | 令牌文件 | `C:\ProgramData\ai-root\token.txt` |
@@ -208,13 +209,15 @@ ai-root run -- <原始命令>
 `ai-root gui`（或**双击 exe**）打开原生 GUI 控制台——**人类巡检/应急面板**，不替代管道/CLI（AI 消费方权威接口仍是 §3 的调用契约）。
 
 - **深色「运维控制台」主题**：深蓝灰面板 + 高对比语义色（开始蓝 / 成功绿 / 失败红 / 轮换琥珀），状态一目了然。
+- **窗口自适应**：初始 1280×800，最小 960×600；左侧栏 240–480px 可拖；三 Tab 与列表随窗口伸缩（`available_*` 布局）。
 - **顶部**：服务状态徽章（运行/停止/未安装 + 中继启用 toggle 开关）。
-- **实时信息流**：1s 增量轮询 `events.jsonl`，实时显示 AI 每次执行的「开始/完成」（含 caller/pid/退出码/时长/输出摘要）。
-- **命令台**：常用命令一键、输入框 Enter 执行 / ↑ 历史、执行历史回填、输出区。
-- **审计日志**：`exec.log` 着色（exit≠0 红色 + 左侧色条）+ 关键字过滤。
+- **实时信息流**：1s 增量轮询 `events.jsonl`，实时显示 AI 每次执行的「开始/完成」（含 caller/pid/退出码/时长/输出摘要）；支持等级筛选、暂停滚动、清空显示、重新加载（绕过 1s 节流立即生效）。
+- **命令台**：常用命令一键、输入框 Enter 执行 / ↑ 历史、执行历史回填、输出区（自动滚动 + 历史翻看）。
+- **审计日志**：`exec.log` 着色（exit≠0 红色 + 左侧色条）+ 关键字/PID 精确过滤 + 「清空过滤」（仅清条件）/「清空显示」（清空内容，后续新记录仍追加）/「刷新日志」。
 - **令牌区**：前 8 位指纹 + 写入时间；「轮换令牌」二次确认后走系统确认弹窗。
 - **管理员操作隔离**：安装/卸载折叠在红色「仅首次/应急」区，与日常操作视觉切割。
-- **系统托盘常驻**：角标绿=运行且启用 / 红=运行但禁用 / 灰=停止；右键菜单（启停/中继开关/轮换/打开/退出）；**关闭窗口=最小化到托盘**，托盘「退出」才结束 GUI 进程（不影响服务）。
+- **控制按钮状态感知**：启动/停止/安装/卸载按服务状态自动禁用（Running 时「启动/安装」置灰，Stopped/未安装时「停止/卸载」置灰），与托盘菜单状态一致。
+- **系统托盘常驻**：角标绿=运行且启用 / 红=运行但禁用 / 灰=停止；右键菜单（启停/中继开关/轮换/打开/退出）；**关闭窗口=最小化到托盘**，托盘「退出」才结束 GUI 进程（不影响服务）。托盘事件经 `set_event_handler` 转发 + `request_repaint` 唤醒主循环，**窗口隐藏后菜单点击（含退出）实时响应**；「退出控制台」在事件线程直接退出，不依赖主循环。
 - **CLI 输出可见性**：exe 为 GUI 子系统，CLI 命令（status/run/update 等）启动时自动附加父进程控制台（`AttachConsole`），交互终端输出可见；管道/重定向捕获不受影响。
 
 ---
@@ -234,8 +237,8 @@ ai-root run -- <原始命令>
 两种构建变体（Cargo feature `gui`，默认开启）：
 
 ```text
-headless（服务端/CLI，无 GUI 依赖）   cargo build --release --no-default-features     → ~672KB / 11 导入 DLL
-GUI 成品（含 egui + tray-icon）      cargo build --release                        → ~5.5MB / 25 导入 DLL
+headless（服务端/CLI，无 GUI 依赖）   cargo build --release --no-default-features     → ~706KB（722944B）/ 11 导入 DLL
+GUI 成品（含 egui + tray-icon）      cargo build --release                        → ~5.4MB（5644288B）/ 25 导入 DLL
 ```
 
 > **必须分离 CARGO_TARGET_DIR**（同目录构建会互相覆盖）：headless 用 `D:/wbrelay_target`，GUI 用 `D:/wbrelay_target_gui`。
@@ -258,6 +261,9 @@ export CARGO_TARGET_DIR=D:/wbrelay_target_gui      # GUI
 |---|---|
 | `ai-root.exe` | headless 服务端（部署用，`update` 热更新到 `D:\Kiln\AI-root\`） |
 | `ai-root-gui.exe` | GUI 桌面成品（双击开控制台） |
+
+**部署流程（务必现场重建，勿复用早前构建）**：工作树存在并发编辑，`Ai-root-build` 中的旧二进制可能滞后于源码（实测同尺寸但哈希不同）。固定流程：
+`cargo build --release`（两变体，各自 CARGO_TARGET_DIR）→ 复制到 `Ai-root-build` → `ai-root update <Ai-root-build\ai-root.exe>` → 校验部署哈希一致 + `run --json whoami`=SYSTEM。
 
 **CI**：`.github/workflows/ci.yml` 在 GitHub Actions `windows-latest` 上自动执行 `build.ps1`（MSVC release 构建产物校验，提交到 main 或 PR 时触发）。
 

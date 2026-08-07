@@ -395,7 +395,12 @@ pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::
             std::thread::sleep(Duration::from_millis(500));
         }
         if service.query_status()?.current_state != ServiceState::Stopped {
-            return Err("服务停止超时".into());
+            // 超时但二进制尚未覆盖、服务未损坏（不会留下坏服务），状态安全可直接重试。
+            return Err(
+                "服务停止超时（15s 内未变为 Stopped）。现有二进制尚未覆盖、服务未损坏，可安全重试：\
+                 请确认服务已停止（ai-root status / services.msc）后再次执行 update"
+                    .into(),
+            );
         }
     }
 
@@ -506,6 +511,10 @@ fn service_run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 运行管道服务，直到收到 stop 事件（监控线程会中断阻塞的 ConnectNamedPipe）
     server::run_pipe_server(stop_event);
+
+    // 服务停止前强制落盘缓冲日志（events.jsonl 实时 flush；exec.log 审计可能仍在缓冲），
+    // 防止常驻句柄上的审计条目因进程退出未 flush 而丢失。
+    common::flush_logs();
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,

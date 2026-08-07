@@ -18,6 +18,7 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use crate::common;
 
 pub struct ExecResult {
     pub exit_code: i32,
@@ -41,9 +42,6 @@ impl ExecResult {
         }
     }
 }
-
-/// 单流输出上限（字节）。防止 `dir /s C:\` 等命令产出 GB 级输出拖垮 SYSTEM 内存。
-const OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// 执行命令，带超时（毫秒）。超时则终止进程。
 pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
@@ -87,7 +85,7 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
 /// - `&`/`&&`/`|`/`()` 均为 cmd 正常语义（不转义）；同一行内 `set x=1 & echo %x%`
 ///   的 `%x%` 在解析期展开为空，需写 `& call echo %x%`；
 /// - 含 `(`/`)` 的括号块（`if (...)` / `for ... do (...)`）无法拼接为单行，自动回退文件方案；
-/// - 拼接后长度超过 6000 字符回退文件方案（cmd 命令行上限 8191）。
+/// - 拼接后长度超过 common::SCRIPT_INLINE_MAX_LEN 字符回退文件方案（cmd 命令行上限 8191）。
 fn run_script(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
     let norm = script.replace("\r\n", "\n");
     let has_paren = norm.contains('(') || norm.contains(')');
@@ -98,7 +96,7 @@ fn run_script(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
         .collect::<Vec<_>>()
         .join(" & ");
 
-    if !has_paren && !joined.is_empty() && joined.len() <= 6000 {
+    if !has_paren && !joined.is_empty() && joined.len() <= common::SCRIPT_INLINE_MAX_LEN {
         let mut builder = Command::new("cmd");
         // raw_arg 原样传参、不 escape_cmd_meta：脚本模式中 `&` 是命令分隔符（cmd 原生语义），
         // 中文经 UTF-16 命令行传递无乱码
@@ -202,7 +200,7 @@ fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
                         }
                     }
                 }
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(common::CHILD_POLL_INTERVAL_MS));
             }
             Err(e) => {
                 return ExecResult::error(format!("try_wait 失败: {e}"));
@@ -231,7 +229,7 @@ fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
 /// 现改为超限后**继续排空管道（读到 EOF，丢弃超出的字节）**，让子进程自然跑完退出；
 /// 截断标记仅用于告知客户端输出被裁剪，超时判定完全由子进程真实退出状态决定。
 fn drain_pipe<R: Read>(pipe: Option<R>) -> (Vec<u8>, bool) {
-    let mut buf = Vec::with_capacity(OUTPUT_LIMIT.min(64 * 1024));
+    let mut buf = Vec::with_capacity(common::OUTPUT_LIMIT.min(64 * 1024));
     let mut truncated = false;
     if let Some(mut p) = pipe {
         let mut chunk = [0u8; 8192];
@@ -239,11 +237,11 @@ fn drain_pipe<R: Read>(pipe: Option<R>) -> (Vec<u8>, bool) {
             match p.read(&mut chunk) {
                 Ok(0) => break, // 管道关闭，子进程已结束
                 Ok(n) => {
-                    if buf.len() < OUTPUT_LIMIT {
+                    if buf.len() < common::OUTPUT_LIMIT {
                         // 仍未到上限：截取不超过上限的字节，恰好填满时标记截断
-                        let take = (OUTPUT_LIMIT - buf.len()).min(n);
+                        let take = (common::OUTPUT_LIMIT - buf.len()).min(n);
                         buf.extend_from_slice(&chunk[..take]);
-                        if buf.len() >= OUTPUT_LIMIT {
+                        if buf.len() >= common::OUTPUT_LIMIT {
                             truncated = true;
                         }
                     } else {

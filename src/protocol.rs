@@ -40,25 +40,32 @@ pub struct Response {
     pub truncated: bool,
 }
 
-/// 从文件（包装的管道句柄）读取一帧，带读超时（毫秒）
+/// 从文件（包装的管道句柄）读取一帧，采用「空闲超时」计时（毫秒）
 ///
 /// 防线程泄漏：客户端连接后若不发送数据，read_exact 会永久阻塞工作线程。
-/// 通过 PeekNamedPipe 轮询可用字节数实现超时：帧头 4 字节等待 + 帧体等待，
-/// 超时返回 TimedOut 错误，调用方据此释放线程。
-pub fn read_frame_timeout(file: &mut File, timeout_ms: u64) -> io::Result<Vec<u8>> {
+/// 通过 PeekNamedPipe 轮询可用字节数实现超时。
+///
+/// 计时语义（B4 优化）：旧实现让「帧头等待 + 帧体读取」共享同一个总预算 deadline，
+/// 导致接近 16MB 上限的大负载在慢速管道上，可能因累计耗时（而非真正卡死）在帧体
+/// 中途被误判超时断连。现改为分阶段计时：
+///   1. 帧头阶段——保留原有「连接后静默」保护：连续 `idle_ms` 拿不到 4 字节帧头即超时。
+///   2. 帧体阶段——`idle_ms` 作为「空闲窗口」：每读到新增数据就刷新计时，仅当「连续
+///      `idle_ms` 无任何新字节」才判定超时；稳定流式传输的大帧不会被误断。
+///      同时叠加一个按 payload 长度放宽的**绝对上限**（本地命名管道吞吐极高，此上限主要
+///      兜底慢速涓流 / slow-loris 长期占用工作线程），既修复误超时又不削弱 DoS 防护。
+pub fn read_frame_timeout(file: &mut File, idle_ms: u64) -> io::Result<Vec<u8>> {
     use std::os::windows::io::AsRawHandle;
     use std::time::{Duration, Instant};
 
     let handle = file.as_raw_handle() as winapi_raw::HANDLE;
-    let start = Instant::now();
-    let deadline = Duration::from_millis(timeout_ms);
+    let idle = Duration::from_millis(idle_ms);
 
-    // 等待帧头 4 字节可用
-    loop {
+    // 轮询管道当前可读字节数；对端关闭时返回 Err(BrokenPipe)
+    let peek = |h: winapi_raw::HANDLE| -> io::Result<u32> {
         let mut total: u32 = 0;
         let ok = unsafe {
             winapi_raw::PeekNamedPipe(
-                handle,
+                h,
                 std::ptr::null_mut(),
                 0,
                 std::ptr::null_mut(),
@@ -72,67 +79,73 @@ pub fn read_frame_timeout(file: &mut File, timeout_ms: u64) -> io::Result<Vec<u8
                 "PeekNamedPipe 失败（对端关闭）",
             ));
         }
+        Ok(total)
+    };
+
+    // ---- 帧头阶段：等待 4 字节可用 ----
+    // 语义与旧实现一致：连接后连续 idle_ms 无帧头即超时（防连接后静默的线程泄漏）
+    let hdr_start = Instant::now();
+    loop {
+        let total = peek(handle)?;
         if total >= 4 {
             break;
         }
-        if start.elapsed() >= deadline {
+        if hdr_start.elapsed() >= idle {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("读帧头超时（>{timeout_ms}ms 无数据，客户端可能连接后未发送）"),
+                format!("读帧头超时（>{idle_ms}ms 无数据，客户端可能连接后未发送）"),
             ));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(common::PIPE_POLL_INTERVAL_MS));
     }
 
     // 读帧头
     let mut len_buf = [0u8; 4];
     file.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > 16 * 1024 * 1024 {
+    if len > common::FRAME_MAX_SIZE {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
     }
 
-    // 等待帧体 len 字节可用（Peek 轮询）
+    // ---- 帧体阶段：空闲超时 + 按 payload 放宽的绝对上限 ----
+    // 绝对上限：按「最低吞吐 256KB/s」折算并叠加一个 idle 基准，仅用于兜底慢速涓流；
+    // 16MB => ~64s + idle，本地管道正常大负载在毫秒级即完成，绝不会触及此上限。
+    let body_start = Instant::now();
+    let body_hard = idle + Duration::from_millis((len as u64) / 256); // 256 B/ms = 256 KB/s
     let mut buf = vec![0u8; len];
     let mut filled = 0usize;
-    loop {
-        if filled >= len {
-            break;
+    let mut last_progress = Instant::now();
+    while filled < len {
+        // 绝对上限始终生效（即便数据在持续涓流也会兜底），防 slow-loris 拖满线程
+        if body_start.elapsed() >= body_hard {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("读帧体总超时（已收 {filled}/{len} 字节）"),
+            ));
         }
-        let mut total: u32 = 0;
-        let ok = unsafe {
-            winapi_raw::PeekNamedPipe(
-                handle,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &mut total,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "对端关闭"));
-        }
+        let total = peek(handle)?;
         if total == 0 {
-            if start.elapsed() >= deadline {
+            // 无新数据：仅当空闲窗口耗尽才超时（有增量会在下方刷新 last_progress）
+            if last_progress.elapsed() >= idle {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("读帧体超时（>{timeout_ms}ms）"),
+                    format!("读帧体空闲超时（>{idle_ms}ms 无新数据，已收 {filled}/{len} 字节）"),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(common::PIPE_POLL_INTERVAL_MS));
             continue;
         }
         let n = (total as usize).min(len - filled);
         file.read_exact(&mut buf[filled..filled + n])?;
         filled += n;
+        last_progress = Instant::now(); // 有增量：刷新空闲计时
     }
     Ok(buf)
 }
 
-/// 兼容旧调用：默认 60s 读超时
+/// 兼容旧调用：默认 60s 空闲读超时
 pub fn read_frame(file: &mut File) -> io::Result<Vec<u8>> {
-    read_frame_timeout(file, 60_000)
+    read_frame_timeout(file, common::CLIENT_READ_TIMEOUT_MS)
 }
 
 /// 向文件写入一帧
@@ -149,6 +162,11 @@ pub fn write_frame(file: &mut File, data: &[u8]) -> io::Result<()> {
 /// 多个客户端并发连接时，CreateFileW 会撞 ERROR_PIPE_BUSY(231)。
 /// 标准处理：WaitNamedPipeW 等待实例就绪后重试（最多约 3s），
 /// 保证 AI 并发调用 `run` 时不会偶发「连接失败」。
+///
+/// 关键区分（避免服务未运行时的无谓重试）：CreateFileW / WaitNamedPipeW
+/// 失败时读取 GetLastError()，将「管道不存在（ERROR_FILE_NOT_FOUND=2，服务未运行）」
+/// 与「实例忙（ERROR_PIPE_BUSY=231 / ERROR_SEM_TIMEOUT=121）」分开处理：
+/// 前者立即返回精准的「服务未运行」错误，后者才进入等待重试循环。
 pub fn connect_client() -> io::Result<File> {
     use std::os::windows::io::{FromRawHandle, RawHandle};
     use std::time::Duration;
@@ -171,21 +189,53 @@ pub fn connect_client() -> io::Result<File> {
             return Ok(unsafe { File::from_raw_handle(handle as RawHandle) });
         }
         let err = unsafe { winapi_raw::GetLastError() };
+        // 管道根本不存在 = 服务未运行：立即精准失败，不做无意义的重试
+        if err == winapi_raw::ERROR_FILE_NOT_FOUND {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "中继服务未运行（命名管道不存在）",
+            ));
+        }
+        // 仅「所有实例忙」才值得等待重试；其余错误直接失败
         if err != winapi_raw::ERROR_PIPE_BUSY {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("无法连接管道（last_err={err}），中继服务是否运行？"),
             ));
         }
-        // 等待服务端创建可用实例；管道已消失则快速失败
-        let waited = unsafe { winapi_raw::WaitNamedPipeW(name.as_ptr(), 500) };
-        if waited == 0 && attempt >= 5 {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "连接管道超时（持续忙），中继服务是否运行？",
-            ));
+        // 等待服务端释放/新建可用实例（最多 500ms）
+        let waited = unsafe { winapi_raw::WaitNamedPipeW(name.as_ptr(), common::PIPE_CONNECT_WAIT_MS) };
+        if waited == 0 {
+            // WaitNamedPipeW 返回 0 有多种语义，必须靠 GetLastError 精确区分，不能一概按超时处理：
+            match unsafe { winapi_raw::GetLastError() } {
+                // 管道消失（等待期间服务停止）=> 服务未运行，立即精准失败，不再机械重试
+                winapi_raw::ERROR_FILE_NOT_FOUND => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "中继服务未运行（等待管道实例时管道已消失）",
+                    ));
+                }
+                // 等待超时：管道仍在但实例持续忙 => 属正常并发竞争，耗尽次数才放弃
+                winapi_raw::ERROR_SEM_TIMEOUT => {
+                    if attempt >= 5 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "连接管道超时（服务持续繁忙，实例未释放）",
+                        ));
+                    }
+                }
+                // 其他意外错误：给出精准 last_err，同样耗尽次数才放弃
+                other => {
+                    if attempt >= 5 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            format!("等待管道实例失败（last_err={other}），中继服务是否运行？"),
+                        ));
+                    }
+                }
+            }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(common::PIPE_CONNECT_RETRY_SLEEP_MS));
     }
     Err(io::Error::new(
         io::ErrorKind::ConnectionRefused,
