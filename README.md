@@ -1,4 +1,4 @@
-# ai-root
+# AI-Root
 
 > **面向 AI 智能体自调用的 LocalSystem 提权命令中继。**
 > 非提权（普通用户）的智能体进程，仅凭一个共享令牌即可通过命名管道以 `SYSTEM` 权限自治执行命令，全程无需 UAC 弹窗。本工具的主要消费方是 AI 智能体本身，文档聚焦于「如何可靠对接」而非「人怎么敲命令」。
@@ -8,8 +8,8 @@
 ## 1. 架构
 
 ```
-┌─────────────┐   命名管道 \\.\pipe\ai-root    ┌──────────────────────┐
-│  AI 智能体   │ ──── 请求(令牌+命令) ───────> │  ai-root 服务进程     │
+┌─────────────┐   命名管道 \\.\pipe\AI-Root    ┌──────────────────────┐
+│  AI 智能体   │ ──── 请求(令牌+命令) ───────> │  AI-Root 服务进程     │
 │ (非提权用户) │ <── 响应(退出码+stdout/stderr)─│  (LocalSystem 运行)   │
 └─────────────┘                               └──────────┬───────────┘
                                                         │ cmd /C <command>
@@ -17,48 +17,46 @@
                                                   SYSTEM 最高权限执行
 ```
 
-- **服务**：以 `LocalSystem` 注册为自启 Windows 服务（`SERVICE_NAME = "ai-root"`）。
-- **管道**：`\\.\pipe\ai-root`，SDDL 限制连接方为 `SYSTEM` / `Administrators` / `Interactive` + 安装用户 SID（确保智能体进程可无人值守连接）。
-- **令牌**：安装时生成 32 字节随机十六进制令牌，落盘于 `C:\ProgramData\ai-root\token.txt`，目录 ACL 仅 `SYSTEM` 完全控制 + 当前用户只读。
+- **服务**：以 `LocalSystem` 注册为自启 Windows 服务（`SERVICE_NAME = "AI-Root"`）。
+- **管道**：`\\.\pipe\AI-Root`，SDDL 限制连接方为 `SYSTEM` / `Administrators` / `Interactive` + 安装用户 SID（确保智能体进程可无人值守连接）。
+- **令牌**：安装时生成 32 字节随机十六进制令牌，落盘于 `C:\ProgramData\AI-Root\token.txt`，目录 ACL 仅 `SYSTEM` 完全控制 + 当前用户只读。
 
 ---
 
 ## 2. 部署（仅需一次，管理员）
 
 ```powershell
-# 以管理员运行 deploy.ps1（注册服务、生成令牌、设置 SDDL、写入 C:\Windows\ai-root.cmd）
+# 以管理员运行 deploy.ps1（注册服务、生成令牌、设置 SDDL、写入 C:\Windows\AI-Root.cmd）
 powershell -ExecutionPolicy Bypass -File deploy.ps1
 ```
 
 > **一次性管理员，之后零介入**：`install` 除注册服务外，还会给**当前用户 SID** 追加服务的
 > `GRGX` 权限（GENERIC_READ|GENERIC_EXECUTE，含 QUERY_STATUS/START/STOP，Windows 服务安全描述符
 > 标准机制；实测 SDDL 零散位 `RP/WP/LO` 组合不含 QUERY_STATUS，勿用）。此后智能体（用户身份、非提权）
-> 可自主执行 `ai-root status/stop/start/update`，**更新服务二进制不再需要管理员**。
+> 可自主执行 `AI-Root status/stop/start/update`，**更新服务二进制不再需要管理员**。
 
 部署产物：
 
 | 项 | 路径 |
 |---|---|
-| 服务二进制 | `D:\Kiln\AI-root\ai-root.exe` |
-| GUI 成品 | `D:\Kiln\AI-root\ai-root-gui.exe`（双击打开控制台） |
-| 全局包装器 | `C:\Windows\ai-root.cmd` |
-| 数据/令牌目录 | `C:\ProgramData\ai-root\` |
-| 令牌文件 | `C:\ProgramData\ai-root\token.txt` |
-| 审计日志 | `C:\ProgramData\ai-root\exec.log` |
-| 实时事件流 | `C:\ProgramData\ai-root\events.jsonl`（GUI「实时信息流」数据源） |
+| 服务二进制 | `D:\Kiln\AI-Root\AI-Root.exe` |
+| 全局包装器 | `C:\Windows\AI-Root.cmd` |
+| 数据/令牌目录 | `C:\ProgramData\AI-Root\` |
+| 令牌文件 | `C:\ProgramData\AI-Root\token.txt` |
+| 审计日志 | `C:\ProgramData\AI-Root\exec.log` |
+| 实时事件流 | `C:\ProgramData\AI-Root\events.jsonl`（`AI-Root tail` 实时跟随数据源） |
 
 安装后服务自启。常用管理命令：
 
 ```text
-ai-root install     # 注册为 LocalSystem 自启服务（管理员，仅首次；已存在时给出指引）
-ai-root uninstall   # 卸载服务（管理员；同时清理部署目录/全局包装器/令牌/身份文件）
-ai-root rotate-token  # 轮换共享令牌（写盘后服务端自动热加载，旧令牌立即失效）
-ai-root start       # 启动服务（install 授权后非提权即可）
-ai-root stop        # 停止服务（install 授权后非提权即可）
-ai-root update <新exe路径>  # 自主更新服务二进制：PE 校验→停服务→覆盖→启服务（无需管理员）
-ai-root status      # 查询服务状态
-ai-root gui         # 打开 GUI 控制面板（人工巡检用）
-ai-root -h          # 命令行帮助（无参数双击 exe = 默认打开 GUI）
+AI-Root install     # 注册为 LocalSystem 自启服务（管理员，仅首次；已存在时给出指引）
+AI-Root uninstall   # 卸载服务（管理员；同时清理部署目录/全局包装器/令牌/身份文件）
+AI-Root rotate-token  # 轮换共享令牌（写盘后服务端自动热加载，旧令牌立即失效）
+AI-Root start       # 启动服务（install 授权后非提权即可）
+AI-Root stop        # 停止服务（install 授权后非提权即可）
+AI-Root update <新exe路径>  # 自主更新服务二进制：PE 校验→停服务→覆盖→启服务（无需管理员）
+AI-Root status      # 查询服务状态
+AI-Root -h          # 命令行帮助（无参数双击 exe = 打印帮助并等待按键，防一闪而过）
 ```
 
 > **失败自动重启**：`install` 会配置 SCM Recovery Actions（异常终止后 60s/300s/600s 依次自动重启），
@@ -70,38 +68,38 @@ ai-root -h          # 命令行帮助（无参数双击 exe = 默认打开 GUI�
 
 ### 3.1 鉴权
 
-- 读取令牌：`C:\ProgramData\ai-root\token.txt`（当前用户只读，AI 进程以安装用户身份运行即可读取）。
+- 读取令牌：`C:\ProgramData\AI-Root\token.txt`（当前用户只读，AI 进程以安装用户身份运行即可读取）。
 - 每次请求须在 `Request.token` 字段携带正确令牌；令牌不符服务端拒绝执行。
 - **持有令牌即等价于拥有 SYSTEM 命令执行权**——令牌等同于高权限凭据，须妥善保管，不得写入日志、提交仓库或泄露。
 
 ### 3.2 客户端调用形态
 
-`ai-root run` 是智能体最常用的入口，有三种形态：
+`AI-Root run` 是智能体最常用的入口，有三种形态：
 
 ```text
 # 单行命令（默认，非提权即可）
-ai-root run "whoami"
+AI-Root run "whoami"
 
 # 覆盖默认 60s 超时（超时后整棵进程树被杀）
-ai-root run --timeout 5000 "ping -n 10 127.0.0.1"
+AI-Root run --timeout 5000 "ping -n 10 127.0.0.1"
 
 # 多行脚本（文件）：&/&&/|/() 全部正常，推荐用于批量自治
-ai-root run --file C:\tmp\batch.cmd
+AI-Root run --file C:\tmp\batch.cmd
 
 # 从标准输入喂入脚本（多行）
-type C:\tmp\batch.cmd | ai-root run --stdin
+type C:\tmp\batch.cmd | AI-Root run --stdin
 
 # 结构化输出（AI 消费推荐）：{ok,exit_code,stdout,stderr,error,truncated}
-ai-root run --json "whoami"
+AI-Root run --json "whoami"
 
 # 指定工作目录执行
-ai-root run --cwd C:\Windows --json "cd"
+AI-Root run --cwd C:\Windows --json "cd"
 
 # 分隔符之后全部按字面量作为命令（不经任何解析）
-ai-root run -- <原始命令>
+AI-Root run -- <原始命令>
 ```
 
-> **智能体直接拼参数的约定**：通过子进程 `subprocess` 等机制把含换行符的命令字符串传给 `ai-root run` 时，
+> **智能体直接拼参数的约定**：通过子进程 `subprocess` 等机制把含换行符的命令字符串传给 `AI-Root run` 时，
 > 服务端按「命令含 `\n`」自动判定为脚本模式，无需显式 `--file`/`--stdin`。
 
 ### 3.3 命令语义（关键）
@@ -160,8 +158,8 @@ ai-root run -- <原始命令>
 
 ### 3.7 实时事件流（events.jsonl）
 
-服务端在关键节点追加 JSONL 事件到 `C:\ProgramData\ai-root\events.jsonl`（每行一个 JSON 对象），
-供 GUI「实时信息流」及外部监控**增量读取**（按字节偏移读新增行，`size <= offset` 安全返空）：
+服务端在关键节点追加 JSONL 事件到 `C:\ProgramData\AI-Root\events.jsonl`（每行一个 JSON 对象），
+供 `AI-Root tail` 及外部监控**增量读取**（按字节偏移读新增行，`size <= offset` 安全返空）：
 
 | 事件类型 | 触发点 | 关键字段 |
 |---|---|---|
@@ -184,12 +182,12 @@ ai-root run -- <原始命令>
 ## 4. 安全模型
 
 - 令牌仅安装时生成一次；目录 ACL `SYSTEM(F) + 当前用户(R)`，其余账户不可访问。
-- **令牌轮换**：`ai-root rotate-token`（管理员/SYSTEM）生成新令牌写盘，服务端按文件 mtime 变化**自动热加载**（无需重启），旧令牌立即失效。泄露后的标准处置流程：rotate → 更新 AI 侧令牌引用。
-- **审计日志**：`C:\ProgramData\ai-root\exec.log` 逐行记录 `[时间] caller=DOMAIN\user pid=xxx exit=code cmd=...`。`caller` 来自服务端 `GetNamedPipeClientProcessId` 解析的**管道对端进程身份**（非服务自身环境变量），可精确追溯"谁在什么进程里执行了什么"。
+- **令牌轮换**：`AI-Root rotate-token`（管理员/SYSTEM）生成新令牌写盘，服务端按文件 mtime 变化**自动热加载**（无需重启），旧令牌立即失效。泄露后的标准处置流程：rotate → 更新 AI 侧令牌引用。
+- **审计日志**：`C:\ProgramData\AI-Root\exec.log` 逐行记录 `[时间] caller=DOMAIN\user pid=xxx exit=code cmd=...`。`caller` 来自服务端 `GetNamedPipeClientProcessId` 解析的**管道对端进程身份**（非服务自身环境变量），可精确追溯"谁在什么进程里执行了什么"。
 - 管道 SDDL 追加安装用户 SID，使以该用户身份运行的智能体（可能非交互登录）也能稳定连接。
 - 服务 DACL 在 install 时追加安装用户 SID 的 `GRGX`（GENERIC_READ|GENERIC_EXECUTE，含 QUERY_STATUS/START/STOP）——仅授权 status/stop/start/update 自身服务，不授予 CHANGE_CONFIG/WRITE_DAC 等管理权限、不涉及其他服务或系统级权限。
-- 受「启用开关」约束（`C:\ProgramData\ai-root\enabled.flag` 存在即启用），删除即禁用中继（服务端拒绝一切命令，`ok=false, error="中继已禁用"`）。
-  **开关是运行期语义**：禁用后无法通过中继自身恢复（拒绝执行），需本地/管理员重建 flag，或直接非提权 `ai-root stop` + `ai-root start`（服务启动时自动重建 flag，已实测）。
+- 受「启用开关」约束（`C:\ProgramData\AI-Root\enabled.flag` 存在即启用），删除即禁用中继（服务端拒绝一切命令，`ok=false, error="中继已禁用"`）。
+  **开关是运行期语义**：禁用后无法通过中继自身恢复（拒绝执行），需本地/管理员重建 flag，或直接非提权 `AI-Root stop` + `AI-Root start`（服务启动时自动重建 flag，已实测）。
 - 服务运行时（SYSTEM 身份）不会改写令牌/SID，避免错误写入 `S-1-5-18`。
 
 ### 4.1 运行时安全加固
@@ -200,25 +198,18 @@ ai-root run -- <原始命令>
 - **并发信号量**：同时处理连接上限 8（`AtomicU32` + RAII 释放），超出立即返回「服务繁忙」（AI 侧重试即可）。
 - **连接读超时**：帧头/帧体读取带超时（PeekNamedPipe 轮询），防「连上不发数据」的线程泄漏。
 - **输出截断**：stdout/stderr 各 1MB 上限，超出置 `truncated=true`（Response 含该字段，旧客户端 serde 默认兼容）。
-- **update 输入校验**：`ai-root update` 先校验目标为有效 PE（MZ + PE 头 + x64/x86 Machine）并打印 SHA256，非 PE 拒绝，防被误导写入恶意文件。
+- **update 输入校验**：`AI-Root update` 先校验目标为有效 PE（MZ + PE 头 + x64/x86 Machine）并打印 SHA256，非 PE 拒绝，防被误导写入恶意文件。
 
 ---
 
-## 5. GUI 控制台（人工巡检面板）
+## 5. 纯终端版（无 GUI）
 
-`ai-root gui`（或**双击 exe**）打开原生 GUI 控制台——**人类巡检/应急面板**，不替代管道/CLI（AI 消费方权威接口仍是 §3 的调用契约）。
+> **GUI 已于 2026-08-07 彻底移除**：当前只有单一终端版，不再有 GUI 控制面板、系统托盘或 `AI-Root-gui.exe`。若调用 `AI-Root gui` 子命令，将直接报错「本构建为纯终端版，未包含 GUI 控制面板」。
 
-- **深色「运维控制台」主题**：深蓝灰面板 + 高对比语义色（开始蓝 / 成功绿 / 失败红 / 轮换琥珀），状态一目了然。
-- **窗口自适应**：初始 1280×800，最小 960×600；左侧栏 240–480px 可拖；三 Tab 与列表随窗口伸缩（`available_*` 布局）。
-- **顶部**：服务状态徽章（运行/停止/未安装 + 中继启用 toggle 开关）。
-- **实时信息流**：1s 增量轮询 `events.jsonl`，实时显示 AI 每次执行的「开始/完成」（含 caller/pid/退出码/时长/输出摘要）；支持等级筛选、暂停滚动、清空显示、重新加载（绕过 1s 节流立即生效）。
-- **命令台**：常用命令一键、输入框 Enter 执行 / ↑ 历史、执行历史回填、输出区（自动滚动 + 历史翻看）。
-- **审计日志**：`exec.log` 着色（exit≠0 红色 + 左侧色条）+ 关键字/PID 精确过滤 + 「清空过滤」（仅清条件）/「清空显示」（清空内容，后续新记录仍追加）/「刷新日志」。
-- **令牌区**：前 8 位指纹 + 写入时间；「轮换令牌」二次确认后走系统确认弹窗。
-- **管理员操作隔离**：安装/卸载折叠在红色「仅首次/应急」区，与日常操作视觉切割。
-- **控制按钮状态感知**：启动/停止/安装/卸载按服务状态自动禁用（Running 时「启动/安装」置灰，Stopped/未安装时「停止/卸载」置灰），与托盘菜单状态一致。
-- **系统托盘常驻**：角标绿=运行且启用 / 红=运行但禁用 / 灰=停止；右键菜单（启停/中继开关/轮换/打开/退出）；**关闭窗口=最小化到托盘**，托盘「退出」才结束 GUI 进程（不影响服务）。托盘事件经 `set_event_handler` 转发 + `request_repaint` 唤醒主循环，**窗口隐藏后菜单点击（含退出）实时响应**；「退出控制台」在事件线程直接退出，不依赖主循环。
-- **CLI 输出可见性**：exe 为 GUI 子系统，CLI 命令（status/run/update 等）启动时自动附加父进程控制台（`AttachConsole`），交互终端输出可见；管道/重定向捕获不受影响。
+- **双击 exe（无参数）**：打印帮助信息并等待按键，防止终端一闪而过；CLI 交互输出经 `AttachConsole(ATTACH_PARENT_PROCESS)` 可见，管道/重定向不受影响。
+- **实时查看 AI 操作**：用 `AI-Root tail` 实时跟随 `events.jsonl`（支持 `--caller` / `--type` / `--since` 过滤），替代原 GUI「实时信息流」。
+- **审计日志查看**：`C:\ProgramData\AI-Root\exec.log` 逐行记录；人工巡检用任意文本工具或 `AI-Root tail` 查看。
+- **构建产物**：仅 `AI-Root.exe`（console 子系统，~1.9–2.0MB，MinGW 静态链接 CRT）。
 
 ---
 
@@ -234,40 +225,41 @@ ai-root run -- <原始命令>
 
 ## 7. 构建与测试
 
-两种构建变体（Cargo feature `gui`，默认开启）：
-
-```text
-headless（服务端/CLI，无 GUI 依赖）   cargo build --release --no-default-features     → ~706KB（722944B）/ 11 导入 DLL
-GUI 成品（含 egui + tray-icon）      cargo build --release                        → ~5.4MB（5644288B）/ 25 导入 DLL
-```
-
-> **必须分离 CARGO_TARGET_DIR**（同目录构建会互相覆盖）：headless 用 `D:/wbrelay_target`，GUI 用 `D:/wbrelay_target_gui`。
+当前为**单一纯终端版**（无 `gui` feature、无双变体），构建产物仅 `AI-Root.exe`。
 
 ```bash
-# 构建（本机需先 export RUSTUP_HOME='C:\Users\AprYT\.rustup' 指向含 msvc toolchain 的 rustup home）
+# 本机构建（x86_64-pc-windows-gnu + MinGW，因本机无 MSVC 链接器）
 export RUSTUP_HOME='C:\Users\AprYT\.rustup'
-export PATH="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64:$PATH"
-export INCLUDE="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/include;/c/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um;/c/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared;/c/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/ucrt"
-export LIB="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/lib/x64;/c/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x64;/c/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/ucrt/x64"
-export CARGO_TARGET_DIR=D:/wbrelay_target          # headless
-"/c/Users/AprYT/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe" build --release --target x86_64-pc-windows-msvc --no-default-features
-export CARGO_TARGET_DIR=D:/wbrelay_target_gui      # GUI
-"/c/Users/AprYT/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/cargo.exe" build --release --target x86_64-pc-windows-msvc
+export RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu
+export CARGO_TARGET_DIR=D:/AI-Root-target
+"/c/Users/AprYT/.rustup/toolchains/stable-x86_64-pc-windows-gnu/bin/cargo.exe" build --release --target x86_64-pc-windows-gnu
+# → D:/AI-Root-target/x86_64-pc-windows-gnu/release/AI-Root.exe（~1.9–2.0MB，MinGW 静态链接 CRT）
 ```
 
-**产物交付目录 `Ai-root-build\`**（与源码平级，`D:\project\workbuddy\工具\Ai-root-build\`）：
+> CI（GitHub Actions `windows-latest`）用 MSVC toolchain：`build.ps1` 执行 `cargo build --release --target x86_64-pc-windows-msvc` 做产物校验；本机与 CI 的 `CARGO_TARGET_DIR` 需分离，避免互相覆盖。
+
+**产物交付目录 `AI-Root-build\`**（与源码平级，`D:\project\workbuddy\工具\AI-Root-build\`）：
 
 | 文件 | 说明 |
 |---|---|
-| `ai-root.exe` | headless 服务端（部署用，`update` 热更新到 `D:\Kiln\AI-root\`） |
-| `ai-root-gui.exe` | GUI 桌面成品（双击开控制台） |
+| `AI-Root.exe` | 纯终端服务端（部署用，`update` 热更新到 `D:\Kiln\AI-Root\`） |
 
-**部署流程（务必现场重建，勿复用早前构建）**：工作树存在并发编辑，`Ai-root-build` 中的旧二进制可能滞后于源码（实测同尺寸但哈希不同）。固定流程：
-`cargo build --release`（两变体，各自 CARGO_TARGET_DIR）→ 复制到 `Ai-root-build` → `ai-root update <Ai-root-build\ai-root.exe>` → 校验部署哈希一致 + `run --json whoami`=SYSTEM。
+**正式成品包**（2026-08-18 起，与 GG-Ghost 同规：exe + docs/）：
+
+```
+D:\Finished product\AI-Root\
+├── AI-Root.exe        # 交付用二进制（与部署/构建产物一致）
+└── docs\README.md     # 本文档
+```
+
+取用流程：`D:\Finished product\AI-Root\AI-Root.exe` → `AI-Root update <该exe路径>`（服务在跑时热更新，无需管理员）。
+
+**部署流程（务必现场重建，勿复用早前构建）**：工作树存在并发编辑，`AI-Root-build` 中的旧二进制可能滞后于源码（实测同尺寸但哈希不同）。固定流程：
+`cargo build --release`（单一终端变体；CI 用 MSVC，本机无 MSVC 链接器时改用 `x86_64-pc-windows-gnu` + MinGW）→ 复制到 `AI-Root-build` → `AI-Root update <AI-Root-build\AI-Root.exe>` → 校验部署哈希一致 + `run --json whoami`=SYSTEM。
 
 **CI**：`.github/workflows/ci.yml` 在 GitHub Actions `windows-latest` 上自动执行 `build.ps1`（MSVC release 构建产物校验，提交到 main 或 PR 时触发）。
 
-依赖：`serde` / `serde_json` / `rand` / `chrono` / `eframe`+`egui` / `tray-icon`（均为 GUI feature，headless 构建不含）。
+依赖：`serde` / `serde_json` / `rand` / `chrono`（纯终端实现，无 GUI / egui / tray-icon 依赖）。
 
 ---
 
@@ -275,23 +267,23 @@ export CARGO_TARGET_DIR=D:/wbrelay_target_gui      # GUI
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `AIROOT_DATA_DIR` | `C:\ProgramData\ai-root` | 覆盖数据目录（token / exec.log / enabled.flag / sid.txt） |
-| `AIROOT_PIPE_NAME` | `\\.\pipe\ai-root` | 覆盖命名管道名 |
+| `AIROOT_DATA_DIR` | `C:\ProgramData\AI-Root` | 覆盖数据目录（token / exec.log / enabled.flag / sid.txt） |
+| `AIROOT_PIPE_NAME` | `\\.\pipe\AI-Root` | 覆盖命名管道名 |
 
-**为什么需要**：ai-root 的鉴权凭据（令牌）与监听管道名都是进程内唯一的。「临时演练中继」需要与生产服务完全隔离，否则会串到生产实例（实测教训：测试曾连到生产管道导致数据串扰）。
+**为什么需要**：AI-Root 的鉴权凭据（令牌）与监听管道名都是进程内唯一的。「临时演练中继」需要与生产服务完全隔离，否则会串到生产实例（实测教训：测试曾连到生产管道导致数据串扰）。
 
 **手动起隔离实例**（演练 / 压测 / 临时中继，不影响生产）：
 
 ```powershell
 # 终端 A：起隔离服务（前台模式，Ctrl+C 退出）
 $env:AIROOT_DATA_DIR = "C:\temp\airoot-demo"
-$env:AIROOT_PIPE_NAME = "\\.\pipe\ai-root-demo"
-ai-root.exe server
+$env:AIROOT_PIPE_NAME = "\\.\pipe\AI-Root-demo"
+AI-Root.exe server
 
 # 终端 B：连接隔离实例（读写都走 demo 数据目录与管道）
 $env:AIROOT_DATA_DIR = "C:\temp\airoot-demo"
-$env:AIROOT_PIPE_NAME = "\\.\pipe\ai-root-demo"
-ai-root.exe run "whoami"
+$env:AIROOT_PIPE_NAME = "\\.\pipe\AI-Root-demo"
+AI-Root.exe run "whoami"
 ```
 
 > 注意：`install` 注册的**服务模式**固定使用默认数据目录与管道名；环境变量覆盖主要服务于前台 `server` 模式与多实例演练场景。
