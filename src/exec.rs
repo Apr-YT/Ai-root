@@ -13,12 +13,12 @@
 //! - 多行脚本（命令含换行 `\n`）：写入临时 `.cmd` 文件并以 `cmd /C <file>` 执行，
 //!   **不转义**，`&`/`&&`/`|`/`()` 均按正常 cmd 语义工作。这是 AI 批量自治多命令时的推荐路径。
 
+use crate::common;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use crate::common;
 
 pub struct ExecResult {
     pub exit_code: i32,
@@ -51,6 +51,22 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
         return run_script(command, cwd, timeout_ms);
     }
 
+    // 命令验证：防止空命令或危险命令
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return ExecResult::error("命令不能为空".to_string());
+    }
+
+    // 基本安全检查：阻止直接格式化命令（防注入）
+    let dangerous_patterns = [
+        "format ", "format:", "diskpart", "del /s", "rd /s", "rmdir /s",
+    ];
+    for pattern in dangerous_patterns {
+        if trimmed.to_lowercase().contains(pattern) {
+            return ExecResult::error(format!("检测到危险命令模式 '{}'，已阻止执行", pattern));
+        }
+    }
+
     let mut builder = Command::new("cmd");
     // 关键：用 raw_arg 原样拼接命令，禁止 Rust 对引号/`&`/结尾反斜杠二次转义。
     // 否则 `cmd /C` 会把内层引号转义成 `\"` 且无法还原，导致 `dir "C:\x"`、
@@ -60,7 +76,7 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
     // 只有首段送达 pnputil。故在交给 cmd 前对 `^`/`&` 做 `^` 转义为字面量。
     // 代价：`^`/`&` 仅在**引号外**被转义为字面量，故**引号外**的 `&` 与 `&&` 串联**全部失效**（退化为字面 `&`/`&&`）；
     // 仅 `|`/`<`/`>`/`()` 运算符语义保留。需要 `&`/`&&` 串联请改用多行脚本模式（命令含 `\n`、
-    // 或 `ai-root run --file <脚本>` / `ai-root run --stdin`）。
+    // 或 `AI-Root run --file <脚本>` / `AI-Root run --stdin`）。
     // 引号内的 `&`/`^` 不做转义（B3 修复）：cmd 引号内 `^` 非转义符，盲目加 `^` 会把 `&` 变成字面 `^&` 破坏内容。
     let escaped = escape_cmd_meta(command);
     builder.raw_arg("/C").raw_arg(&escaped);
@@ -115,8 +131,8 @@ fn run_script(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
 /// 文件方案（回退）：本体 UTF-8 写入临时 `.cmd`，经「ASCII 包装脚本」以 `cmd /C <wrap>` 执行。
 ///
 /// 双文件结构（实测验证）：
-/// - 本体 `ai-root-<pid>-<n>.cmd`：脚本内容，UTF-8 + CRLF（见 `encode_script`）。
-/// - 包装 `ai-root-<pid>-<n>.wrap.cmd`：**纯 ASCII**，内容为
+/// - 本体 `AI-Root-<pid>-<n>.cmd`：脚本内容，UTF-8 + CRLF（见 `encode_script`）。
+/// - 包装 `AI-Root-<pid>-<n>.wrap.cmd`：**纯 ASCII**，内容为
 ///   `@echo off` / `chcp 65001 >nul` / `call "<本体路径>"`。
 /// 原理：cmd 顶层批处理存在「预读缓冲」怪癖——`chcp` 生效前的行已按旧代码页读入，
 /// 导致 UTF-8 中文在某些行乱码；且 `cmd /C "chcp & call \"path\""` 单行形式会因
@@ -128,8 +144,8 @@ fn run_script_file(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResu
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     let pid = std::process::id();
-    let tmp = std::env::temp_dir().join(format!("ai-root-{}-{}.cmd", pid, nanos));
-    let wrap = std::env::temp_dir().join(format!("ai-root-{}-{}.wrap.cmd", pid, nanos));
+    let tmp = std::env::temp_dir().join(format!("AI-Root-{}-{}.cmd", pid, nanos));
+    let wrap = std::env::temp_dir().join(format!("AI-Root-{}-{}.wrap.cmd", pid, nanos));
 
     // 本体：脚本内容（UTF-8 + CRLF）
     let bytes = encode_script(script);
@@ -159,10 +175,17 @@ fn run_script_file(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResu
 
 /// spawn 子进程、读取 stdout/stderr、轮询退出状态并在超时时杀进程
 fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
+    let start = Instant::now();
     let mut child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return ExecResult::error(format!("spawn 失败: {e}"));
+            let error_msg = format!("启动命令失败: {}", e);
+            common::log_event(serde_json::json!({
+                "type": "exec_error",
+                "error": error_msg,
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            }));
+            return ExecResult::error(error_msg);
         }
     };
 
@@ -179,7 +202,6 @@ fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
     });
 
     // 轮询退出状态，超时则杀进程树
-    let start = Instant::now();
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
@@ -193,25 +215,57 @@ fn run_child(mut builder: Command, timeout_ms: u64) -> ExecResult {
                         .args(["/PID", &pid.to_string(), "/T", "/F"])
                         .output();
                     timed_out = true;
+
+                    common::log_event(serde_json::json!({
+                        "type": "exec_timeout",
+                        "pid": pid,
+                        "timeout_ms": timeout_ms,
+                        "timestamp": chrono::Utc::now().to_rfc3339()
+                    }));
+
                     match child.wait() {
                         Ok(s) => break s,
                         Err(e) => {
-                            return ExecResult::error(format!("wait 失败: {e}"));
+                            let error_msg = format!("等待进程退出失败: {}", e);
+                            common::log_event(serde_json::json!({
+                                "type": "exec_error",
+                                "error": error_msg,
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            }));
+                            return ExecResult::error(error_msg);
                         }
                     }
                 }
                 thread::sleep(Duration::from_millis(common::CHILD_POLL_INTERVAL_MS));
             }
             Err(e) => {
-                return ExecResult::error(format!("try_wait 失败: {e}"));
+                let error_msg = format!("进程状态检查失败: {}", e);
+                common::log_event(serde_json::json!({
+                    "type": "exec_error",
+                    "error": error_msg,
+                    "timestamp": chrono::Utc::now().to_rfc3339()
+                }));
+                return ExecResult::error(error_msg);
             }
         }
     };
 
     let (stdout, out_trunc) = out_t.join().unwrap_or_default();
     let (stderr, err_trunc) = err_t.join().unwrap_or_default();
+
+    let exit_code = status.code().unwrap_or(-1);
+    if exit_code != 0 {
+        common::log_event(serde_json::json!({
+            "type": "exec_nonzero_exit",
+            "exit_code": exit_code,
+            "stdout_preview": &stdout[..stdout.len().min(200)],
+            "stderr_preview": &stderr[..stderr.len().min(200)],
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }));
+    }
+
     ExecResult {
-        exit_code: status.code().unwrap_or(-1),
+        exit_code,
         stdout,
         stderr,
         timed_out,
@@ -394,10 +448,7 @@ mod tests {
             "echo \"a&b\" ^& echo c"
         );
         // 引号外的 ^ 转义，引号内的 ^ 不转义
-        assert_eq!(
-            escape_cmd_meta("echo ^a \"b^c\""),
-            "echo ^^a \"b^c\""
-        );
+        assert_eq!(escape_cmd_meta("echo ^a \"b^c\""), "echo ^^a \"b^c\"");
     }
 
     #[test]

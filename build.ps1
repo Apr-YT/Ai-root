@@ -1,7 +1,7 @@
-# ai-root 一键构建脚本(本机与 CI 通用)
+# AI-Root 一键构建脚本(本机与 CI 通用)
 #
 # 用法:  powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
-# 产物:  $CARGO_TARGET_DIR\x86_64-pc-windows-msvc\release\ai-root.exe
+# 产物:  $CARGO_TARGET_DIR\x86_64-pc-windows-msvc\release\AI-Root.exe
 #
 # 为什么优先使用 rustup 真实 toolchain:
 #   本机(开发环境)的 PATH 中 D:\Kiln\rust\cargo\bin 下所有工具是同一 12.8MB 代理二进制(全同 MD5),
@@ -19,12 +19,12 @@ if (-not (Test-Path $rustupCargo)) {
     $rustupCargo = (Get-Command cargo -ErrorAction Stop).Source
 }
 
-# 2) 目标目录: 环境变量优先(CI 可注入), 否则本机惯例 D:\ai-root-target, 否则仓库内 target
+# 2) 目标目录: 环境变量优先(CI 可注入), 否则本机惯例 D:\AI-Root-target, 否则仓库内 target
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ($env:CARGO_TARGET_DIR) {
     $targetDir = $env:CARGO_TARGET_DIR
 } elseif (Test-Path "D:\") {
-    $targetDir = "D:\ai-root-target"
+    $targetDir = "D:\AI-Root-target"
 } else {
     $targetDir = Join-Path $repoRoot "target"
 }
@@ -38,4 +38,4 @@ Write-Host "[*] CARGO_TARGET_DIR: $targetDir" -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) {
     Write-Error "构建失败"
 }
-Write-Host "[✓] 产物: $targetDir\x86_64-pc-windows-msvc\release\ai-root.exe" -ForegroundColor Green
+Write-Host "[✓] 产物: $targetDir\x86_64-pc-windows-msvc\release\AI-Root.exe" -ForegroundColor Green

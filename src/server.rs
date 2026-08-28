@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::os::windows::io::{FromRawHandle, RawHandle};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -63,6 +63,19 @@ static AUTH_THROTTLE: Mutex<Option<AuthThrottle>> = Mutex::new(None);
 /// 当前在执行的连接数（并发上限见 `common::MAX_CONNS`，防失控 AI 线程轰炸拖垮 SYSTEM 服务）
 static ACTIVE_CONNS: AtomicU32 = AtomicU32::new(0);
 
+/// 全局单调 run_id 生成器：UNIX毫秒-counter，保证进程内唯一且可粗略按时间排序。
+/// 用于把同一次执行的 exec_start / exec_done 事件配对，并回传给客户端 JSON 响应，
+/// 使 AI 消费方能在 tail 事件流里精确锁定「某条命令的开始与结束」。
+static RUN_ID: AtomicU64 = AtomicU64::new(0);
+fn next_run_id() -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = RUN_ID.fetch_add(1, Ordering::SeqCst);
+    format!("{now_ms:x}-{n}")
+}
+
 /// 创建带安全描述符的命名管道实例，返回原生 HANDLE
 ///
 /// SDDL 由 `common::pipe_sddl()` 动态构造：基础授权 SYSTEM/Admins/Interactive，
@@ -81,7 +94,9 @@ fn create_pipe() -> io::Result<winapi_raw::HANDLE> {
     if converted == 0 {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("SDDL 转换失败, last_err={}", unsafe { winapi_raw::GetLastError() }),
+            format!("SDDL 转换失败, last_err={}", unsafe {
+                winapi_raw::GetLastError()
+            }),
         ));
     }
 
@@ -92,14 +107,16 @@ fn create_pipe() -> io::Result<winapi_raw::HANDLE> {
     };
 
     let name_w = common::to_wide(&common::pipe_name());
+    // 优化：增加管道缓冲区大小以提高大输出命令的吞吐量
+    const PIPE_BUFFER_SIZE: u32 = 64 * 1024; // 64KB 缓冲区
     let handle = unsafe {
         winapi_raw::CreateNamedPipeW(
             name_w.as_ptr(),
             winapi_raw::PIPE_ACCESS_DUPLEX,
             winapi_raw::PIPE_TYPE_BYTE | winapi_raw::PIPE_READMODE_BYTE | winapi_raw::PIPE_WAIT,
             winapi_raw::PIPE_UNLIMITED_INSTANCES,
-            8192,
-            8192,
+            PIPE_BUFFER_SIZE, // 输出缓冲区
+            PIPE_BUFFER_SIZE, // 输入缓冲区
             0,
             &sa as *const winapi_raw::SECURITY_ATTRIBUTES,
         )
@@ -113,10 +130,9 @@ fn create_pipe() -> io::Result<winapi_raw::HANDLE> {
     if handle == winapi_raw::INVALID_HANDLE_VALUE {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!(
-                "CreateNamedPipeW 失败, last_err={}",
-                unsafe { winapi_raw::GetLastError() }
-            ),
+            format!("CreateNamedPipeW 失败, last_err={}", unsafe {
+                winapi_raw::GetLastError()
+            }),
         ));
     }
     Ok(handle)
@@ -131,7 +147,10 @@ fn accept_one() -> io::Result<File> {
         // ERROR_PIPE_CONNECTED：连接在 CreateNamedPipe 与 ConnectNamedPipe 之间已建立
         if err != winapi_raw::ERROR_PIPE_CONNECTED {
             unsafe { winapi_raw::CloseHandle(handle) };
-            return Err(io::Error::new(io::ErrorKind::Other, "ConnectNamedPipe 失败"));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "ConnectNamedPipe 失败",
+            ));
         }
     }
     // 转移句柄所有权给 Rust File
@@ -166,15 +185,16 @@ fn client_identity_cheap(file: &File) -> (String, u32, Option<String>) {
         return ("unknown".to_string(), 0, None);
     }
 
-    let proc = unsafe {
-        winapi_raw::OpenProcess(winapi_raw::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-    };
+    let proc =
+        unsafe { winapi_raw::OpenProcess(winapi_raw::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if proc.is_null() {
         return (format!("pid={pid}"), pid, None);
     }
     let mut token: winapi_raw::HANDLE = std::ptr::null_mut();
     let tok_ok = unsafe { winapi_raw::OpenProcessToken(proc, winapi_raw::TOKEN_QUERY, &mut token) };
-    unsafe { winapi_raw::CloseHandle(proc); }
+    unsafe {
+        winapi_raw::CloseHandle(proc);
+    }
     if tok_ok == 0 || token.is_null() {
         return (format!("pid={pid}"), pid, None);
     }
@@ -182,7 +202,13 @@ fn client_identity_cheap(file: &File) -> (String, u32, Option<String>) {
     // 先查 TokenUser 所需缓冲大小（期望 ERROR_INSUFFICIENT_BUFFER + need）
     let mut need: u32 = 0;
     unsafe {
-        winapi_raw::GetTokenInformation(token, winapi_raw::TOKEN_USER, std::ptr::null_mut(), 0, &mut need);
+        winapi_raw::GetTokenInformation(
+            token,
+            winapi_raw::TOKEN_USER,
+            std::ptr::null_mut(),
+            0,
+            &mut need,
+        );
     }
     let mut buf = vec![0u8; need.max(1) as usize];
     let got = unsafe {
@@ -194,7 +220,9 @@ fn client_identity_cheap(file: &File) -> (String, u32, Option<String>) {
             &mut need,
         )
     };
-    unsafe { winapi_raw::CloseHandle(token); }
+    unsafe {
+        winapi_raw::CloseHandle(token);
+    }
     if got == 0 {
         return (format!("pid={pid}"), pid, None);
     }
@@ -211,7 +239,9 @@ fn client_identity_cheap(file: &File) -> (String, u32, Option<String>) {
         return (format!("pid={pid}"), pid, None);
     }
     let sid_str = unsafe { wide_ptr_to_string(psz) };
-    unsafe { winapi_raw::LocalFree(psz as *mut c_void); }
+    unsafe {
+        winapi_raw::LocalFree(psz as *mut c_void);
+    }
     (sid_str.clone(), pid, Some(sid_str))
 }
 
@@ -247,7 +277,8 @@ fn lookup_account_name(sid_str: &str) -> Option<String> {
 
     let sid_w = common::to_wide(sid_str);
     let mut psid: *mut c_void = std::ptr::null_mut();
-    if unsafe { winapi_raw::ConvertStringSidToSidW(sid_w.as_ptr(), &mut psid) } == 0 || psid.is_null()
+    if unsafe { winapi_raw::ConvertStringSidToSidW(sid_w.as_ptr(), &mut psid) } == 0
+        || psid.is_null()
     {
         return None;
     }
@@ -268,7 +299,9 @@ fn lookup_account_name(sid_str: &str) -> Option<String> {
             &mut use_,
         )
     };
-    unsafe { winapi_raw::LocalFree(psid); }
+    unsafe {
+        winapi_raw::LocalFree(psid);
+    }
     if lok == 0 {
         return None;
     }
@@ -308,7 +341,8 @@ fn handle_client(mut file: File) {
         ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
         let _ = protocol::write_frame(
             &mut file,
-            &serde_json::to_vec(&protocol::err_response("服务繁忙（并发超限），请稍后重试")).unwrap(),
+            &serde_json::to_vec(&protocol::err_response("服务繁忙（并发超限），请稍后重试"))
+                .unwrap(),
         );
         return;
     }
@@ -320,6 +354,10 @@ fn handle_client(mut file: File) {
         }
     }
     let _guard = ConnGuard;
+
+    // 优化：设置连接超时，防止连接无限期占用资源
+    let start_time = Instant::now();
+    let max_connection_duration = Duration::from_secs(300); // 5分钟最大连接时间
 
     let token = common::cached_token();
     // 审计（C2 优化）：鉴权前仅做「低成本」身份解析——PID + SID 字符串（纯本地，无域控往返）。
@@ -360,6 +398,19 @@ fn handle_client(mut file: File) {
         }
     };
 
+    // 验证请求数据
+    if let Err(err_msg) = protocol::validate_request(&req) {
+        let _ = protocol::write_frame(
+            &mut file,
+            &serde_json::to_vec(&protocol::err_response(&format!(
+                "请求验证失败: {}",
+                err_msg
+            )))
+            .unwrap(),
+        );
+        return;
+    }
+
     // 令牌鉴权（恒定时间比较）
     if !ct_eq(&req.token, &token) {
         // 记录失败 + 审计（暴力尝试必须可追溯）
@@ -367,7 +418,12 @@ fn handle_client(mut file: File) {
             let mut th = AUTH_THROTTLE.lock().unwrap_or_else(|e| e.into_inner());
             th.get_or_insert_with(AuthThrottle::new).record_fail()
         };
-        common::log_exec(&caller, caller_pid, &format!("<auth-fail cmd={}>", req.command), -401);
+        common::log_exec(
+            &caller,
+            caller_pid,
+            &format!("<auth-fail cmd={}>", req.command),
+            -401,
+        );
         let msg = if locked {
             "令牌鉴权失败（多次失败已锁定 60s）".to_string()
         } else {
@@ -405,14 +461,17 @@ fn handle_client(mut file: File) {
     }
 
     // 超时钳制：客户端可传超时，但上限 10 分钟（防持令牌客户端长期占用 SYSTEM 服务）
-    let timeout_ms = req.timeout_ms
+    let timeout_ms = req
+        .timeout_ms
         .unwrap_or(common::DEFAULT_COMMAND_TIMEOUT_MS)
         .min(common::MAX_COMMAND_TIMEOUT_MS);
 
     // GUI 实时信息流：执行开始事件
+    let run_id = next_run_id();
     common::log_event(serde_json::json!({
         "ts": common::now_str(),
         "type": "exec_start",
+        "run_id": run_id.clone(),
         "caller": caller,
         "pid": caller_pid,
         "cmd": req.command,
@@ -424,17 +483,33 @@ fn handle_client(mut file: File) {
     let r = exec::run_command(&req.command, req.cwd.as_deref(), timeout_ms);
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    // 优化：检查连接时间，防止长时间占用
+    if start_time.elapsed() > max_connection_duration {
+        common::log_event(serde_json::json!({
+            "type": "connection_timeout",
+            "caller": caller,
+            "pid": caller_pid,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }));
+        return;
+    }
+
+    // 优化：减少不必要的克隆，直接使用所有权
     let resp = Response {
         ok: r.error.is_none() && !r.timed_out,
         exit_code: r.exit_code,
-        stdout: r.stdout.clone(),
-        stderr: r.stderr.clone(),
+        stdout: r.stdout, // 直接使用所有权，避免克隆
+        stderr: r.stderr, // 直接使用所有权，避免克隆
         error: if r.timed_out {
             Some("执行超时".to_string())
         } else {
-            r.error.clone()
+            r.error
         },
         truncated: r.truncated,
+        run_id: Some(run_id.clone()),
+        duration_ms: Some(duration_ms),
+        caller: Some(caller.clone()),
+        timed_out: r.timed_out,
     };
 
     // GUI 实时信息流：执行完成事件
@@ -442,6 +517,7 @@ fn handle_client(mut file: File) {
     common::log_event(serde_json::json!({
         "ts": common::now_str(),
         "type": "exec_done",
+        "run_id": run_id.clone(),
         "caller": caller,
         "pid": caller_pid,
         "cmd": req.command,
@@ -458,6 +534,20 @@ fn handle_client(mut file: File) {
 
     // 落盘执行日志
     common::log_exec(&caller, caller_pid, &req.command, r.exit_code);
+
+    // 记录详细审计信息
+    common::log_event(serde_json::json!({
+        "type": "command_audit",
+        "caller": caller,
+        "pid": caller_pid,
+        "command": req.command,
+        "exit_code": r.exit_code,
+        "duration_ms": duration_ms,
+        "truncated": r.truncated,
+        "timed_out": r.timed_out,
+        "cwd": req.cwd,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    }));
 }
 
 /// 前台（测试）模式：持续接受连接，直到进程被终止
@@ -465,14 +555,14 @@ pub fn run_pipe_server_forever() {
     let tok = common::read_or_create_token();
     common::cache_token(tok);
     common::set_enabled(true); // 前台模式默认启用
-    println!("[ai-root] 前台管道服务已启动: {}", common::pipe_name());
+    println!("[AI-Root] 前台管道服务已启动: {}", common::pipe_name());
     loop {
         match accept_one() {
             Ok(file) => {
                 thread::spawn(|| handle_client(file));
             }
             Err(e) => {
-                eprintln!("[ai-root] accept 错误: {e}");
+                eprintln!("[AI-Root] accept 错误: {e}");
                 thread::sleep(Duration::from_millis(300));
             }
         }
@@ -531,13 +621,20 @@ pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
     // 监控线程：等待 stop 信号，触发后 CancelIoEx 当前管道句柄（不关闭），中断阻塞的 ConnectNamedPipe
     let monitor_pipe = current_pipe.clone();
     let monitor = thread::spawn(move || {
-        unsafe { winapi_raw::WaitForSingleObject(stop_event_usize as winapi_raw::HANDLE, winapi_raw::INFINITE); }
+        unsafe {
+            winapi_raw::WaitForSingleObject(
+                stop_event_usize as winapi_raw::HANDLE,
+                winapi_raw::INFINITE,
+            );
+        }
         if let Some(h) = monitor_pipe
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
-            unsafe { winapi_raw::CancelIoEx(h as winapi_raw::HANDLE, std::ptr::null_mut()); }
+            unsafe {
+                winapi_raw::CancelIoEx(h as winapi_raw::HANDLE, std::ptr::null_mut());
+            }
         }
     });
 
@@ -550,22 +647,25 @@ pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
         let handle = match create_pipe() {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("[ai-root] create_pipe 错误: {e}");
+                eprintln!("[AI-Root] create_pipe 错误: {e}");
                 thread::sleep(Duration::from_millis(300));
                 continue;
             }
         };
-        *current_pipe
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(handle as usize);
+        *current_pipe.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle as usize);
 
         let connected = unsafe { winapi_raw::ConnectNamedPipe(handle, std::ptr::null_mut()) };
         // 连接已返回（成功或失败），清空 current（取走），避免监控线程误 Cancel 已移交的句柄
-        let _ = current_pipe.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let _ = current_pipe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
 
         // stop 已触发：CancelIoEx 已中断本次 ConnectNamedPipe；放弃本连接并退出（不 dispatch）
         if unsafe { winapi_raw::WaitForSingleObject(stop_event, 0) } == winapi_raw::WAIT_OBJECT_0 {
-            unsafe { winapi_raw::CloseHandle(handle); }
+            unsafe {
+                winapi_raw::CloseHandle(handle);
+            }
             break;
         }
 
@@ -576,7 +676,9 @@ pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
             dispatch_connection(handle);
         } else {
             // 真实连接错误：关闭后重试
-            unsafe { winapi_raw::CloseHandle(handle); }
+            unsafe {
+                winapi_raw::CloseHandle(handle);
+            }
             thread::sleep(Duration::from_millis(300));
         }
     }

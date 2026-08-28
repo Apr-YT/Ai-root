@@ -17,12 +17,12 @@ use crate::common;
 use crate::server;
 use crate::winapi_raw;
 
-/// 将自身部署到 D:\Kiln\AI-root 并在 C:\Windows 写入 ai-root.cmd 包装器，
-/// 使 ai-root 在任意目录、任意身份（含智能体非交互进程）下均可直接调用。
+/// 将自身部署到 D:\Kiln\AI-Root 并在 C:\Windows 写入 AI-Root.cmd 包装器，
+/// 使 AI-Root 在任意目录、任意身份（含智能体非交互进程）下均可直接调用。
 /// 返回服务应指向的可执行文件路径（部署成功返回部署副本，失败回退到当前 exe）。
 fn deploy_global(src_exe: &std::path::Path) -> std::path::PathBuf {
-    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-root");
-    let deploy_exe = deploy_dir.join("ai-root.exe");
+    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-Root");
+    let deploy_exe = deploy_dir.join("AI-Root.exe");
     if let Err(e) = std::fs::create_dir_all(deploy_dir) {
         eprintln!("[warn] 无法创建部署目录 {}: {e}", deploy_dir.display());
         return src_exe.to_path_buf();
@@ -30,13 +30,13 @@ fn deploy_global(src_exe: &std::path::Path) -> std::path::PathBuf {
     match std::fs::copy(src_exe, &deploy_exe) {
         Ok(_) => {
             // 全局包装器：转发所有参数（%*）。C:\Windows 默认在系统 PATH 中，
-            // 写入后 ai-root 在任意 shell / 任意身份下均可直接调用。
-            let wrapper = std::path::Path::new("C:\\Windows\\ai-root.cmd");
+            // 写入后 AI-Root 在任意 shell / 任意身份下均可直接调用。
+            let wrapper = std::path::Path::new("C:\\Windows\\AI-Root.cmd");
             let content = format!("@echo off\r\n\"{}\" %*\r\n", deploy_exe.display());
             if let Err(e) = std::fs::write(wrapper, content) {
                 eprintln!("[warn] 无法写入全局包装器 {}: {e}", wrapper.display());
             } else {
-                println!("✓ 已部署全局命令: ai-root (C:\\Windows\\ai-root.cmd)");
+                println!("✓ 已部署全局命令: AI-Root (C:\\Windows\\AI-Root.cmd)");
             }
             deploy_exe
         }
@@ -50,12 +50,19 @@ fn deploy_global(src_exe: &std::path::Path) -> std::path::PathBuf {
 /// 配置 SCM 失败恢复策略：服务异常终止（7034）后按 60s/300s/600s 间隔自动重启，
 /// 防止进程被意外杀死后中继长时间不可用。install 注册服务后调用一次；失败仅降级（无自动重启）。
 fn configure_failure_actions(svc: &windows_service::service::Service) {
-
-
     let mut actions = [
-        winapi_raw::SC_ACTION { Type: winapi_raw::SC_ACTION_RESTART, Delay: 60_000 },
-        winapi_raw::SC_ACTION { Type: winapi_raw::SC_ACTION_RESTART, Delay: 300_000 },
-        winapi_raw::SC_ACTION { Type: winapi_raw::SC_ACTION_RESTART, Delay: 600_000 },
+        winapi_raw::SC_ACTION {
+            Type: winapi_raw::SC_ACTION_RESTART,
+            Delay: 60_000,
+        },
+        winapi_raw::SC_ACTION {
+            Type: winapi_raw::SC_ACTION_RESTART,
+            Delay: 300_000,
+        },
+        winapi_raw::SC_ACTION {
+            Type: winapi_raw::SC_ACTION_RESTART,
+            Delay: 600_000,
+        },
     ];
     let fa = winapi_raw::SERVICE_FAILURE_ACTIONS {
         dwResetPeriod: 86_400, // 重置失败计数周期：24h
@@ -74,10 +81,9 @@ fn configure_failure_actions(svc: &windows_service::service::Service) {
     if ok != 0 {
         println!("✓ 已配置失败自动重启（60s/300s/600s）");
     } else {
-        eprintln!(
-            "[warn] 配置失败恢复策略失败, last_err={}",
-            unsafe { winapi_raw::GetLastError() }
-        );
+        eprintln!("[warn] 配置失败恢复策略失败, last_err={}", unsafe {
+            winapi_raw::GetLastError()
+        });
     }
 }
 
@@ -92,27 +98,28 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|s| format!("{:?}", s.current_state))
                 .unwrap_or_else(|| "unknown".to_string());
             return Err(format!(
-                "服务 {} 已存在（状态: {state}）。重装请先 `ai-root uninstall`；仅更新二进制请用 `ai-root update <新exe>`。",
+                "服务 {} 已存在（状态: {state}）。重装请先 `AI-Root uninstall`；仅更新二进制请用 `AI-Root update <新exe>`。",
                 common::SERVICE_NAME
             )
             .into());
         }
     }
 
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
+    let manager =
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
     let src_exe = std::env::current_exe()?;
     // 部署全局副本并写入包装器（服务指向部署副本，便于后续统一升级）
     let exe_path = deploy_global(&src_exe);
 
     let info = ServiceInfo {
         name: OsString::from(common::SERVICE_NAME),
-        display_name: OsString::from("AI-root (SYSTEM 提权中继)"),
+        display_name: OsString::from("AI-Root (SYSTEM 提权中继)"),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: exe_path,
         launch_arguments: vec![OsString::from("--service")],
-        account_name: None,      // None = 以 LocalSystem 运行（最高本地权限）
+        account_name: None, // None = 以 LocalSystem 运行（最高本地权限）
         account_password: None,
         dependencies: vec![],
     };
@@ -138,7 +145,7 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     common::set_enabled(true);
 
     println!("✓ 服务已注册: {} (LocalSystem, 自启)", common::SERVICE_NAME);
-    println!("启动命令: ai-root start");
+    println!("启动命令: AI-Root start");
     Ok(())
 }
 
@@ -151,12 +158,12 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ 服务已卸载: {}", common::SERVICE_NAME);
 
     // 清理部署残留（尽力而为，失败仅提示）
-    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-root");
+    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-Root");
     if deploy_dir.exists() {
         let _ = std::fs::remove_dir_all(deploy_dir);
         println!("✓ 已清理部署目录: {}", deploy_dir.display());
     }
-    let wrapper = std::path::Path::new("C:\\Windows\\ai-root.cmd");
+    let wrapper = std::path::Path::new("C:\\Windows\\AI-Root.cmd");
     if wrapper.exists() {
         let _ = std::fs::remove_file(wrapper);
         println!("✓ 已清理全局包装器: {}", wrapper.display());
@@ -194,7 +201,10 @@ pub fn start_svc() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    println!("✓ 启动指令已下发（服务状态: {:?}）", service.query_status()?.current_state);
+    println!(
+        "✓ 启动指令已下发（服务状态: {:?}）",
+        service.query_status()?.current_state
+    );
     Ok(())
 }
 
@@ -202,10 +212,10 @@ pub fn start_svc() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// 权限位：`SERVICE_START`=0x10=SDDL `RP`，`SERVICE_STOP`=0x20=SDDL `WP`。
 /// 效果：智能体进程（以安装用户身份运行，非提权）此后可执行
-/// `ai-root stop/start/update`，无需管理员 → 二进制更新彻底自治。
+/// `AI-Root stop/start/update`，无需管理员 → 二进制更新彻底自治。
 /// 失败不致命（install 继续，仅降级为「更新仍需管理员」）。
 ///
-/// 可独立以 `ai-root grant` 调用（需管理员）：用于**对已存在的服务**补发授权，
+/// 可独立以 `AI-Root grant` 调用（需管理员）：用于**对已存在的服务**补发授权，
 /// 无需卸载重装（deploy.ps1 会在部署后自动调用一次）。
 pub fn grant_acl() -> Result<(), Box<dyn std::error::Error>> {
     let Some(sid) = common::get_user_sid() else {
@@ -234,10 +244,9 @@ pub fn grant_acl() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
     if converted == 0 || sd.is_null() {
-        return Err(format!(
-            "SDDL 转换失败, last_err={}",
-            unsafe { winapi_raw::GetLastError() }
-        )
+        return Err(format!("SDDL 转换失败, last_err={}", unsafe {
+            winapi_raw::GetLastError()
+        })
         .into());
     }
 
@@ -250,34 +259,29 @@ pub fn grant_acl() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
     if scm.is_null() {
-        unsafe { winapi_raw::LocalFree(sd); }
-        return Err(format!(
-            "OpenSCManagerW 失败, last_err={}",
-            unsafe { winapi_raw::GetLastError() }
-        )
+        unsafe {
+            winapi_raw::LocalFree(sd);
+        }
+        return Err(format!("OpenSCManagerW 失败, last_err={}", unsafe {
+            winapi_raw::GetLastError()
+        })
         .into());
     }
-    let svc = unsafe {
-        winapi_raw::OpenServiceW(scm, name_w.as_ptr(), winapi_raw::SERVICE_ALL_ACCESS)
-    };
+    let svc =
+        unsafe { winapi_raw::OpenServiceW(scm, name_w.as_ptr(), winapi_raw::SERVICE_ALL_ACCESS) };
     if svc.is_null() {
         unsafe {
             winapi_raw::CloseServiceHandle(scm);
             winapi_raw::LocalFree(sd);
         }
-        return Err(format!(
-            "OpenServiceW 失败, last_err={}",
-            unsafe { winapi_raw::GetLastError() }
-        )
+        return Err(format!("OpenServiceW 失败, last_err={}", unsafe {
+            winapi_raw::GetLastError()
+        })
         .into());
     }
 
     let ok = unsafe {
-        winapi_raw::SetServiceObjectSecurity(
-            svc,
-            winapi_raw::DACL_SECURITY_INFORMATION,
-            sd,
-        )
+        winapi_raw::SetServiceObjectSecurity(svc, winapi_raw::DACL_SECURITY_INFORMATION, sd)
     };
     unsafe {
         winapi_raw::CloseServiceHandle(svc);
@@ -285,11 +289,12 @@ pub fn grant_acl() -> Result<(), Box<dyn std::error::Error>> {
         winapi_raw::LocalFree(sd);
     }
     if ok == 0 {
-        return Err(format!(
-            "SetServiceObjectSecurity 失败, last_err={}",
-            unsafe { winapi_raw::GetLastError() }
-        )
-        .into());
+        return Err(
+            format!("SetServiceObjectSecurity 失败, last_err={}", unsafe {
+                winapi_raw::GetLastError()
+            })
+            .into(),
+        );
     }
     println!("✓ 服务 ACL 已授权用户 STOP/START（智能体可自主更新）");
     Ok(())
@@ -398,20 +403,20 @@ pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::
             // 超时但二进制尚未覆盖、服务未损坏（不会留下坏服务），状态安全可直接重试。
             return Err(
                 "服务停止超时（15s 内未变为 Stopped）。现有二进制尚未覆盖、服务未损坏，可安全重试：\
-                 请确认服务已停止（ai-root status / services.msc）后再次执行 update"
+                 请确认服务已停止（AI-Root status / services.msc）后再次执行 update"
                     .into(),
             );
         }
     }
 
     // 2) 覆盖部署副本（与 install 的 deploy_global 同一路径）
-    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-root");
+    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-Root");
     std::fs::create_dir_all(deploy_dir)?;
-    let deploy_exe = deploy_dir.join("ai-root.exe");
+    let deploy_exe = deploy_dir.join("AI-Root.exe");
     // 自锁处理：update 若由部署 exe 自身运行，直接 copy 会因「映像被占用」报 os error 32。
     // Windows 允许重命名运行中 exe（映像以 FILE_SHARE_DELETE 打开），先改名 .old 腾出路径，
     // 再复制新文件；失败回滚，启动后清理 .old（残留可被下轮 update 清理）。
-    let old_exe = deploy_dir.join("ai-root.exe.old");
+    let old_exe = deploy_dir.join("AI-Root.exe.old");
     let _ = std::fs::remove_file(&old_exe);
     match std::fs::rename(&deploy_exe, &old_exe) {
         Ok(_) => {
@@ -469,7 +474,7 @@ windows_service::define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(_arguments: Vec<OsString>) {
     if let Err(e) = service_run() {
-        eprintln!("[ai-root] 服务运行错误: {e}");
+        eprintln!("[AI-Root] 服务运行错误: {e}");
     }
 }
 
@@ -486,7 +491,9 @@ fn service_run() -> Result<(), Box<dyn std::error::Error>> {
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop => {
-                unsafe { winapi_raw::SetEvent(svc_stop_event as winapi_raw::HANDLE); }
+                unsafe {
+                    winapi_raw::SetEvent(svc_stop_event as winapi_raw::HANDLE);
+                }
                 ServiceControlHandlerResult::NoError
             }
             _ => ServiceControlHandlerResult::NoError,
@@ -526,7 +533,9 @@ fn service_run() -> Result<(), Box<dyn std::error::Error>> {
         process_id: None,
     })?;
 
-    unsafe { winapi_raw::CloseHandle(stop_event); }
+    unsafe {
+        winapi_raw::CloseHandle(stop_event);
+    }
 
     Ok(())
 }

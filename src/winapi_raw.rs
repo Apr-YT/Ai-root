@@ -187,11 +187,7 @@ extern "system" {
         dwDesiredAccess: u32,
     ) -> HANDLE;
 
-    pub fn OpenServiceW(
-        hSCManager: HANDLE,
-        lpServiceName: PCWSTR,
-        dwDesiredAccess: u32,
-    ) -> HANDLE;
+    pub fn OpenServiceW(hSCManager: HANDLE, lpServiceName: PCWSTR, dwDesiredAccess: u32) -> HANDLE;
 
     pub fn CloseServiceHandle(hSCObject: HANDLE) -> BOOL;
 
@@ -256,5 +252,6 @@ extern "system" {
     pub fn ConvertStringSidToSidW(StringSid: PCWSTR, Sid: *mut *mut c_void) -> BOOL;
 
     /// 配置服务失败恢复策略（SCM Recovery Actions，防异常终止后不重启）
-    pub fn ChangeServiceConfig2W(hService: HANDLE, dwInfoLevel: u32, lpInfo: *const c_void) -> BOOL;
+    pub fn ChangeServiceConfig2W(hService: HANDLE, dwInfoLevel: u32, lpInfo: *const c_void)
+        -> BOOL;
 }

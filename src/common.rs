@@ -1,14 +1,14 @@
 //! 公共常量、路径、令牌管理与 ACL 设置
 //!
 //! 安全模型：
-//! - 共享令牌（token）仅在安装时生成一次，落盘于 `C:\ProgramData\ai-root\token.txt`
+//! - 共享令牌（token）仅在安装时生成一次，落盘于 `C:\ProgramData\AI-Root\token.txt`
 //! - 该目录 ACL 设为「仅 SYSTEM 完全控制 + 当前用户只读」，其余账户不可访问
 //! - 命名管道本身也通过 SDDL 限制连接方（见 server.rs）
 //! - 客户端必须以正确令牌鉴权，否则服务端拒绝执行
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -28,7 +28,7 @@ pub const PIPE_READ_TIMEOUT_MS: u64 = 10_000;
 /// 来源：经验值；SYSTEM 命令多数较快，兜底 60s。
 pub const CLIENT_READ_TIMEOUT_MS: u64 = 60_000;
 
-/// 命令默认执行超时（毫秒）。`ai-root run` 未传 `--timeout` 时采用。
+/// 命令默认执行超时（毫秒）。`AI-Root run` 未传 `--timeout` 时采用。
 /// 来源：经验值；覆盖绝大多数系统命令。服务端会钳制到 [0, MAX_COMMAND_TIMEOUT_MS]。
 /// 边界：建议 >= 1000。
 pub const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 60_000;
@@ -75,8 +75,8 @@ pub const FRAME_MAX_SIZE: usize = 16 * 1024 * 1024;
 /// 边界：建议 >= 64KB 且 <= FRAME_MAX_SIZE（须能完整回传）。
 pub const OUTPUT_LIMIT: usize = 1024 * 1024;
 
-/// 命名管道名称（Windows 格式：\\.\pipe\ai-root）
-pub const PIPE_NAME: &str = "\\\\.\\pipe\\ai-root";
+/// 命名管道名称（Windows 格式：\\.\pipe\AI-Root）
+pub const PIPE_NAME: &str = "\\\\.\\pipe\\AI-Root";
 
 /// 实际使用的管道名：默认 PIPE_NAME；可用 AIROOT_PIPE_NAME 环境变量覆盖
 /// （集成测试隔离用，避免与生产服务争用同名管道导致串扰）。
@@ -89,11 +89,10 @@ pub fn pipe_name() -> String {
     PIPE_NAME.to_string()
 }
 
-
 /// 服务名（需与 service_dispatcher 注册名一致）
-pub const SERVICE_NAME: &str = "ai-root";
+pub const SERVICE_NAME: &str = "AI-Root";
 
-/// 数据目录：默认 C:\ProgramData\ai-root；可用 AIROOT_DATA_DIR 环境变量覆盖（集成测试隔离用）
+/// 数据目录：默认 C:\ProgramData\AI-Root；可用 AIROOT_DATA_DIR 环境变量覆盖（集成测试隔离用）
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("AIROOT_DATA_DIR") {
         if !dir.trim().is_empty() {
@@ -101,7 +100,7 @@ pub fn data_dir() -> PathBuf {
         }
     }
     let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
-    PathBuf::from(base).join("ai-root")
+    PathBuf::from(base).join("AI-Root")
 }
 
 pub fn token_path() -> PathBuf {
@@ -150,7 +149,11 @@ impl LogFile {
         name.push(".1");
         let backup = PathBuf::from(name);
         let _ = std::fs::rename(&self.path, &backup);
-        if let Ok(f) = OpenOptions::new().create(true).append(true).open(&self.path) {
+        if let Ok(f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
             self.writer = std::io::BufWriter::with_capacity(64 * 1024, f);
         }
     }
@@ -160,7 +163,12 @@ impl LogFile {
     fn write_line(&mut self, data: &[u8]) {
         const MAX_LOG: u64 = 2 * 1024 * 1024;
         const FLUSH_THRESHOLD: usize = 16 * 1024; // exec.log 每积满 16KB 落盘一次
-        let on_disk = self.writer.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
+        let on_disk = self
+            .writer
+            .get_ref()
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
         let buffered = self.writer.buffer().len() as u64;
         if on_disk + buffered + data.len() as u64 > MAX_LOG {
             self.rotate();
@@ -248,9 +256,7 @@ fn append_with_rotate(path: PathBuf, data: &[u8]) {
 }
 
 /// 从 offset 字节处读取 events.jsonl 新增行，返回（新增行, 新的文件长度）。
-/// GUI 每 ~1s 调用一次实现增量实时刷新；offset 越界/文件被截断时安全回退。
-/// （headless 构建无 GUI，未引用时允许 dead_code）
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// `AI-Root tail` 每 500ms 调用一次实现增量实时跟随；offset 越界/文件被截断时安全回退。
 pub fn read_events_since(offset: u64) -> (Vec<String>, u64) {
     use std::io::{Read, Seek, SeekFrom};
     let path = events_path();
@@ -282,7 +288,7 @@ pub fn enabled_flag_path() -> PathBuf {
 }
 
 /// 进程内令牌缓存：懒加载 + 每次请求比对 token.txt 的 mtime，文件变化即重读。
-/// 这样 `ai-root rotate-token`（管理员写盘）后，服务端无需重启即可热加载新令牌。
+/// 这样 `AI-Root rotate-token`（管理员写盘）后，服务端无需重启即可热加载新令牌。
 /// 键为 `(文件mtime, 令牌)`；mtime 读取失败时视为 None（每次请求都重读，兜底正确性）。
 static TOKEN_CACHE: Mutex<Option<(Option<SystemTime>, String)>> = Mutex::new(None);
 
@@ -295,12 +301,22 @@ pub fn to_wide(s: &str) -> Vec<u16> {
         .collect()
 }
 
-/// 生成 32 字节随机十六进制令牌
+/// 生成 32 字节随机十六进制令牌（加密安全随机数）
 fn gen_token() -> String {
     use rand::Rng;
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// 令牌轮转：生成新令牌并写盘，同时更新 SDDL 权限
+/// 返回旧令牌（用于日志记录）和新令牌
+pub fn rotate_token() -> io::Result<(String, String)> {
+    let old_token = read_token().unwrap_or_default();
+    let new_token = gen_token();
+    std::fs::write(token_path(), &new_token)?;
+    set_dir_acl(&data_dir());
+    Ok((old_token, new_token))
 }
 
 /// 通过 whoami 获取当前用户 SID（用于精细化 ACL 与管道授权）
@@ -400,7 +416,9 @@ pub fn ensure_token() -> io::Result<String> {
 pub fn read_token() -> Option<String> {
     let tp = token_path();
     if tp.exists() {
-        std::fs::read_to_string(&tp).ok().map(|s| s.trim().to_string())
+        std::fs::read_to_string(&tp)
+            .ok()
+            .map(|s| s.trim().to_string())
     } else {
         None
     }
@@ -413,7 +431,9 @@ pub fn read_or_create_token() -> String {
 
 /// 填充进程内令牌缓存（兼容旧调用；服务启动时调用，缓存 mtime 与文件一致）
 pub fn cache_token(tok: String) {
-    let mtime = std::fs::metadata(token_path()).and_then(|m| m.modified()).ok();
+    let mtime = std::fs::metadata(token_path())
+        .and_then(|m| m.modified())
+        .ok();
     if let Ok(mut c) = TOKEN_CACHE.lock() {
         *c = Some((mtime, tok));
     }
@@ -430,12 +450,18 @@ pub fn cached_token() -> String {
                 return tok.clone();
             }
         }
-        let tok = std::fs::read_to_string(&tp).unwrap_or_default().trim().to_string();
+        let tok = std::fs::read_to_string(&tp)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         *cache = Some((mtime, tok.clone()));
         tok
     } else {
         // 缓存锁不可用（poison）：直接读文件，兜底正确性
-        std::fs::read_to_string(&tp).unwrap_or_default().trim().to_string()
+        std::fs::read_to_string(&tp)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
     }
 }
 
@@ -500,46 +526,4 @@ pub fn log_exec(caller: &str, pid: u32, command: &str, exit_code: i32) {
         }
     }
     append_with_rotate(log_path(), line.as_bytes());
-}
-
-/// 读取最近 N 行执行日志（GUI 用；headless 构建下未引用，允许 dead_code）
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
-pub fn read_log_tail(n: usize) -> String {
-    match std::fs::read_to_string(log_path()) {
-        Ok(s) => {
-            let lines: Vec<&str> = s.lines().collect();
-            let start = lines.len().saturating_sub(n);
-            lines[start..].join("\n")
-        }
-        Err(_) => String::new(),
-    }
-}
-
-/// 从 offset 字节处读取 exec.log 新增行，返回（新增行, 新的文件长度）。
-/// GUI 增量追加实现「日志实时刷新」，避免大文件整读（read_log_tail 是整读，文件大时开销高）。
-/// offset 越界/文件被截断时安全回退到文件末尾。
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
-pub fn read_log_since(offset: u64) -> (Vec<String>, u64) {
-    use std::io::{Read, Seek, SeekFrom};
-    let path = log_path();
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return (Vec::new(), 0);
-    };
-    let size = meta.len();
-    if size <= offset {
-        return (Vec::new(), size);
-    }
-    let Ok(mut f) = std::fs::File::open(&path) else {
-        return (Vec::new(), size);
-    };
-    if f.seek(SeekFrom::Start(offset)).is_err() {
-        return (Vec::new(), size);
-    }
-    let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() {
-        return (Vec::new(), size);
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
-    (lines, size)
 }

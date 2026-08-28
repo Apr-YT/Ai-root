@@ -38,6 +38,65 @@ pub struct Response {
     /// 输出是否因超过 1MB 上限被截断（默认 false，兼容旧客户端）
     #[serde(default)]
     pub truncated: bool,
+    /// 本次执行的唯一标识，与 events.jsonl 的 exec_start/exec_done 配对（默认 None，兼容旧服务端）
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// 命令执行耗时（毫秒，含超时），便于 AI 消费方判断命令快慢（默认 None）
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    /// 执行者身份（domain\user 或 SID），便于多 AI 场景下区分来源（默认 None）
+    #[serde(default)]
+    pub caller: Option<String>,
+    /// 是否因超时终止（显式布尔，替代从 error 文字猜），默认 false
+    #[serde(default)]
+    pub timed_out: bool,
+}
+
+/// 验证请求数据的完整性
+fn validate_request(req: &Request) -> Result<(), String> {
+    // 验证令牌格式
+    if req.token.is_empty() {
+        return Err("令牌不能为空".to_string());
+    }
+    if req.token.len() != 64 {
+        // 32字节十六进制 = 64字符
+        return Err("令牌格式无效".to_string());
+    }
+
+    // 验证命令
+    if req.command.is_empty() {
+        return Err("命令不能为空".to_string());
+    }
+    if req.command.len() > 8191 {
+        // Windows 命令行长度限制
+        return Err("命令过长".to_string());
+    }
+
+    // 验证工作目录
+    if let Some(ref cwd) = req.cwd {
+        if cwd.is_empty() {
+            return Err("工作目录不能为空字符串".to_string());
+        }
+        if cwd.len() > 260 {
+            // MAX_PATH
+            return Err("工作目录路径过长".to_string());
+        }
+    }
+
+    // 验证超时
+    if let Some(timeout) = req.timeout_ms {
+        if timeout == 0 {
+            return Err("超时时间不能为0".to_string());
+        }
+        if timeout > common::MAX_COMMAND_TIMEOUT_MS {
+            return Err(format!(
+                "超时时间超过上限 {}ms",
+                common::MAX_COMMAND_TIMEOUT_MS
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// 从文件（包装的管道句柄）读取一帧，采用「空闲超时」计时（毫秒）
@@ -104,7 +163,10 @@ pub fn read_frame_timeout(file: &mut File, idle_ms: u64) -> io::Result<Vec<u8>> 
     file.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > common::FRAME_MAX_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
 
     // ---- 帧体阶段：空闲超时 + 按 payload 放宽的绝对上限 ----
@@ -204,7 +266,8 @@ pub fn connect_client() -> io::Result<File> {
             ));
         }
         // 等待服务端释放/新建可用实例（最多 500ms）
-        let waited = unsafe { winapi_raw::WaitNamedPipeW(name.as_ptr(), common::PIPE_CONNECT_WAIT_MS) };
+        let waited =
+            unsafe { winapi_raw::WaitNamedPipeW(name.as_ptr(), common::PIPE_CONNECT_WAIT_MS) };
         if waited == 0 {
             // WaitNamedPipeW 返回 0 有多种语义，必须靠 GetLastError 精确区分，不能一概按超时处理：
             match unsafe { winapi_raw::GetLastError() } {
@@ -243,7 +306,7 @@ pub fn connect_client() -> io::Result<File> {
     ))
 }
 
-/// 构造标准错误响应
+/// 构造标准错误响应（新字段给默认值，兼容旧客户端反序列化）
 pub fn err_response(msg: &str) -> Response {
     Response {
         ok: false,
@@ -252,5 +315,9 @@ pub fn err_response(msg: &str) -> Response {
         stderr: String::new(),
         error: Some(msg.to_string()),
         truncated: false,
+        run_id: None,
+        duration_ms: None,
+        caller: None,
+        timed_out: false,
     }
 }
