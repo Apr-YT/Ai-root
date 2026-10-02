@@ -20,11 +20,78 @@ use crate::exec;
 use crate::protocol::{self, Request, Response};
 use crate::winapi_raw;
 
-/// 鉴权失败节流：30s 窗口内最多失败 5 次，超出则拒绝所有请求 60s（防暴力尝试）。
+/// 鉴权失败节流：双层模型。
+///
+/// 早期实现是单一全局计数器（30s 窗口内 5 次失败 → 全局锁 60s）。缺陷：
+/// 攻击者可开 8 条并发连接（MAX_CONNS）同时试探，每次失败都累加到**同一**计数器，
+/// 计数器很快打满并触发全局锁——但这反而让**合法客户端**被连坐锁定；
+/// 且试探方在窗口重置后立刻恢复，限流被并发稀释。
+///
+/// 现改为：
+/// - **全局熔断**（本结构）：统计全局失败总数，超过阈值则整体锁定一段时间，
+///   用于兜底「无差别暴力尝试」；锁定期间拒绝一切请求。
+/// - **单连接窗口**（由 handle_client 内的 per-conn 计数 + 读超时共同约束）：
+///   单次连接内只允许极少数失败，超限即断开该连接，避免单连接无限次试探。
 struct AuthThrottle {
     window_start: Instant,
     fail_count: u32,
     locked_until: Option<Instant>,
+}
+
+/// 全局熔断参数：窗口 30s 内累计失败达到 20 次（≈ MAX_CONNS×2.5）触发，锁 120s。
+const AUTH_WINDOW_SECS: u64 = 30;
+const AUTH_GLOBAL_FAIL_THRESHOLD: u32 = 20;
+const AUTH_LOCK_SECS: u64 = 120;
+/// 单个调用方 SID 在 60s 窗口内允许的最大鉴权失败次数，超出即定向拒绝 300s。
+const MAX_AUTH_FAILS_PER_SID: u32 = 5;
+
+/// 按调用方 SID 的定向失败计数表（SID → (窗口起点, 失败次数, 封禁截止)）。
+/// 用于防「同一身份反复试探令牌」——这是本服务一连接一请求模型下唯一有意义的
+/// 定向防护维度（连接级计数无意义，详见 handle_client 内注释）。
+static SID_FAILS: Mutex<Option<HashMap<String, (Instant, u32, Option<Instant>)>>> =
+    Mutex::new(None);
+
+/// 记录一次「按 SID 的鉴权失败」，返回 (该 SID 当前失败次数, 是否已被定向拒绝)。
+/// 窗口 60s 内失败达到 MAX_AUTH_FAILS_PER_SID 即封禁该 SID 300s（自动过期）。
+/// 表规模上限 256，超出时清理过期项，防内存无限增长。
+fn record_sid_fail(sid: &str) -> (u32, bool) {
+    let now = Instant::now();
+    let mut guard = SID_FAILS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+
+    // 惰性清理：表过大时清掉所有已过期条目（超时未再犯者不留痕）
+    if map.len() > 256 {
+        map.retain(|_, (start, _, until)| {
+            let active = now.duration_since(*start) <= Duration::from_secs(60)
+                || until.map(|u| now < u).unwrap_or(false);
+            active
+        });
+    }
+
+    let entry = map
+        .entry(sid.to_string())
+        .or_insert_with(|| (now, 0, None));
+    // 窗口过期且未封禁 → 重置窗口
+    if now.duration_since(entry.0) > Duration::from_secs(60) && entry.2.is_none() {
+        entry.0 = now;
+        entry.1 = 0;
+    }
+    // 已被定向封禁 → 直接拒绝
+    if let Some(until) = entry.2 {
+        if now < until {
+            return (entry.1, true);
+        }
+        // 封禁已过期：清除并重新开始计数
+        entry.2 = None;
+        entry.0 = now;
+        entry.1 = 0;
+    }
+    entry.1 += 1;
+    if entry.1 >= MAX_AUTH_FAILS_PER_SID {
+        entry.2 = Some(now + Duration::from_secs(300));
+        return (entry.1, true);
+    }
+    (entry.1, false)
 }
 
 impl AuthThrottle {
@@ -35,25 +102,32 @@ impl AuthThrottle {
             locked_until: None,
         }
     }
-    /// 记录一次失败；返回是否已触发锁定
+    /// 记录一次失败；返回是否已触发全局熔断
     fn record_fail(&mut self) -> bool {
         let now = Instant::now();
-        if now.duration_since(self.window_start) > Duration::from_secs(30) {
+        if now.duration_since(self.window_start) > Duration::from_secs(AUTH_WINDOW_SECS) {
             self.window_start = now;
             self.fail_count = 0;
         }
         self.fail_count += 1;
-        if self.fail_count >= 5 {
-            self.locked_until = Some(now + Duration::from_secs(60));
+        if self.fail_count >= AUTH_GLOBAL_FAIL_THRESHOLD {
+            self.locked_until = Some(now + Duration::from_secs(AUTH_LOCK_SECS));
             return true;
         }
         false
     }
-    /// 是否处于锁定态
-    fn is_locked(&self) -> bool {
+    /// 是否处于锁定态（锁定已过期则自动清理并返回 false）
+    fn is_locked(&mut self) -> bool {
         match self.locked_until {
             Some(t) if Instant::now() < t => true,
-            _ => false,
+            Some(_) => {
+                // 锁定已过期：清理状态，避免长期停留在锁定分支
+                self.locked_until = None;
+                self.fail_count = 0;
+                self.window_start = Instant::now();
+                false
+            }
+            None => false,
         }
     }
 }
@@ -372,7 +446,7 @@ fn handle_client(mut file: File) {
             let _ = protocol::write_frame(
                 &mut file,
                 &serde_json::to_vec(&protocol::err_response(
-                    "鉴权失败次数过多，已临时锁定（60s），请稍后再试",
+                    "鉴权失败次数过多，已临时锁定（120s），请稍后再试",
                 ))
                 .unwrap(),
             );
@@ -413,7 +487,11 @@ fn handle_client(mut file: File) {
 
     // 令牌鉴权（恒定时间比较）
     if !ct_eq(&req.token, &token) {
-        // 记录失败 + 审计（暴力尝试必须可追溯）
+        // 定向限流：按调用方 SID 记账（本服务是一连接一请求模型，无「连接内计数」概念；
+        // 真正防定向暴力尝试的维度是**身份**，故按 SID 累计失败次数）。
+        let sid_key = caller_sid.clone().unwrap_or_else(|| format!("pid:{caller_pid}"));
+        let (sid_fails, sid_blocked) = record_sid_fail(&sid_key);
+        // 全局熔断（无差别兜底）
         let locked = {
             let mut th = AUTH_THROTTLE.lock().unwrap_or_else(|e| e.into_inner());
             th.get_or_insert_with(AuthThrottle::new).record_fail()
@@ -424,8 +502,20 @@ fn handle_client(mut file: File) {
             &format!("<auth-fail cmd={}>", req.command),
             -401,
         );
+        if sid_blocked {
+            let _ = protocol::write_frame(
+                &mut file,
+                &serde_json::to_vec(&protocol::err_response(
+                    "该调用方鉴权失败次数过多，已临时拒绝",
+                ))
+                .unwrap(),
+            );
+            return;
+        }
         let msg = if locked {
-            "令牌鉴权失败（多次失败已锁定 60s）".to_string()
+            "令牌鉴权失败（全局熔断已触发，临时锁定 120s）".to_string()
+        } else if sid_fails >= MAX_AUTH_FAILS_PER_SID {
+            "令牌鉴权失败（该调用方失败次数已达上限）".to_string()
         } else {
             "令牌鉴权失败".to_string()
         };
@@ -435,12 +525,14 @@ fn handle_client(mut file: File) {
         );
         return;
     }
-    // 鉴权成功后重置失败计数（防正常用户被历史失败误锁）
+    // 鉴权成功后重置全局失败计数（防正常用户被历史失败误锁）。
+    // 仅在未处于锁定态时清零，避免把正在进行的熔断窗口「重置」，使熔断形同虚设。
     {
         let mut th = AUTH_THROTTLE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = th.as_mut() {
-            if !t.is_locked() {
+            if t.locked_until.is_none() {
                 t.fail_count = 0;
+                t.window_start = Instant::now();
             }
         }
     }
@@ -494,6 +586,10 @@ fn handle_client(mut file: File) {
         return;
     }
 
+    // GUI 实时信息流：先截取输出预览（必须在下方所有权移动 r.stdout 之前完成，
+    // 否则会触发「移动后借用」编译错误）
+    let out_preview: String = r.stdout.chars().take(200).collect();
+
     // 优化：减少不必要的克隆，直接使用所有权
     let resp = Response {
         ok: r.error.is_none() && !r.timed_out,
@@ -513,7 +609,6 @@ fn handle_client(mut file: File) {
     };
 
     // GUI 实时信息流：执行完成事件
-    let out_preview: String = r.stdout.chars().take(200).collect();
     common::log_event(serde_json::json!({
         "ts": common::now_str(),
         "type": "exec_done",

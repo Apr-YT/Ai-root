@@ -25,6 +25,11 @@ chrono = "0.4"
 embed-resource = "2"
 
 [profile.release]
-opt-level = 2
-lto = false
-codegen-units = 4
+opt-level = 3
+# thin LTO：在「构建时间」与「跨 crate 内联/死代码消除」之间取平衡。
+# 单文件终端工具无需 full LTO 的极致体积（会显著拉长 CI 构建），thin 已能消除
+# serde_json/chrono 与本 crate 之间的大部分跨 crate 调用开销。
+lto = "thin"
+codegen-units = 1
+# 剥离符号：减小分发体积（服务端日志/回溯由 log_exec 自理，不依赖符号表）
+strip = "symbols"

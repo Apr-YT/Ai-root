@@ -1,0 +1,3 @@
+// AI-Root 应用图标（Windows 资源，由 rc.exe / embed-resource 编译）
+// 图标：深蓝圆角背景 + 绿色终端提示符（16-256 共 7 帧）
+IDI_ICON1 ICON "AI-Root.ico"

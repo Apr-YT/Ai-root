@@ -309,16 +309,6 @@ fn gen_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// 令牌轮转：生成新令牌并写盘，同时更新 SDDL 权限
-/// 返回旧令牌（用于日志记录）和新令牌
-pub fn rotate_token() -> io::Result<(String, String)> {
-    let old_token = read_token().unwrap_or_default();
-    let new_token = gen_token();
-    std::fs::write(token_path(), &new_token)?;
-    set_dir_acl(&data_dir());
-    Ok((old_token, new_token))
-}
-
 /// 通过 whoami 获取当前用户 SID（用于精细化 ACL 与管道授权）
 pub fn get_user_sid() -> Option<String> {
     let out = Command::new("whoami")

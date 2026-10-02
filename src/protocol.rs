@@ -52,8 +52,8 @@ pub struct Response {
     pub timed_out: bool,
 }
 
-/// 验证请求数据的完整性
-fn validate_request(req: &Request) -> Result<(), String> {
+/// 验证请求数据的完整性（服务端 handle_client 调用，故为 pub）
+pub fn validate_request(req: &Request) -> Result<(), String> {
     // 验证令牌格式
     if req.token.is_empty() {
         return Err("令牌不能为空".to_string());

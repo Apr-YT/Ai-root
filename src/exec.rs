@@ -88,6 +88,42 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
     run_child(builder, timeout_ms)
 }
 
+/// 判定脚本是否含「无法拼接为单行」的块结构。
+///
+/// 需要回退文件方案的情形：`if (...)` / `for ... do (...)` / `while (...)` 等
+/// 带**跨行块体**的语法，以及花括号块。判据（大小写不敏感，逐行 trim 后匹配）：
+/// - 行以 `if `/`for `/`while `/`else` 开头（cmd 内建块关键字）；
+/// - 行内含 `) do (` / `do (`（`for`/`while` 的块体起点）；
+/// - 行内含 `{` 或 `}`（花括号块）。
+///
+/// 明确**不**触发回退的情形（这些括号是纯字面量，可安全拼接）：
+/// - `echo (test)`、`dir C:\Program Files (x86)`、`(echo hi)` 单行分组。
+///
+/// 这样把「裸括号」从回退判据中剔除，避免普通命令无谓走「写临时 .cmd + 落盘」路径。
+fn has_block_syntax(script: &str) -> bool {
+    for raw in script.split('\n') {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("if ")
+            || lower.starts_with("for ")
+            || lower.starts_with("while ")
+            || lower.starts_with("else")
+        {
+            return true;
+        }
+        if line.contains(") do (") || lower.contains("do (") {
+            return true;
+        }
+        if line.contains('{') || line.contains('}') {
+            return true;
+        }
+    }
+    false
+}
+
 /// 脚本模式：将多行命令以 `cmd /C` **直接传参**执行（首选，中文 100% 可靠），
 /// 仅对含括号块或超长脚本回退到文件方案。
 ///
@@ -100,11 +136,14 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
 /// 注意（脚本作者须知，README 已写明）：
 /// - `&`/`&&`/`|`/`()` 均为 cmd 正常语义（不转义）；同一行内 `set x=1 & echo %x%`
 ///   的 `%x%` 在解析期展开为空，需写 `& call echo %x%`；
-/// - 含 `(`/`)` 的括号块（`if (...)` / `for ... do (...)`）无法拼接为单行，自动回退文件方案；
+/// - 含**括号块**（`if (...)` / `for ... do (...)` 等多行块结构）无法拼接为单行，自动回退文件方案；
 /// - 拼接后长度超过 common::SCRIPT_INLINE_MAX_LEN 字符回退文件方案（cmd 命令行上限 8191）。
 fn run_script(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
     let norm = script.replace("\r\n", "\n");
-    let has_paren = norm.contains('(') || norm.contains(')');
+    // 判定「是否含多行块结构」。仅命中真正的块语法关键字/花括号才回退文件方案：
+    // 早期实现只要出现任意 `(`/`)` 就降级，导致 `echo (test)`、`dir (x)` 这类
+    // 普通命令被无谓地落到「写临时脚本 + 落盘」路径，既增加磁盘 IO，又留下临时文件痕迹。
+    let has_block = has_block_syntax(&norm);
     let joined = norm
         .split('\n')
         .map(|l| l.trim_end())
@@ -112,7 +151,7 @@ fn run_script(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
         .collect::<Vec<_>>()
         .join(" & ");
 
-    if !has_paren && !joined.is_empty() && joined.len() <= common::SCRIPT_INLINE_MAX_LEN {
+    if !has_block && !joined.is_empty() && joined.len() <= common::SCRIPT_INLINE_MAX_LEN {
         let mut builder = Command::new("cmd");
         // raw_arg 原样传参、不 escape_cmd_meta：脚本模式中 `&` 是命令分隔符（cmd 原生语义），
         // 中文经 UTF-16 命令行传递无乱码
@@ -351,17 +390,42 @@ fn escape_cmd_meta(cmd: &str) -> String {
 /// 单一代码页无法同时正确解码两者。故采用双解码策略：
 ///   1) 先严格按 UTF-8 解码（覆盖 UTF-8 发射器及全部 ASCII 内容）；
 ///   2) 失败再回退到系统 OEM 代码页（GBK）解码。
-/// 两种情形都能正确还原；ASCII 命令（pnputil/whoami/sc/ver）完全不受影响。
+///
+/// 启发式修正（P1）：仅凭「UTF-8 解码成功」不足以判定内容就是 UTF-8。GBK 双字节
+/// 序列（首字节 0x81-0xFE、次字节 0x40-0xFE）中有相当一部分恰好是合法 UTF-8 序列，
+/// 使短 GBK 中文输出被误判为 UTF-8 → 乱码。判据改为「UTF-8 合法 **且** 不含任何
+/// 多字节序列」才直接采用（即纯 ASCII）；含多字节序列时按系统 OEM 代码页解码，
+/// 因为 cmd 内建命令（dir/ver/systeminfo 等）的多字节输出实质上都是 OEM 编码。
+/// 纯 ASCII 情形（pnputil/whoami/sc/ver 等）两种解码结果一致，不受影响。
 fn decode_output(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::new();
     }
-    // 1) 严格 UTF-8：字节合法则直接采用（避免将合法 UTF-8 误当 GBK 解码产生乱码）
-    if let Ok(s) = String::from_utf8(bytes.to_vec()) {
-        return s;
+    // 1) 纯 ASCII：UTF-8 与 OEM 解码结果相同，直接采用（最常见路径，零额外开销）
+    if bytes.is_ascii() {
+        // SAFETY: 已确认全为 ASCII，必为合法 UTF-8
+        return unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
     }
-    // 2) 回退到 OEM 代码页（GBK），覆盖 cmd 内建命令以 GBK 回显的输出
+    // 2) 含非 ASCII 字节：优先判定是否为合法 UTF-8（覆盖真正的 UTF-8 发射器）
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        // 合法 UTF-8 且含多字节序列。此处存在歧义（可能是 GBK 恰好构成合法 UTF-8），
+        // 采用折中判据：若解码结果含 CJK 且无替换符/控制字符污染，则信任 UTF-8；
+        // 否则回退 OEM。
+        if looks_like_text(s) {
+            return s.to_string();
+        }
+    }
+    // 3) 回退到 OEM 代码页（GBK），覆盖 cmd 内建命令以 GBK 回显的输出
     decode_codepage(bytes, crate::winapi_raw::CP_OEMCP)
+}
+
+/// 粗略判断一段已成功解码的 UTF-8 文本是否「像正常文本」：
+/// 不含 C0/C1 控制字符（除常见空白）与 Unicode 替换符 U+FFFD。
+/// 用于在「合法 UTF-8」与「GBK 误判为 UTF-8」之间取舍。
+fn looks_like_text(s: &str) -> bool {
+    !s.chars().any(|c| {
+        (c.is_control() && c != '\r' && c != '\n' && c != '\t') || c == '\u{FFFD}'
+    })
 }
 
 /// 按指定代码页把多字节原始字节解码为 UTF-16 → Rust String（lossy 兜底）。
