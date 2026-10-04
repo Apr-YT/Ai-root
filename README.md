@@ -286,6 +286,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 >
 > 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。本机位于 `D:\Kiln\mingw-binutils\bin`（可用 `MINGW_BINUTILS_BIN` 覆盖）。获取：清华 msys2 镜像 `mingw-w64-x86_64-binutils-*.pkg.tar.zst`，解压后把 `mingw64/bin` 内容放入该目录。
 > 2. **Git Bash 下 PATH 只认 POSIX 形式**。把 `D:/Kiln/...` 或 `D:\Kiln\...` 写进 `PATH` 后，`command -v dlltool.exe` / `which` 一律查不到（不是 Permission denied，是彻底找不到），导致 cargo 解析回落到 `CARGO_HOME\bin` 的 rustup shim，最终报 `error calling dlltool 'dlltool.exe': program not found`。`build.sh` 用 `to_posix()` 统一转换，并直接调用 toolchain 内的真实 `cargo.exe`；`build.ps1` 侧为原生 Windows 路径语义，无此问题。
+> 3. **gnu 目标的 `CARGO_TARGET_DIR` 必须是纯 ASCII 路径**。MinGW binutils（`dlltool`/`ld`）按 ANSI 代码页解释路径参数，遇到非 ASCII（本项目路径含 `工具`）会把它毁成 `????`，报 `dlltool.exe: Can't create .lib file: ...\????\...\kernel32.dll_imports.lib` —— 错误信息里路径已乱码，极难定位。因此**不要**用仓库内默认的 `target/`（本项目路径非 ASCII），本机固定 `D:\AI-Root-target`。两个构建脚本均已加前置校验，命中时直接给出可执行的修复建议而非让链接期失败。
 
 **CI 双 job**（`.github/workflows/ci.yml`，`windows-latest`）：
 
@@ -308,20 +309,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 cargo test --release --target x86_64-pc-windows-gnu
 ```
 
-当前 **44 个单元测试**（2026-10-04 从 6 个扩充），分布：
+当前 **49 个测试**（2026-10-04 从 6 个扩充：先到 44 个单元测试，再补 5 个真实管道集成测试），分布：
 
-| 模块 | 覆盖内容 |
-|---|---|
-| `exec` | cmd 元字符转义（引号内/外、`^`/`&`、未闭合引号） |
-| `protocol` | `validate_request` 全字段边界（令牌长度/命令 8191/cwd MAX_PATH/超时上下限/校验顺序）；序列化向后兼容；`write_frame` 帧编码与 flush |
-| `server` | `ct_eq` 恒定时间比较（含逐字节差异、首末字节）；`AuthThrottle` 熔断阈值/窗口重置/锁定过期；`record_sid_fail` 定向封禁/隔离/窗口过期 |
+| 模块 | 数量 | 覆盖内容 |
+|---|---|---|
+| `exec` | 6 | cmd 元字符转义（引号内/外、`^`/`&`、未闭合引号） |
+| `protocol` | 27 | `validate_request` 全字段边界（令牌长度/命令 8191/cwd MAX_PATH/超时上下限/校验顺序）；序列化向后兼容；`write_frame` 帧编码与 flush；**`read_frame_timeout` 真实命名管道集成测试**（正常往返、300 KB 大帧、空闲超时、超长长度前缀拒绝、对端关闭） |
+| `server` | 16 | `ct_eq` 恒定时间比较（含逐字节差异、首末字节）；`AuthThrottle` 熔断阈值/窗口重置/锁定过期；`record_sid_fail` 定向封禁/隔离/窗口过期 |
+
+> **集成测试用真实命名管道**：`read_frame_timeout` 的 5 个测试通过 `make_pipe_pair()` 在进程内自建 `CreateNamedPipeW` + `CreateFileW` 管道对（管道名含 `pid` + 测试标签，保证并行安全），**不 mock 任何 IO**。因此它真实覆盖了 `PeekNamedPipe` 轮询、分段超时预算、`FRAME_MAX_SIZE` 长度前缀校验这几条最容易出安全 bug 的路径。
+>
+> 该组测试经变异验证有效：注入「去掉 `FRAME_MAX_SIZE` 校验」→ 仅 `read_frame_rejects_oversized_length_prefix` 失败；注入「去掉头部空闲超时检查」→ `read_frame_times_out_when_no_data_sent` **直接挂死**（被 `timeout 60` 杀掉）——恰好印证它守的是线程泄漏型 DoS 的兜底。
 
 > **测试用真实被测代码**：帧测试真实调用 `write_frame` 并校验落盘字节，而非在测试内重抄一遍编码逻辑（后者是「伪测试」——实现改错也照样通过）。
 >
 > **阈值类断言硬编码期望值**，而非引用常量。否则「改常量」的变异不会被检出（测试跟着一起变）。这些数值是对外承诺的行为契约（见 4.1），变更应是有意识的决策。
 >
 > **尚未覆盖**（已知缺口，优先级从高到低）：
-> - `read_frame_timeout` 的分阶段超时/大帧/slow-loris 兜底 —— 需真实命名管道句柄，测试成本较高
 > - `handle_client` 端到端流程（鉴权→执行→回写）、`connect_client` 的 `ERROR_PIPE_BUSY` 重试路径
 > - 命令黑名单（`format ` 等）的匹配规则
 > - 输出截断（1MB）、GBK 回退解码

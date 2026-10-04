@@ -593,5 +593,172 @@ mod tests {
         // 且长度前缀为 u32，上限不得超过 u32::MAX
         assert!(common::FRAME_MAX_SIZE <= u32::MAX as usize);
     }
+
+    // ============ read_frame_timeout：真实命名管道集成测试 ============
+    //
+    // 为什么必须用真实命名管道：read_frame_timeout 内部依赖 PeekNamedPipe 轮询
+    // 可用字节数来实现「空闲超时」。普通文件不支持该语义，用文件测等于没测到
+    // 真正的超时逻辑。
+    //
+    // 本机自连方案（CreateNamedPipeW 服务端 + CreateFileW 客户端，同一进程）：
+    // 无需管理员、无需已安装服务，也不依赖全局单例管道名 —— 每个测试用
+    // 独立随机管道名，可并行执行。
+
+    /// 建立一对已连接的命名管道：返回 (服务端句柄包装的 File, 客户端句柄包装的 File)。
+    /// 服务端在一个独立线程内阻塞等待连接，避免与本线程的 CreateFileW 互锁。
+    fn make_pipe_pair(tag: &str) -> (File, File) {
+        use std::os::windows::io::FromRawHandle;
+        use std::sync::mpsc;
+
+        // 用 pid + tag 保证并行测试间管道名唯一
+        let name = format!(r"\\.\pipe\airoot-test-{}-{}", std::process::id(), tag);
+        let wide = common::to_wide(&name);
+        let (tx, rx) = mpsc::channel::<bool>();
+
+        let name_for_thread = wide.clone();
+        // 关键：HANDLE 是裸指针(!Send)，不能在跨线程返回值里传递。
+        // 故服务端线程内部完成「创建+等待连接+封装为 File」，只把 bool 状态传出。
+        let server_thread = std::thread::spawn(move || -> Option<File> {
+            let h = unsafe {
+                winapi_raw::CreateNamedPipeW(
+                    name_for_thread.as_ptr(),
+                    winapi_raw::PIPE_ACCESS_DUPLEX,
+                    winapi_raw::PIPE_TYPE_BYTE | winapi_raw::PIPE_READMODE_BYTE,
+                    winapi_raw::PIPE_UNLIMITED_INSTANCES,
+                    65536,
+                    65536,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if h == winapi_raw::INVALID_HANDLE_VALUE {
+                tx.send(false).unwrap();
+                return None;
+            }
+            tx.send(true).unwrap();
+            // 阻塞等待客户端连接
+            let ok = unsafe { winapi_raw::ConnectNamedPipe(h, std::ptr::null_mut()) };
+            let err = unsafe { winapi_raw::GetLastError() };
+            if ok == 0 && err != winapi_raw::ERROR_PIPE_CONNECTED {
+                unsafe { winapi_raw::CloseHandle(h) };
+                return None;
+            }
+            Some(unsafe { File::from_raw_handle(h as _) })
+        });
+
+        // 等服务端管道创建完成（否则 CreateFileW 会先撞上 FILE_NOT_FOUND）
+        assert!(rx.recv().expect("服务端管道创建失败"), "CreateNamedPipeW 失败");
+
+        // 客户端连接（服务端 ConnectNamedPipe 会在此刻返回）
+        let cli_h = unsafe {
+            winapi_raw::CreateFileW(
+                wide.as_ptr(),
+                winapi_raw::GENERIC_READ | winapi_raw::GENERIC_WRITE,
+                winapi_raw::FILE_SHARE_READ | winapi_raw::FILE_SHARE_WRITE,
+                std::ptr::null(),
+                winapi_raw::OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            cli_h != winapi_raw::INVALID_HANDLE_VALUE,
+            "客户端连接测试管道失败 (last_err={})",
+            unsafe { winapi_raw::GetLastError() }
+        );
+
+        let srv = server_thread.join().unwrap().expect("服务端连接失败");
+        let cli = unsafe { File::from_raw_handle(cli_h as _) };
+        (srv, cli)
+    }
+
+    #[test]
+    fn read_frame_roundtrip_over_real_pipe() {
+        let (mut srv, cli) = make_pipe_pair("roundtrip");
+
+        let payload = br#"{"token":"x","command":"whoami"}"#;
+        let mut writer = cli.try_clone().unwrap();
+        let payload_for_writer = payload.to_vec();
+        let t = std::thread::spawn(move || {
+            write_frame(&mut writer, &payload_for_writer).unwrap();
+        });
+
+        // 服务端读取，验证与写入内容一致（覆盖真实 PeekNamedPipe 轮询路径）
+        let got = read_frame_timeout(&mut srv, 5_000).expect("读帧应成功");
+        t.join().unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn read_frame_handles_large_payload() {
+        // 覆盖「帧体分阶段读取」路径：远大于单次管道缓冲区(64KB)的负载，
+        // 必须在多次 peek/read 循环中完整拼装。
+        let (mut srv, cli) = make_pipe_pair("large");
+        let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+
+        let mut writer = cli.try_clone().unwrap();
+        let p = payload.clone();
+        let t = std::thread::spawn(move || {
+            write_frame(&mut writer, &p).unwrap();
+        });
+
+        let got = read_frame_timeout(&mut srv, 5_000).expect("大帧应完整读出");
+        t.join().unwrap();
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(got, payload, "大帧内容必须逐字节一致");
+    }
+
+    #[test]
+    fn read_frame_times_out_when_no_data_sent() {
+        // 核心 DoS 防护：客户端连上后不发任何数据，必须按 idle_ms 超时返回，
+        // 而不是永久阻塞工作线程。
+        let (mut srv, _cli) = make_pipe_pair("idle");
+
+        let start = std::time::Instant::now();
+        let err = read_frame_timeout(&mut srv, 300).expect_err("无数据应超时");
+        let elapsed = start.elapsed();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "应为 TimedOut");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "不应早于 idle 窗口返回（实际 {elapsed:?}）"
+        );
+        // 允许充足的调度余量，但必须确实返回而非挂死
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "超时后应尽快返回（实际 {elapsed:?}）"
+        );
+    }
+
+    #[test]
+    fn read_frame_rejects_oversized_length_prefix() {
+        // 只发「长度前缀」声明超过 FRAME_MAX_SIZE，且不实际发送负载。
+        // 实现应在读完 4 字节帧头后立即拒绝，绝不能去分配 16MB+ 缓冲。
+        let (mut srv, cli) = make_pipe_pair("oversize");
+
+        let bogus = (common::FRAME_MAX_SIZE as u32 + 1).to_le_bytes();
+        let mut writer = cli.try_clone().unwrap();
+        let t = std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = writer.write_all(&bogus);
+            let _ = writer.flush();
+            // 保持片刻，确保服务端已读到帧头再判定
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+
+        let err = read_frame_timeout(&mut srv, 3_000).expect_err("超大帧应被拒绝");
+        t.join().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "应为 InvalidData");
+    }
+
+    #[test]
+    fn read_frame_detects_closed_peer() {
+        // 对端关闭时 PeekNamedPipe 失败，应作为 BrokenPipe 暴露而非挂死
+        let (mut srv, cli) = make_pipe_pair("closed");
+        drop(cli); // 立即关闭客户端
+
+        let err = read_frame_timeout(&mut srv, 3_000).expect_err("对端关闭应报错");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "应为 BrokenPipe");
+    }
 }
 

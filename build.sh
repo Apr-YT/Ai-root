@@ -28,6 +28,14 @@
 #        报 "error calling dlltool 'dlltool.exe': program not found"。
 #   因此本脚本: 所有加入 PATH 的路径必须先转 POSIX 形式(to_posix), 且 cargo
 #   直接指向 toolchain 内的真实 cargo.exe, 不再依赖 PATH 解析。
+#
+#   ── 坑 2: 目标目录不能含非 ASCII ─────────────────────────────────────────
+#   MinGW binutils 按 ANSI 代码页解释路径, 非 ASCII(如本项目路径里的 "工具")会
+#   被毁成 "????", 报:
+#     dlltool.exe: Can't create .lib file:
+#       D:\project\workbuddy\????\AI-Root\target\...\kernel32.dll_imports.lib
+#   注意报错里路径已乱码, 极易误判为"文件不存在"。故默认用 ASCII 的
+#   D:\AI-Root-target; 若调用方覆盖成含中文的路径, 本脚本前置拦截并提示。
 
 set -euo pipefail
 
@@ -46,6 +54,17 @@ to_posix() {
   printf '/%s/%s' "$drive" "${rest#/}"
 }
 
+# 目标目录必须为纯 ASCII。原因(2026-10-04 实测):
+#   MinGW binutils(dlltool/ld)按 ANSI 代码页解释路径参数, 遇到非 ASCII(如中文
+#   "工具")会把它毁成 "????", 报
+#     dlltool.exe: Can't create .lib file: D:\project\...\????\AI-Root\target\...
+#   —— 错误信息里路径已乱码, 极难定位。若沿用仓库内默认 target/(本项目路径含
+#   "工具"), 就会触发。故构建期强制使用 ASCII 目标目录。
+is_ascii() {
+  # LC_ALL=C 下, 任何 >= 0x80 的字节都会被 grep 命中
+  ! printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]'
+}
+
 # 允许外部覆盖; 默认与本机一致(均为 Windows 形式, 后面统一转 POSIX)
 CARGO_HOME_WIN="${CARGO_HOME:-D:/software/rust/cargo}"
 RUSTUP_HOME_WIN="${RUSTUP_HOME:-D:/software/rust/rustup}"
@@ -59,6 +78,16 @@ BINUTILS_BIN_POSIX="$(to_posix "$BINUTILS_BIN_WIN")"
 
 TOOLCHAIN_DIR="$RUSTUP_HOME_POSIX/toolchains/stable-x86_64-pc-windows-gnu"
 TOOLCHAIN_BIN="$TOOLCHAIN_DIR/bin"
+
+# 目标目录 ASCII 校验: 非 ASCII 会在链接期被 dlltool 毁成 "????" 而失败(见上方注释)。
+# 默认 D:/AI-Root-target 是 ASCII; 但如果调用方显式传了含中文的 CARGO_TARGET_DIR,
+# 在此提前拦下并给出可执行的修复建议。
+if ! is_ascii "$CARGO_TARGET_DIR_POSIX"; then
+  echo "[X] CARGO_TARGET_DIR 含非 ASCII 字符: $CARGO_TARGET_DIR_POSIX" >&2
+  echo "    MinGW binutils 无法处理非 ASCII 路径, 链接期会因路径乱码而失败。" >&2
+  echo "    请改用纯 ASCII 路径, 例如: CARGO_TARGET_DIR=D:/AI-Root-target bash build.sh" >&2
+  exit 1
+fi
 
 if [ ! -x "$BINUTILS_BIN_POSIX/as.exe" ]; then
   echo "[X] 未找到完整 MinGW binutils: $BINUTILS_BIN_POSIX/as.exe" >&2

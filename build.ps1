@@ -155,6 +155,17 @@ if ($env:CARGO_TARGET_DIR) {
 } else {
     $targetDir = Join-Path $repoRoot "target"
 }
+
+# gnu 链接期必须用纯 ASCII 目标目录: MinGW binutils(dlltool/ld)按 ANSI 代码页解释
+# 路径, 遇非 ASCII(如中文 "工具")会毁成 "????", 报
+#   dlltool.exe: Can't create .lib file: ...\????\...\kernel32.dll_imports.lib
+# 错误信息本身已乱码, 极难定位。msvc 不受影响, 但此处统一拦住以免误判。
+if ($TARGET -like "*windows-gnu*") {
+    if ($targetDir -match '[^\x20-\x7E]') {
+        Write-Error "CARGO_TARGET_DIR 含非 ASCII 字符: $targetDir`nMinGW binutils 无法处理, 链接期会因路径乱码失败。`n请改用纯 ASCII 路径, 例如 D:\AI-Root-target"
+    }
+}
+
 $env:CARGO_TARGET_DIR = $targetDir
 
 Set-Location $repoRoot
