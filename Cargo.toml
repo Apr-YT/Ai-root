@@ -20,9 +20,12 @@ serde_json = "1"
 rand = "0.8"
 chrono = "0.4"
 
-[build-dependencies]
-# 嵌入 Windows 资源（应用图标 assets/AI-Root.ico），仅 Windows 目标生效
-embed-resource = "2"
+# 说明：嵌入 Windows 资源（应用图标 assets/AI-Root.ico）由 build.rs **直接调用**
+# rc.exe(msvc) / windres(gnu) 完成，不依赖 embed-resource crate。
+# 原因：embed-resource 2.x 按「编译 build script 的 host」选模块，而非按 cargo
+# --target 指定的目标 —— 在「msvc host + gnu target」的 cross-compile 场景下
+# 会调 rc.exe 产出 MSVC 格式 .lib，gnu 链接器报 "file format not recognized"。
+# 详见 build.rs 文件头注释。
 
 [profile.release]
 opt-level = 3
