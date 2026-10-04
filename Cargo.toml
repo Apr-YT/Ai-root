@@ -31,5 +31,19 @@ opt-level = 3
 # serde_json/chrono 与本 crate 之间的大部分跨 crate 调用开销。
 lto = "thin"
 codegen-units = 1
-# 剥离符号：减小分发体积（服务端日志/回溯由 log_exec 自理，不依赖符号表）
-strip = "symbols"
+# 剥离符号：`debuginfo` 保留符号表、只去掉 .debug_* 段。
+#
+# 为什么不用 `strip = "symbols"`（2026-10-04 实测）：
+#   实测对比（rustc -O，同源码）：
+#     strip="symbols"   → 871KB，panic 回溯**完全为空**，只剩一行
+#                         "note: Some details are omitted"，一个帧都没有。
+#     strip="debuginfo" → 1.22MB（+30%），回溯完整给出函数名与调用链
+#                         （rust_begin_unwind → panic_fmt → panic →
+#                           unwrap_failed → 目标函数），且 panic 位置
+#                           仍精确到 file:line:col（该信息编在 panic 元数据中，
+#                           不依赖 .debug_* 段）。
+#     strip="none"      → 3.58MB（+315%），多出的体积几乎全是无用的 debug 段。
+#
+#   本项目是以 LocalSystem 执行任意命令的服务，线上崩溃时若拿不到任何符号，
+#   排障成本远高于 256KB 的体积收益。故取 `debuginfo` 这个中间点。
+strip = "debuginfo"

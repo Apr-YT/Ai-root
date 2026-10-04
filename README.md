@@ -235,9 +235,18 @@ AI-Root run -- <原始命令>
 - **双击 exe（无参数）**：打印帮助信息并等待按键，防止终端一闪而过；CLI 交互输出经 `AttachConsole(ATTACH_PARENT_PROCESS)` 可见，管道/重定向不受影响。
 - **实时查看 AI 操作**：用 `AI-Root tail` 实时跟随 `events.jsonl`（支持 `--caller` / `--type` / `--since` 过滤），替代原 GUI「实时信息流」。
 - **审计日志查看**：`C:\ProgramData\AI-Root\exec.log` 逐行记录；人工巡检用任意文本工具或 `AI-Root tail` 查看。
-- **构建产物**：仅 `AI-Root.exe`（console 子系统，约 842 KB，MinGW 静态链接 CRT）。
-  > 体积经 `profile.release` 优化：`lto="thin"` + `codegen-units=1` + `strip="symbols"`（早期未优化时约 1.9–2.0MB）。
-  > ⚠ `strip="symbols"` 会同时剥掉 panic 回溯的符号信息 —— 线上崩溃只能拿到地址，无法直接定位函数。若需排查线上问题，临时改为 `strip=false` 或保留 `debug=1` 重建。
+- **构建产物**：仅 `AI-Root.exe`（console 子系统，约 1.07 MB，MinGW 静态链接 CRT）。
+  > 体积经 `profile.release` 优化：`lto="thin"` + `codegen-units=1` + `strip="debuginfo"`。
+  > ⚠ **`strip` 取 `debuginfo` 而非 `symbols`**（2026-10-04 实测调整）：
+  >
+  > | 配置 | 体积 | 符号数 | panic 回溯 |
+  > |---|---|---|---|
+  > | `symbols` | 842 KB | 0 | **空**，仅一行 `note: Some details are omitted` |
+  > | `debuginfo` | 1.07 MB | 3333 | 完整函数名 + 调用链 |
+  > | `none` | 3.41 MB | 完整 | 多出体积几乎全是无用 debug 段 |
+  >
+  > 本项目以 LocalSystem 执行任意命令，线上崩溃拿不到符号的排障代价远高于 256 KB 体积。
+  > 另注：panic 的 `file:line:col` 位置信息编在 panic 元数据中，**两种配置下都有**，不受 `strip` 影响。
 
 ---
 
@@ -258,7 +267,7 @@ AI-Root run -- <原始命令>
 ```bash
 # 本机构建（git bash 执行 build.sh）
 bash build.sh
-# → $CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/AI-Root.exe（约 842 KB，MinGW 静态链接 CRT）
+# → $CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/AI-Root.exe（约 1.07 MB，MinGW 静态链接 CRT）
 
 # 或 PowerShell（本机与 CI 通用，自动选 target）
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
@@ -275,7 +284,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 > 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。本机位于 `D:\Kiln\mingw-binutils\bin`（可用 `MINGW_BINUTILS_BIN` 覆盖）。获取：清华 msys2 镜像 `mingw-w64-x86_64-binutils-*.pkg.tar.zst`，解压后把 `mingw64/bin` 内容放入该目录。
 > 2. **Git Bash 下 PATH 只认 POSIX 形式**。把 `D:/Kiln/...` 或 `D:\Kiln\...` 写进 `PATH` 后，`command -v dlltool.exe` / `which` 一律查不到（不是 Permission denied，是彻底找不到），导致 cargo 解析回落到 `CARGO_HOME\bin` 的 rustup shim，最终报 `error calling dlltool 'dlltool.exe': program not found`。`build.sh` 用 `to_posix()` 统一转换，并直接调用 toolchain 内的真实 `cargo.exe`；`build.ps1` 侧为原生 Windows 路径语义，无此问题。
 
-> CI（GitHub Actions `windows-latest`）自带 MSVC，`build.ps1` 走 msvc 路径；本机与 CI 的 `CARGO_TARGET_DIR` 需分离，避免互相覆盖。CI 另附「Package artifact」步骤，产出 `AI-Root-windows-x64` 工件（含 exe + `build.ps1` + README，保留 30 天，并打印 exe 的 SHA256）。
+**CI 双 job**（`.github/workflows/ci.yml`，`windows-latest`）：
+
+| job | toolchain | 内容 |
+|---|---|---|
+| `build-msvc` | `x86_64-pc-windows-msvc` | `build.ps1` 构建 → `cargo test` → 打包上传 `AI-Root-windows-x64` 工件（30 天保留，打印 exe SHA256） |
+| `build-gnu` | `x86_64-pc-windows-gnu` | 经 `msys2/setup-msys2` 装完整 binutils → `bash build.sh` 构建 → `cargo test` |
+
+> **为什么必须有两个 job**（2026-10-04 教训）：本机开发环境是 **gnu-only**，而 msvc job 不可能覆盖 gnu 路径。
+> `build.sh` 曾长期因 binutils/PATH 问题无法构建，**但 CI 一直是绿的** —— 因为只验了 msvc。`build-gnu` 专门堵住这个盲区：
+> 它走的是**开发者实际使用的 `build.sh`**，而非另写一套等价逻辑，确保 CI 验的就是本机跑的。
+>
+> `build-gnu` 不手工下载 `.pkg.tar.zst`：该格式是 zstd 压缩，实测本机 GNU tar 1.35、Python 标准库（无 `zstandard`）均无法解压，runner 上是否可行无法在本地验证 —— 属于「靠猜」。改用 `msys2/setup-msys2` 由官方 action 保证正确性。
+
+`build.ps1` 构建产物随 job 上传；本机与 CI 的 `CARGO_TARGET_DIR` 需分离，避免互相覆盖。
 
 > 📌 **现状核对（2026-10-04）**：下述交付目录**当前均不存在** —— `D:\project\workbuddy\工具\AI-Root-build\` 与 `D:\Finished product\AI-Root\` 都未创建，`D:\Kiln\` 下也只有 `mingw-binutils`（无 `AI-Root` 部署目录）。构建产物目前只落在 `CARGO_TARGET_DIR`（本机 `D:\AI-Root-target\x86_64-pc-windows-gnu\release\AI-Root.exe`）。首次部署时需按下文流程创建。
 
@@ -298,7 +320,7 @@ D:\Finished product\AI-Root\
 **部署流程（务必现场重建，勿复用早前构建）**：工作树存在并发编辑，`AI-Root-build` 中的旧二进制可能滞后于源码（实测同尺寸但哈希不同）。固定流程：
 `bash build.sh`（本机 gnu；CI 走 `build.ps1` 自动选 msvc）→ 复制到 `AI-Root-build` → `AI-Root update <AI-Root-build\AI-Root.exe>` → 校验部署哈希一致 + `run --json whoami`=SYSTEM。
 
-**CI**：`.github/workflows/ci.yml` 在 GitHub Actions `windows-latest` 上自动执行 `build.ps1`（提交到 main、PR 或手动 `workflow_dispatch` 触发），并打包上传 `AI-Root-windows-x64` 工件（保留 30 天）。
+**CI**：`.github/workflows/ci.yml` 在 GitHub Actions `windows-latest` 上跑 msvc + gnu 双 job（提交到 main、PR 或手动 `workflow_dispatch` 触发），详见第 7 节。
 
 依赖：`serde` / `serde_json` / `rand` / `chrono`（纯终端实现，无 GUI / egui / tray-icon 依赖）。
 

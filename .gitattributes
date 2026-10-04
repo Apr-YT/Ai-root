@@ -1,0 +1,41 @@
+# 统一换行符处理，避免 Windows/Linux 协作时脚本被破坏。
+#
+# 背景：Git 在 Windows 上默认 core.autocrlf=true，会把文本文件检出为 CRLF。
+# 对 *.sh 而言这是**破坏性的**：CRLF 会污染 shebang(#!...\r) 与 `set -euo pipefail`，
+# 导致在 Git Bash/WSL/CI 中执行时出现难以定位的报错。
+# 实测：提交 build.sh 时 Git 曾警告 "LF will be replaced by CRLF"。
+
+# 默认：交由 Git 自动判断文本文件，并以 LF 存入仓库
+* text=auto eol=lf
+
+# Shebang 脚本必须保持 LF，否则无法执行
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Windows 脚本保持 CRLF（PowerShell 对 LF 容忍，但 CRLF 更符合平台惯例）
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 配置文件与文档用 LF
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.rs text eol=lf
+
+# 二进制文件：禁止任何换行符转换
+*.exe binary
+*.dll binary
+*.pdb binary
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+
+# 语言统计：标记为文档/生成物，不计入语言占比
+*.md linguist-documentation

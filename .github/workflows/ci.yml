@@ -11,8 +11,8 @@ env:
   CARGO_TARGET_DIR: ${{ runner.temp }}\ai-root-target
 
 jobs:
-  build:
-    name: Build (windows-latest)
+  build-msvc:
+    name: Build + Test (windows-latest / msvc)
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -28,6 +28,10 @@ jobs:
         shell: pwsh
         run: ./build.ps1
 
+      - name: Test
+        shell: pwsh
+        run: cargo test --release --target x86_64-pc-windows-msvc
+
       - name: Package artifact
         shell: pwsh
         run: |
@@ -36,7 +40,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item $exe dist\AI-Root.exe
           # 附带安装所需的辅助脚本与资源(若存在)
-          foreach ($f in @("build.ps1", "README.md")) {
+          foreach ($f in @("build.ps1", "build.sh", "README.md")) {
             if (Test-Path $f) { Copy-Item $f dist\ }
           }
           Get-ChildItem dist | Format-Table Name, Length
@@ -50,3 +54,53 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 30
+
+  # 为什么单独跑 gnu: 本机(开发环境)是 gnu-only, 而 msvc job 不可能覆盖 gnu
+  # 路径。历史教训 —— build.sh 曾长期是坏的(binutils 注入 + Git Bash PATH 形式
+  # 问题), 但 CI 全绿, 因为只验了 msvc。本 job 专门堵住这个盲区。
+  build-gnu:
+    name: Build + Test (windows-latest / gnu)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable / x86_64-pc-windows-gnu)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-gnu
+
+      # gnu 链接期需要完整 MinGW binutils(含 as.exe); rustup 的 self-contained
+      # 目录实测只有 dlltool/ld/gcc, 缺 as.exe, 故必须单独提供完整 binutils。
+      #
+      # 不用「手工下载 .pkg.tar.zst 再解压」: 该格式是 zstd 压缩, 实测本机
+      # GNU tar 1.35 与 Python 标准库(无 zstandard)均无法解压, runner 上是否可行
+      # 无法在本地验证 —— 属于「靠猜」。改用 msys2 官方 action, 由它保证正确性。
+      - name: Setup MSYS2 + MinGW binutils
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-binutils
+          path-type: inherit
+
+      - name: Locate MinGW binutils
+        shell: pwsh
+        run: |
+          $as = (Get-Command as.exe -ErrorAction SilentlyContinue).Source
+          if (-not $as) { throw "未找到 as.exe —— MinGW binutils 未安装成功" }
+          $dir = Split-Path -Parent $as
+          "MINGW_BINUTILS_BIN=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "[*] binutils: $dir"
+          Get-Command as.exe, dlltool.exe, ld.exe | Select-Object Name, Source | Format-Table
+
+      # 走真实的本机构建脚本, 确保 CI 验的就是开发者实际用的路径
+      - name: Build (release, via build.sh)
+        shell: bash
+        run: bash build.sh
+
+      - name: Test
+        shell: bash
+        run: cargo test --release --target x86_64-pc-windows-gnu
+
