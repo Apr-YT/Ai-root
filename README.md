@@ -52,9 +52,24 @@
 ## 2. 部署（仅需一次，管理员）
 
 ```powershell
-# 以管理员运行 deploy.ps1（注册服务、生成令牌、设置 SDDL、写入 C:\Windows\AI-Root.cmd）
-powershell -ExecutionPolicy Bypass -File deploy.ps1
+# 以管理员身份打开 PowerShell，然后执行：
+powershell -ExecutionPolicy Bypass -File install-service.ps1
 ```
+
+`install-service.ps1` 分 6 步并逐步打印结果，**不含隐藏动作**：
+
+| 步骤 | 内容 |
+|---|---|
+| 0 | 提权自检（非管理员直接 `exit 1`） |
+| 1 | 二进制 SHA256 指纹核对（不匹配即 `exit 1`，避免装错版本） |
+| 2 | 安装前快照（服务状态 / 目录 ACL / 部署产物存在性） |
+| 3 | `AI-Root install`（注册 LocalSystem 自启服务） |
+| 4 | 安装后核对（服务注册与启动类型、`SERVICE_START_NAME`、部署副本与包装器、**Users 无写权限 + SYSTEM 保留 (F)**、`sid.txt`） |
+| 5-6 | 启动服务 + `sc qfailure` 失败恢复核对（应 60s/300s/600s） |
+
+> 若第 4 步 ACL 检查报 `[X]`（Users 仍持有写权限），**请立即停止使用并反馈** —— 说明 §4.1 的隔离修复未生效。
+
+> 也可手动逐步执行：`AI-Root.exe install` → `AI-Root.exe start`（同样需管理员）。
 
 > **一次性管理员，之后零介入**：`install` 除注册服务外，还会给**当前用户 SID** 追加服务的
 > `GRGX` 权限（GENERIC_READ|GENERIC_EXECUTE，含 QUERY_STATUS/START/STOP，Windows 服务安全描述符
@@ -262,7 +277,7 @@ AI-Root run -- <原始命令>
 （父目录授予可继承的 Users 写权限）后调用**真实** `set_dir_acl`，断言写权限被剥离、
 SYSTEM 保留完全控制、当前用户保留只读。变异验证：还原缺陷 A / 缺陷 B 各一次，均 FAILED。
 
-### 4.1 运行时安全加固
+### 4.2 运行时安全加固
 
 - **鉴权失败节流（双层）**：
   - **全局熔断**：30s 窗口内累计失败达 **20** 次 → 全局锁定 **120s**，期间拒绝一切请求（记 `<locked>`）。

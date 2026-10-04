@@ -13,6 +13,9 @@
 *.bash text eol=lf
 
 # Windows 脚本保持 CRLF（PowerShell 对 LF 容忍，但 CRLF 更符合平台惯例）
+# ⚠ 注意：含中文的 *.ps1 必须自身带 UTF-8 BOM（本机 PS 5.1 默认按 ANSI/GBK 读 .ps1，
+#   无 BOM 的 UTF-8 中文会解码成乱码并引发语法错误）。BOM 是文件内容的一部分，
+#   git 的 eol 转换不会删除它 —— 已实测：检出后 BOM 保留、CRLF 生效、语法正确。
 *.ps1 text eol=crlf
 *.psm1 text eol=crlf
 *.psd1 text eol=crlf
