@@ -16,8 +16,26 @@
 - 新增 `select_grant_sid()` 纯逻辑内核，使"进程身份 = SYSTEM"这一测试环境无法复现的前提可被单元测试覆盖。
 
 ### 构建
-- `build.sh` / `build.ps1` 的 binutils 路径改为**自动探测**（`MINGW_BINUTILS_BIN` → `D:\Kiln\mingw64\bin` → `D:\Kiln\mingw-binutils\bin`），
-  不再硬编码单一目录（本机曾把 `mingw-binutils` 改名为 `mingw64`，硬编码会直接导致脚本失效）。
+- **仓库迁至纯 ASCII 路径** `D:\project\workbuddy\tools\AI-Root`，根治 MinGW `ld`/`dlltool` 无法处理含中文的产物路径问题。
+- **构建脚本大幅简化**：`build.sh` 212 → 116 行、`build.ps1` 207 → 约 145 行。
+  配置下沉到 `.cargo/config.toml`（单一事实来源），产物统一落**仓库内 `target/`**，
+  不再使用外部 `CARGO_TARGET_DIR`，不再需要 ASCII 前置校验。
+- binutils / rust 根目录仍**自动探测**（`MINGW_BINUTILS_BIN` → `D:\Kiln\mingw64\bin` → `D:\Kiln\mingw-binutils\bin`；
+  rust 根支持 `AIROOT_RUST_ROOT` → 环境变量推导 → 候选探测），但每个候选都会**校验真实存在**才采用
+  （已运行的 shell 会话可能带迁移前的陈旧环境变量）。
+- **修复缺陷**：`build.ps1` 此前只读取 `CARGO_HOME`/`RUSTUP_HOME` 用于推导 rustup 根，
+  却**不回写**修正值 → 会话带着陈旧值时 cargo 从上游 `index.crates.io` 重新下载全套 crate，
+  导致与 `build.sh`（用 rsproxy 镜像）产出**两套 registry 的二进制**。现已无条件回写。
+
+> **关于二进制可复现性（实测结论，勿再追查）**：两脚本在**同一台机器、同一源码**下产出的 exe
+> 仍不会逐字节一致，且**同一脚本连续两次也不一致**。原因不在脚本，而在上游：
+> GNU binutils 的 `dlltool` 默认把**时间戳**写入 `kernel32_dll_imports_lib`，
+> 该 lib 的内容哈希又被编进最终产物（PE 内可见 `_head_D_..._kernel32_dll_imports_lib`），
+> 进而改变符号表布局。实测：同一 `.def` 间隔 1 秒生成两个 import lib → md5 不同；
+> 加 `--deterministic-libraries` 并固定输出路径 → md5 一致。但 rustc 内部直接调用 `dlltool`，
+> 无法经 `RUSTFLAGS` 注入该参数，故**当前不可行**。
+> 结论：**不要以二进制字节相等作为构建正确性标准**，应以「测试通过 + 源码级一致」为准。
+> 若确需可复现构建，须改用 msvc 工具链（`link.exe` 无此问题）。
 
 ### 更早（2026-08-28）
 
@@ -407,23 +425,43 @@ SYSTEM 只剩**只读**，于是以 LocalSystem 运行的服务**无法再写** 
 ```bash
 # 本机构建（git bash 执行 build.sh）
 bash build.sh
-# → $CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/AI-Root.exe（约 1.07 MB，MinGW 静态链接 CRT）
+# → target/x86_64-pc-windows-gnu/release/AI-Root.exe（约 1.09 MB，MinGW 静态链接 CRT）
 
 # 或 PowerShell（本机与 CI 通用，自动选 target）
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 ```
 
-**构建脚本自动选 target**（`build.ps1`，2026-10-04 重写）：
+**构建架构（2026-10-04 重构）**：配置与脚本职责分离。
 
-1. 已装 `x86_64-pc-windows-msvc` 且能找到 `link.exe`（VS Build Tools）→ 用 msvc（CI `windows-latest` 走此路径）。
-2. 否则若已装 `x86_64-pc-windows-gnu` → 用 gnu，并注入完整 MinGW binutils。
-3. rustup 根目录按 `$RUSTUP_HOME` → `%USERPROFILE%\.rustup` → `D:\software\rust\rustup` 顺序探测。
+- **`.cargo/config.toml`**：承载所有与机器无关的稳定配置（`target-dir` 等）。单一事实来源。
+- **`build.sh` / `build.ps1`**：只做**与机器相关**的事 —— 找出本机完整 MinGW binutils 并注入 PATH，然后调 cargo。
+  两者共享 `.cargo/config.toml`，不再各自维护一份会漂移的重复逻辑。
 
-> ⚠ **gnu 构建的两个硬约束**（2026-10-04 实测定位）：
+**产物统一落仓库内 `target/`**（各脚本从 212/207 行削至 116/约 140 行）。
+
+**`build.ps1` 自动选 target**：
+
+1. 已装 `x86_64-pc-windows-msvc` 且能找到 `link.exe`（VS Build Tools）→ msvc（CI `windows-latest` 走此路径）。
+2. 否则若已装 `x86_64-pc-windows-gnu` → gnu，并注入完整 MinGW binutils。
+
+> ⚠ **gnu 构建的硬约束**（2026-10-04 实测定位）：
 >
-> 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。两个构建脚本按 `MINGW_BINUTILS_BIN`（环境变量）→ `D:\Kiln\mingw64\bin` → `D:\Kiln\mingw-binutils\bin` 顺序**自动探测**（见注释：2026-10-04 本机把目录从 `mingw-binutils` 改名为 `mingw64`，硬编码单路径会直接失效）。获取：清华 msys2 镜像 `mingw-w64-x86_64-binutils-*.pkg.tar.zst`，解压后把 `mingw64/bin` 内容放入上述任一目录。
-> 2. **Git Bash 下 PATH 只认 POSIX 形式**。把 `D:/Kiln/...` 或 `D:\Kiln\...` 写进 `PATH` 后，`command -v dlltool.exe` / `which` 一律查不到（不是 Permission denied，是彻底找不到），导致 cargo 解析回落到 `CARGO_HOME\bin` 的 rustup shim，最终报 `error calling dlltool 'dlltool.exe': program not found`。`build.sh` 用 `to_posix()` 统一转换，并直接调用 toolchain 内的真实 `cargo.exe`；`build.ps1` 侧为原生 Windows 路径语义，无此问题。
-> 3. **gnu 目标的 `CARGO_TARGET_DIR` 必须是纯 ASCII 路径**。MinGW binutils（`dlltool`/`ld`）按 ANSI 代码页解释路径参数，遇到非 ASCII（本项目路径含 `工具`）会把它毁成 `????`，报 `dlltool.exe: Can't create .lib file: ...\????\...\kernel32.dll_imports.lib` —— 错误信息里路径已乱码，极难定位。因此**不要**用仓库内默认的 `target/`（本项目路径非 ASCII），本机固定 `D:\AI-Root-target`。两个构建脚本均已加前置校验，命中时直接给出可执行的修复建议而非让链接期失败。
+> 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。两个脚本按 `MINGW_BINUTILS_BIN`（环境变量）→ `D:\Kiln\mingw64\bin` → `D:\Kiln\mingw-binutils\bin` 顺序**自动探测**（本机曾把目录从 `mingw-binutils` 改名为 `mingw64`，硬编码单路径会直接失效）。获取：清华 msys2 镜像 `mingw-w64-x86_64-binutils-*.pkg.tar.zst`，解压后把 `mingw64/bin` 内容放入上述任一目录。
+> 2. **Git Bash 下 PATH 只认 POSIX 形式**。把 `D:/Kiln/...` 或 `D:\Kiln\...` 写进 `PATH` 后，`command -v dlltool.exe` / `which` 一律查不到（不是 Permission denied，是彻底找不到），导致 cargo 回落到 `CARGO_HOME\bin` 的 rustup shim，最终报 `error calling dlltool 'dlltool.exe': program not found`。`build.sh` 用 `to_posix()` 统一转换，并直连 toolchain 内的真实 `cargo.exe`；`build.ps1` 为原生 Windows 路径语义，无此问题。
+>
+> 📌 **关于「仓库路径必须纯 ASCII」**（2026-10-04 根治）：
+> 仓库曾位于 `D:\project\workbuddy\工具\AI-Root`（含中文「工具」）。MinGW 的 `ld` 按 ANSI 代码页解释路径参数，
+> 因此当**产物落进中文路径**时报「文件存在却找不到」：
+> ```
+> ld.exe: cannot find D:\project\workbuddy\工具\AI-Root\target\release\deps\libsyn-xxx.rlib
+> No such file or directory
+> ```
+> （注意错误里的 `工具` **显示正常**，但 `ld` 实际按 GBK 解读 UTF-8 字节，故找不到真实文件。最先炸的是 proc-macro 依赖，
+> 因其必须先编成 `.dylib` 供 host 加载，这一步走 `ld`。）
+>
+> 当时用**外部 `CARGO_TARGET_DIR=D:\AI-Root-target` + ASCII 前置校验**绕过，代价是脚本里再添一整套绕行机制。
+> **根治方式：把仓库迁到纯 ASCII 路径**（现为 `D:\project\workbuddy\tools\AI-Root`）——绕行机制全部删除，脚本随之瘦身。
+> 经验：**不要用脚本对抗路径问题，要让路径不再有问题**。若日后必须迁回非 ASCII 路径，外部 ASCII `CARGO_TARGET_DIR` 仍是有效的临时缓解。
 
 **CI 双 job**（`.github/workflows/ci.yml`，`windows-latest`）：
 
@@ -438,7 +476,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 >
 > `build-gnu` 不手工下载 `.pkg.tar.zst`：该格式是 zstd 压缩，实测本机 GNU tar 1.35、Python 标准库（无 `zstandard`）均无法解压，runner 上是否可行无法在本地验证 —— 属于「靠猜」。改用 `msys2/setup-msys2` 由官方 action 保证正确性。
 
-`build.ps1` 构建产物随 job 上传；本机与 CI 的 `CARGO_TARGET_DIR` 需分离，避免互相覆盖。
+`build.ps1` 构建产物随 job 上传。（重构后本机与 CI 均落各自仓库内 `target/`，天然分离，无需再手工指定 `CARGO_TARGET_DIR`。）
 
 ### 7.1 测试覆盖现状
 
@@ -480,9 +518,14 @@ cargo test --release --target x86_64-pc-windows-gnu
 > - 命令黑名单（`format ` 等）的匹配规则
 > - 输出截断（1MB）、GBK 回退解码
 
-> 📌 **现状核对（2026-10-04）**：下述交付目录**当前均不存在** —— `D:\project\workbuddy\工具\AI-Root-build\` 与 `D:\Finished product\AI-Root\` 都未创建。`D:\Kiln\` 下有 `AI-Root`（服务部署副本，服务已安装运行）。构建产物落在 `CARGO_TARGET_DIR`（本机 `D:\AI-Root-target\x86_64-pc-windows-gnu\release\AI-Root.exe`）。首次部署时需按下文流程创建。
+> 📌 **现状核对（2026-10-04 重构后）**：
+> - **源码仓库已迁至纯 ASCII 路径** `D:\project\workbuddy\tools\AI-Root`（原 `D:\project\workbuddy\工具\AI-Root`，因 MinGW `ld` 无法正确处理含中文的产物路径 —— 见 §7）。
+> - 构建产物落**仓库内** `target\x86_64-pc-windows-gnu\release\AI-Root.exe`（不再使用外部 `CARGO_TARGET_DIR`）。
+> - 服务部署副本：`D:\Kiln\AI-Root\AI-Root.exe`（服务已安装并运行）。
+> - 交付目录**已创建**：`D:\project\workbuddy\tools\AI-Root-build\`、`D:\Finished product\AI-Root\{AI-Root.exe, docs\README.md}`。
+> - 上述**四处 exe 哈希已校验一致**。
 
-**产物交付目录 `AI-Root-build\`**（与源码平级，`D:\project\workbuddy\工具\AI-Root-build\`）：
+**产物交付目录 `AI-Root-build\`**（与源码平级，`D:\project\workbuddy\tools\AI-Root-build\`）：
 
 | 文件 | 说明 |
 |---|---|

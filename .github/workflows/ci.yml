@@ -7,7 +7,9 @@ on:
   workflow_dispatch:
 
 env:
-  # 构建产物统一放 runner 临时目录, 不污染 checkout
+  # 构建产物统一放 runner 临时目录, 不污染 checkout。
+  # 注: 简化后的 build.ps1 / build.sh 默认落仓库内 target/, 但显式设置本变量时
+  #     两者都会被 cargo 覆盖(优先级: 环境变量 > .cargo/config.toml), 故此处仍有效。
   CARGO_TARGET_DIR: ${{ runner.temp }}\ai-root-target
 
 jobs:

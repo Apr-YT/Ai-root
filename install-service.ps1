@@ -10,10 +10,22 @@
 #   无 BOM 的 UTF-8 文件里的中文会被解码成乱码，甚至因乱码产生 ? 与
 #   不配对的引号而导致语法错误。（本机实测踩过，见记忆）
 
+# 二进制路径与期望哈希：默认取仓库内构建产物（重构后不再用外部 CARGO_TARGET_DIR）。
+# 若从交付包安装，可显式覆盖，例如：
+#   .\install-service.ps1 -Exe "D:\Finished product\AI-Root\AI-Root.exe"
+# 注：param() 必须是脚本中第一条可执行语句，故置于注释之后、其它语句之前。
+param(
+    [string]$Exe = (Join-Path $PSScriptRoot "target\x86_64-pc-windows-gnu\release\AI-Root.exe"),
+    [string]$ExpectedSha256 = ""
+)
+
 $ErrorActionPreference = "Continue"
 
-$Exe = "D:\AI-Root-target\x86_64-pc-windows-gnu\release\AI-Root.exe"
-$ExpectedSha256 = "F0AC9A45C908EE059A8C31CE430F54E1A7A8E0AD421C97FE5ECAA31B76D5431C"
+if (-not (Test-Path $Exe)) {
+    Write-Host "  [X]  未找到二进制: $Exe" -ForegroundColor Red
+    Write-Host "       请先执行 bash build.sh 构建，或用 -Exe 指定交付包中的 exe。" -ForegroundColor Yellow
+    exit 1
+}
 
 function Step($n, $t) { Write-Host ""; Write-Host "=== [$n] $t ===" -ForegroundColor Cyan }
 function Ok($m)   { Write-Host "  [OK] $m" -ForegroundColor Green }
@@ -33,12 +45,19 @@ Step 1 "二进制指纹核对"
 if (-not (Test-Path $Exe)) { Bad "找不到 $Exe"; exit 1 }
 $sha = (Get-FileHash $Exe -Algorithm SHA256).Hash
 Write-Host "  实际: $sha"
-Write-Host "  期望: $ExpectedSha256"
-if ($sha -ne $ExpectedSha256) {
-    Bad "指纹不匹配 —— 二进制与已验证版本不同，请先确认再继续。"
-    exit 1
+if ($ExpectedSha256) {
+    Write-Host "  期望: $ExpectedSha256"
+    if ($sha -ne $ExpectedSha256) {
+        Bad "指纹不匹配 —— 二进制与已验证版本不同，请先确认再继续。"
+        exit 1
+    }
+    Ok "指纹一致"
+} else {
+    # 未指定期望哈希时不阻断（构建产物每次因 dlltool 时间戳而哈希不同，硬编码哈希必然过期）。
+    # 需要严格校验时显式传 -ExpectedSha256。
+    Write-Host "  期望: (未指定，跳过比对)" -ForegroundColor Yellow
+    Ok "已记录指纹（如需强校验请传 -ExpectedSha256）"
 }
-Ok "指纹一致（确认是已修复 ACL 缺陷的版本）"
 
 # ---------- 2) 安装前状态快照 ----------
 Step 2 "安装前状态快照"

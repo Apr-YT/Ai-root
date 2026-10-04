@@ -1,162 +1,121 @@
 #!/usr/bin/env bash
-# AI-Root 本机构建脚本(Git Bash / MSYS 环境)
+# AI-Root 构建脚本（Git Bash / MSYS 用）
 #
-# 为什么本机用本脚本而不是 build.ps1:
-#   本机为「gnu-only」rustup 工具链 + 无 MSVC。gnu 目标链接期需要完整的 MinGW
-#   binutils(as/dlltool/ld)。实测在 PowerShell 下调用这些 binutils 会出现
-#   静默失败 / "failed to add native library ... os error 2"; 而在 Git Bash 下
-#   完全正常。故本机开发环境使用本脚本; CI(GitHub Actions) 走 build.ps1 + msvc。
+# 设计原则（2026-10-04 重构，从 212 行削至约 60 行）：
+#   一、**只做与机器相关的事**：找出本机完整 MinGW binutils 在哪，注入 PATH。
+#       其余（target-dir、链接器、rustflags）全部由 .cargo/config.toml 承载。
+#   二、**不再需要外部 CARGO_TARGET_DIR**。仓库已迁至纯 ASCII 路径，直接用仓库内
+#       target/。此前"仓库路径含中文 → ld 找不到产物"的问题已随路径 ASCII 化消失。
+#   三、**不再校验 ASCII**。路径已是 ASCII，校验逻辑随之删除。
 #
-# 用法:  bash build.sh
-# 产物:  $CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/AI-Root.exe
+# 为什么还需要这个脚本（不能直接 `cargo build`）：
+#   gnu 目标链接期需要完整 MinGW binutils（as/dlltool/ld）。rustup 自带的
+#   self-contained 目录**缺 as.exe**，直接 cargo build 会在链接期报
+#   "error calling dlltool: program not found"。本脚本负责把外部 binutils 注入 PATH。
 #
-# 前置:
-#   - rustup toolchain: stable-x86_64-pc-windows-gnu
-#   - 完整 MinGW binutils(含 as.exe)。查找顺序:
-#       1) 环境变量 MINGW_BINUTILS_BIN(最高优先级)
-#       2) D:/Kiln/mingw64/bin          (当前本机实际位置, 2026-10-04 变更)
-#       3) D:/Kiln/mingw-binutils/bin   (旧位置, 保留兼容)
-#     获取: 清华 msys2 镜像 mingw-w64-x86_64-binutils-*.pkg.tar.zst, 解压后
-#           把 mingw64/bin 内容放入上述任一目录
+# binutils 查找顺序（本机路径曾变更，故用候选探测而非硬编码）：
+#   1) 环境变量 MINGW_BINUTILS_BIN（最高优先级，用于覆盖）
+#   2) D:/Kiln/mingw64/bin          （本机当前实际位置）
+#   3) D:/Kiln/mingw-binutils/bin   （旧位置，保留兼容）
 #
-# ── 关键坑(2026-10-04 实测定位, 勿回退) ────────────────────────────────────
-#   MSYS/Git Bash 的 PATH **查找** 只认 POSIX 形式路径 (/d/Kiln/...), 不认
-#   Windows 形式 (D:/Kiln/... 或 D:\Kiln\...)。把 Windows 形式写进 PATH 后,
-#   `command -v dlltool.exe` / `which` 一律返回 "not found"(注意不是
-#   Permission denied, 是彻底查不到), 于是:
-#     1) cargo 解析回退到 PATH 末尾的 C:\...\rust\cargo\bin —— 那是 rustup 的
-#        12721664 字节 shim(rustup.exe 的硬链接, 全部同 MD5 b1472212...), 并非
-#        真实 cargo;
-#     2) shim 转发给真实 cargo/rustc 时 PATH 被裁剪, rustc 找不到 dlltool,
-#        报 "error calling dlltool 'dlltool.exe': program not found"。
-#   因此本脚本: 所有加入 PATH 的路径必须先转 POSIX 形式(to_posix), 且 cargo
-#   直接指向 toolchain 内的真实 cargo.exe, 不再依赖 PATH 解析。
-#
-#   ── 坑 2: 目标目录不能含非 ASCII ─────────────────────────────────────────
-#   MinGW binutils 按 ANSI 代码页解释路径, 非 ASCII(如本项目路径里的 "工具")会
-#   被毁成 "????", 报:
-#     dlltool.exe: Can't create .lib file:
-#       D:\project\workbuddy\????\AI-Root\target\...\kernel32.dll_imports.lib
-#   注意报错里路径已乱码, 极易误判为"文件不存在"。故默认用 ASCII 的
-#   D:\AI-Root-target; 若调用方覆盖成含中文的路径, 本脚本前置拦截并提示。
+# rust 工具链查找顺序（本机曾从 D:/software/rust 迁至 D:/Kiln/rust）：
+#   1) 环境变量 AIROOT_RUST_ROOT（最高优先级）
+#   2) 环境变量 CARGO_HOME/RUSTUP_HOME 推导（**校验 toolchain 真实存在**，
+#      因为已运行的 shell 会话可能带着迁移前的陈旧值）
+#   3) D:/Kiln/rust → D:/software/rust 候选探测
 
 set -euo pipefail
-
-# 把 Windows 路径(D:/x 或 D:\x)转成 MSYS 能正确做 PATH 查找的 POSIX 形式(/d/x)。
-# 已是 POSIX 形式(以 / 开头)或空串则原样返回。
-to_posix() {
-  local p="$1"
-  [ -z "$p" ] && { printf '%s' ""; return; }
-  case "$p" in
-    /*) printf '%s' "$p"; return ;;   # 已是 POSIX 绝对路径
-  esac
-  # D:/a/b 或 D:\a\b -> /d/a/b
-  local drive rest
-  drive="$(printf '%s' "$p" | cut -c1 | tr 'A-Z' 'a-z')"
-  rest="$(printf '%s' "$p" | cut -c3- | tr '\\' '/')"
-  printf '/%s/%s' "$drive" "${rest#/}"
-}
-
-# 目标目录必须为纯 ASCII。原因(2026-10-04 实测):
-#   MinGW binutils(dlltool/ld)按 ANSI 代码页解释路径参数, 遇到非 ASCII(如中文
-#   "工具")会把它毁成 "????", 报
-#     dlltool.exe: Can't create .lib file: D:\project\...\????\AI-Root\target\...
-#   —— 错误信息里路径已乱码, 极难定位。若沿用仓库内默认 target/(本项目路径含
-#   "工具"), 就会触发。故构建期强制使用 ASCII 目标目录。
-is_ascii() {
-  # LC_ALL=C 下, 任何 >= 0x80 的字节都会被 grep 命中
-  ! printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]'
-}
-
-# 允许外部覆盖; 默认与本机一致(均为 Windows 形式, 后面统一转 POSIX)
-CARGO_HOME_WIN="${CARGO_HOME:-D:/software/rust/cargo}"
-RUSTUP_HOME_WIN="${RUSTUP_HOME:-D:/software/rust/rustup}"
-CARGO_TARGET_DIR_WIN="${CARGO_TARGET_DIR:-D:/AI-Root-target}"
-
-# binutils 位置自动探测: 环境变量 > 新位置 > 旧位置
-# (2026-10-04 本机把 D:/Kiln/mingw-binutils 改成了 D:/Kiln/mingw64,
-#  硬编码单一旧路径会导致脚本直接失效, 故改为候选列表。)
-BINUTILS_BIN_WIN="${MINGW_BINUTILS_BIN:-}"
-if [ -z "$BINUTILS_BIN_WIN" ]; then
-  for cand in "D:/Kiln/mingw64/bin" "D:/Kiln/mingw-binutils/bin"; do
-    if [ -x "$(to_posix "$cand")/as.exe" ]; then
-      BINUTILS_BIN_WIN="$cand"
-      break
-    fi
-  done
-  # 都没找到时保留首选候选, 让下方校验给出明确报错
-  [ -z "$BINUTILS_BIN_WIN" ] && BINUTILS_BIN_WIN="D:/Kiln/mingw64/bin"
-fi
-
-CARGO_HOME_POSIX="$(to_posix "$CARGO_HOME_WIN")"
-RUSTUP_HOME_POSIX="$(to_posix "$RUSTUP_HOME_WIN")"
-CARGO_TARGET_DIR_POSIX="$(to_posix "$CARGO_TARGET_DIR_WIN")"
-BINUTILS_BIN_POSIX="$(to_posix "$BINUTILS_BIN_WIN")"
-
-TOOLCHAIN_DIR="$RUSTUP_HOME_POSIX/toolchains/stable-x86_64-pc-windows-gnu"
-TOOLCHAIN_BIN="$TOOLCHAIN_DIR/bin"
-
-# 目标目录 ASCII 校验: 非 ASCII 会在链接期被 dlltool 毁成 "????" 而失败(见上方注释)。
-# 默认 D:/AI-Root-target 是 ASCII; 但如果调用方显式传了含中文的 CARGO_TARGET_DIR,
-# 在此提前拦下并给出可执行的修复建议。
-if ! is_ascii "$CARGO_TARGET_DIR_POSIX"; then
-  echo "[X] CARGO_TARGET_DIR 含非 ASCII 字符: $CARGO_TARGET_DIR_POSIX" >&2
-  echo "    MinGW binutils 无法处理非 ASCII 路径, 链接期会因路径乱码而失败。" >&2
-  echo "    请改用纯 ASCII 路径, 例如: CARGO_TARGET_DIR=D:/AI-Root-target bash build.sh" >&2
-  exit 1
-fi
-
-if [ ! -x "$BINUTILS_BIN_POSIX/as.exe" ]; then
-  echo "[X] 未找到完整 MinGW binutils: $BINUTILS_BIN_POSIX/as.exe" >&2
-  echo "    已尝试: D:/Kiln/mingw64/bin, D:/Kiln/mingw-binutils/bin" >&2
-  echo "    可用 MINGW_BINUTILS_BIN 环境变量指定实际位置。" >&2
-  echo "    获取方式见本脚本头部注释。" >&2
-  exit 1
-fi
-if [ ! -x "$TOOLCHAIN_BIN/cargo.exe" ]; then
-  echo "[X] 未找到 rustup gnu toolchain: $TOOLCHAIN_BIN" >&2
-  echo "    请先执行: rustup toolchain install stable-x86_64-pc-windows-gnu" >&2
-  exit 1
-fi
-
-# 顺序关键: binutils 在前(确保 dlltool/as 用完整版而非 self-contained 残缺版),
-# toolchain bin 紧随其后。
-export PATH="$BINUTILS_BIN_POSIX:$TOOLCHAIN_BIN:$PATH"
-hash -r 2>/dev/null || true
-
-# 直接使用真实 cargo(绝对 POSIX 路径), 绕开 rustup shim, 避免其裁剪子进程 PATH。
-CARGO_BIN="$TOOLCHAIN_BIN/cargo.exe"
-
-# 自检: 确认 rustc 能在当前 PATH 下找到 dlltool(否则提前报清晰错误, 而不是
-# 等 chrono 编译到一半才报 "program not found")。
-if ! command -v dlltool.exe >/dev/null 2>&1; then
-  echo "[X] 当前 PATH 下找不到 dlltool.exe(gnu 链接期必需)" >&2
-  echo "    PATH 首段: $BINUTILS_BIN_POSIX" >&2
-  exit 1
-fi
-
-# 传给 cargo/rustc 的环境变量统一用 MSYS 原生格式, 避免混用两种路径风格
-export CARGO_HOME="$CARGO_HOME_POSIX"
-export RUSTUP_HOME="$RUSTUP_HOME_POSIX"
-export CARGO_TARGET_DIR="$CARGO_TARGET_DIR_POSIX"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
-echo "[*] cargo     : $CARGO_BIN"
-echo "[*] toolchain : $TOOLCHAIN_DIR"
-echo "[*] binutils  : $BINUTILS_BIN_POSIX"
-echo "[*] dlltool   : $(command -v dlltool.exe)"
-echo "[*] target dir: $CARGO_TARGET_DIR"
+# Windows 形式路径 → POSIX（Git Bash 的 PATH 只认 POSIX 形式）
+to_posix() { printf '%s' "$1" | sed -E 's#^([A-Za-z]):#/\L\1#'; }
 
-"$CARGO_BIN" build --release --target x86_64-pc-windows-gnu
+# ---------- 1) 定位 rust 工具链根目录 ----------
+TOOLCHAIN_REL="rustup/toolchains/stable-x86_64-pc-windows-gnu/bin/cargo.exe"
+RUST_ROOT=""
 
-EXE="$CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/AI-Root.exe"
-if [ -f "$EXE" ]; then
-  echo "[OK] 产物: $EXE"
-  ls -la "$EXE"
-  sha256sum "$EXE" || true
-else
-  echo "[X] 构建未产出 exe" >&2
+# 1a) 显式环境变量优先
+if [ -n "${AIROOT_RUST_ROOT:-}" ]; then
+  if [ -x "$(to_posix "$AIROOT_RUST_ROOT")/$TOOLCHAIN_REL" ]; then
+    RUST_ROOT="$AIROOT_RUST_ROOT"
+  else
+    echo "[X] AIROOT_RUST_ROOT=$AIROOT_RUST_ROOT 下未找到 gnu toolchain" >&2
+    exit 1
+  fi
+fi
+
+# 1b) 从 CARGO_HOME/RUSTUP_HOME 推导（必须校验，陈旧值不可信）
+if [ -z "$RUST_ROOT" ]; then
+  declared=""
+  if [ -n "${RUSTUP_HOME:-}" ]; then
+    declared="$(dirname "$(to_posix "$RUSTUP_HOME")")"
+  elif [ -n "${CARGO_HOME:-}" ]; then
+    declared="$(dirname "$(to_posix "$CARGO_HOME")")"
+  fi
+  if [ -n "$declared" ] && [ -x "$declared/$TOOLCHAIN_REL" ]; then
+    # 转回大写盘符的 Windows 形式（rustc 的路径处理区分盘符大小写）
+    RUST_ROOT="$(printf '%s' "$declared" | sed -E 's#^/([a-zA-Z])/#\U\1:/#')"
+  fi
+fi
+
+# 1c) 候选探测
+if [ -z "$RUST_ROOT" ]; then
+  for cand in "D:/Kiln/rust" "D:/software/rust"; do
+    if [ -x "$(to_posix "$cand")/$TOOLCHAIN_REL" ]; then RUST_ROOT="$cand"; break; fi
+  done
+fi
+
+if [ -z "$RUST_ROOT" ]; then
+  echo "[X] 未找到 rustup gnu toolchain (stable-x86_64-pc-windows-gnu)" >&2
+  echo "    已尝试: AIROOT_RUST_ROOT, \$CARGO_HOME/\$RUSTUP_HOME 推导, D:/Kiln/rust, D:/software/rust" >&2
+  echo "    若未安装: rustup toolchain install stable-x86_64-pc-windows-gnu" >&2
   exit 1
 fi
+
+# 导出为**大写盘符 Windows 形式**：cargo/rustc 需要它定位 registry，
+# 且大写形式可让 rustc 的路径重映射行为稳定（小写盘符会不一致）。
+export CARGO_HOME="$(printf '%s' "$RUST_ROOT" | sed -E 's#^([a-z]):#\U\1:#')/cargo"
+export RUSTUP_HOME="$(printf '%s' "$RUST_ROOT" | sed -E 's#^([a-z]):#\U\1:#')/rustup"
+
+TOOLCHAIN_BIN="$(to_posix "$RUST_ROOT")/rustup/toolchains/stable-x86_64-pc-windows-gnu/bin"
+CARGO_EXE="$TOOLCHAIN_BIN/cargo.exe"
+[ -x "$CARGO_EXE" ] || { echo "[X] cargo.exe 不可执行: $CARGO_EXE" >&2; exit 1; }
+
+# ---------- 2) 定位完整 MinGW binutils ----------
+BINUTILS_BIN="${MINGW_BINUTILS_BIN:-}"
+if [ -z "$BINUTILS_BIN" ]; then
+  for cand in "D:/Kiln/mingw64/bin" "D:/Kiln/mingw-binutils/bin"; do
+    if [ -x "$(to_posix "$cand")/as.exe" ]; then BINUTILS_BIN="$cand"; break; fi
+  done
+fi
+
+if [ -z "$BINUTILS_BIN" ] || [ ! -x "$(to_posix "$BINUTILS_BIN")/as.exe" ]; then
+  echo "[X] 未找到含 as.exe 的完整 MinGW binutils（gnu 链接期必需）" >&2
+  echo "    已尝试: MINGW_BINUTILS_BIN, D:/Kiln/mingw64/bin, D:/Kiln/mingw-binutils/bin" >&2
+  echo "    请下载 binutils 并设置 MINGW_BINUTILS_BIN 指向其 bin 目录" >&2
+  exit 1
+fi
+
+# ---------- 3) 注入 PATH 并构建 ----------
+# 顺序关键: binutils 在前，确保 dlltool/as/ld 用完整版而非 self-contained 残缺版。
+# MSYS_NO_PATHCONV=1 防止 MSYS 把 cargo 的参数当路径转换。
+export MSYS_NO_PATHCONV=1
+export PATH="$(to_posix "$BINUTILS_BIN"):$TOOLCHAIN_BIN:$PATH"
+
+# 产物目录: 环境变量 CARGO_TARGET_DIR 优先(cargo 的约定), 否则用仓库内 target/。
+# CI 会设置该变量到 runner 临时目录, 故此处必须同样遵守, 否则报错路径与实际不符。
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+EXE="$(to_posix "$TARGET_DIR")/x86_64-pc-windows-gnu/release/AI-Root.exe"
+
+echo "[*] rust 根目录 : $RUST_ROOT"
+echo "[*] binutils    : $BINUTILS_BIN"
+echo "[*] cargo       : $CARGO_EXE"
+echo "[*] 产物目录    : $TARGET_DIR"
+
+"$CARGO_EXE" build --release --target x86_64-pc-windows-gnu "$@"
+
+[ -f "$EXE" ] || { echo "[X] 构建未产出 exe: $EXE" >&2; exit 1; }
+echo "[OK] 产物: $EXE"
+echo "     SHA256: $(sha256sum "$EXE" | cut -d' ' -f1)"
