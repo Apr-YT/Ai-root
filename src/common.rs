@@ -357,8 +357,20 @@ pub fn pipe_sddl() -> String {
 /// 设置目录 ACL：仅 SYSTEM 完全控制 + 指定用户只读
 /// 失败则退化为「SYSTEM + Interactive 只读」，保证至少可用
 ///
-/// 注意：保留目录继承（`/inheritance:e`），新创建的文件自动继承目录 DACL（SYSTEM F + user R），
-/// 否则 SYSTEM 进程创建的事件文件（如 events.jsonl）会带 SYSTEM 默认 DACL，GUI 用户进程无法读取。
+/// ⚠ 安全关键：必须先用 `/inheritance:r` **断开并清除继承的 ACE**，再显式授权。
+///
+/// 2026-10-04 实测发现的缺陷：原实现只用 `/inheritance:e` + `/grant:r`，
+/// 而 `icacls /grant:r` **只替换指定 SID 的那一条 ACE，不会清除其它 SID 的 ACE**。
+/// 于是 `C:\ProgramData` 继承来的 `BUILTIN\Users:(I)(CI)(WD,AD,WEA,WA)` 会**原样保留** ——
+/// 即任意本地用户仍对该目录**有写权限**，可覆写 `token.txt` 并自授权连上 SYSTEM 中继。
+/// 这与本函数「仅 SYSTEM 完全控制 + 用户只读」的声明语义完全背离。
+/// 实测对照（父目录含可继承的 Users 写 ACE）：
+///   `/inheritance:e` → `BUILTIN\Users:(I)(OI)(CI)(WD,AD)` 残留 ❌
+///   `/inheritance:r` → 仅 `SYSTEM:(OI)(CI)(F)` + 用户只读 ✅
+///
+/// 为何 `/inheritance:r` 不会破坏「SYSTEM 建的文件用户可读」：本函数随后显式授予的
+/// ACE 均带 `(OI)(CI)` 传播标志，由**本目录自身**的显式 ACE 向下继承，
+/// 不依赖上级目录 → 子文件仍得到 `SYSTEM:F + Admins:F + 用户:R`。
 ///
 /// 幂等性：必须使用 `/grant:r`（replace 语义）而非 `/grant`（append 语义）。
 /// `icacls /grant` 不会对同一 SID 去重，每次调用都会向 DACL 追加一条 `(OI)(CI)` ACE，
@@ -366,26 +378,63 @@ pub fn pipe_sddl() -> String {
 /// `:r` 会先移除该 SID 的全部既有 ACE 再写入唯一一条，既保证幂等，也顺带清理历史累积的重复 ACE。
 pub fn set_dir_acl(dir: &std::path::Path) {
     let dir_str = dir.to_string_lossy().to_string();
+    // 先断开继承（清除全部继承 ACE），再加显式 ACE。
+    // 顺序不可颠倒：若先 grant 再 inheritance:r，grant 的结果会被一并清掉。
+    let _ = Command::new("icacls")
+        .arg(&dir_str)
+        .arg("/inheritance:r")
+        .output();
     if let Some(sid) = get_user_sid() {
-        let _ = Command::new("icacls")
-            .arg(&dir_str)
-            .arg("/inheritance:e")
-            .arg("/grant:r")
-            .arg(format!("*S-1-5-18:(OI)(CI)F")) // LocalSystem 完全控制
-            .arg("/grant:r")
-            .arg(format!("{sid}:(OI)(CI)R")) // 当前用户只读
-            .output();
+        // ⚠ `{sid}` 必须带 `*` 前缀！`*` 告知 icacls「这是 SID 字面量，不要去解析账户名」。
+        // 缺 `*` 时 icacls 会把 `S-1-5-21-...` 当**账户名**去查，查不到即报
+        //   "账户名与安全标识间无任何映射完成"
+        // 并**整条命令以非零退出、一条 ACE 都不写**（grant 参数是「全有或全无」）。
+        // 叠加同函数的 `/inheritance:r` 后后果极严重：继承 ACE 已清除、显式 ACE 又写入失败
+        // → 目录 DACL 变空 → SYSTEM 自己都进不去，服务彻底锁死。
+        // 该缺陷原本被 `/inheritance:e` 掩盖（继承来的 SYSTEM:F 兜住了访问），
+        // 属"两个 bug 互相遮蔽"，2026-10-04 修复继承缺陷时才暴露。
+        //
+        // 因此这里**逐条独立授予**（而非塞进一条 icacls 命令）：icacls 的 grant 参数是
+        // 「全有或全无」，一条坏参数会让同命令内其它正当 ACE 一起丢失。
+        // 逐条执行后，即使某条失败，SYSTEM 的 ACE 也已独立落盘，不会出现空 DACL。
+        grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F"); // LocalSystem 完全控制
+        grant_one(&dir_str, "*S-1-5-32-544:(OI)(CI)F"); // Administrators 完全控制（运维/排障必需）
+        grant_one(&dir_str, &format!("*{sid}:(OI)(CI)R")); // 当前用户只读（注意 * 前缀）
     } else {
         // 退化方案：Interactive 用户只读（仅本机交互登录者可读取令牌）
-        let _ = Command::new("icacls")
-            .arg(&dir_str)
-            .arg("/inheritance:e")
-            .arg("/grant:r")
-            .arg("*S-1-5-18:(OI)(CI)F")
-            .arg("/grant:r")
-            .arg("*S-1-5-4:(OI)(CI)R") // Interactive 只读
-            .output();
+        grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F");
+        grant_one(&dir_str, "*S-1-5-32-544:(OI)(CI)F");
+        grant_one(&dir_str, "*S-1-5-4:(OI)(CI)R"); // Interactive 只读
     }
+    // 兜底自检：确认 SYSTEM 的完全控制 ACE 确实写入成功。
+    // 本函数先 `/inheritance:r` 清空继承 ACE 再重新授权，若期间授权失败，目录 DACL 会变空
+    // → SYSTEM 自己都进不去，服务彻底锁死且难以恢复。此处检测到即立刻补一条，
+    // 把「空 DACL 锁死」这一失败模式从结构上消除。
+    if !acl_has_system_full(&dir_str) {
+        grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F");
+    }
+}
+
+/// 检查目录 ACL 中是否存在 SYSTEM 的完全控制 ACE（用于硬化后的兜底自检）。
+fn acl_has_system_full(dir_str: &str) -> bool {
+    let Ok(out) = Command::new("icacls").arg(dir_str).output() else {
+        return false;
+    };
+    // 注意 icacls 输出为 OEM/ANSI 编码，但 ACE 权限位字符（如 "(F)"）与 SID 名均为 ASCII，
+    // 足以判断；Windows 下 SYSTEM 显示名恒为 "NT AUTHORITY\\SYSTEM"。
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.lines()
+        .any(|l| l.contains("SYSTEM") && l.contains("(F)"))
+}
+
+/// 单条 `icacls /grant:r` 授权。`:r` = replace 语义（幂等，不累积重复 ACE）。
+/// 独立成函数是为了让每条 ACE 各自落盘，避免一条参数非法导致整批丢失。
+fn grant_one(dir_str: &str, ace: &str) {
+    let _ = Command::new("icacls")
+        .arg(dir_str)
+        .arg("/grant:r")
+        .arg(ace)
+        .output();
 }
 
 /// 确保令牌存在：不存在则生成并写盘、设置 ACL
@@ -516,4 +565,144 @@ pub fn log_exec(caller: &str, pid: u32, command: &str, exit_code: i32) {
         }
     }
     append_with_rotate(log_path(), line.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 运行 icacls 并返回 stdout（用于断言 ACL 内容）。
+    fn icacls_show(dir: &std::path::Path) -> String {
+        let out = Command::new("icacls")
+            .arg(dir.to_string_lossy().to_string())
+            .output()
+            .expect("icacls 执行失败");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// 取当前用户的 `DOMAIN\user` 形式名（与 icacls 输出中的显示形式一致）。
+    /// 用 `whoami`（无参数）取，是本机唯一无需额外依赖的方式。
+    fn current_user_name() -> Option<String> {
+        let out = Command::new("whoami").output().ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        let n = s.trim().to_string();
+        if n.is_empty() {
+            None
+        } else {
+            Some(n)
+        }
+    }
+
+    /// 安全回归：`set_dir_acl` 必须清除**继承来的** `BUILTIN\Users` 写权限。
+    ///
+    /// 背景（2026-10-04 实测发现的真实缺陷）：原实现用 `/inheritance:e` + `/grant:r`，
+    /// 而 `icacls /grant:r` 只替换指定 SID 那一条 ACE，**不清除其它 SID 的 ACE**。
+    /// `C:\ProgramData` 继承来的 `BUILTIN\Users:(I)(CI)(WD,AD,WEA,WA)` 会原样保留，
+    /// 使任意本地用户仍可写该目录 → 覆写 `token.txt` 自授权连 SYSTEM 中继。
+    ///
+    /// 本测试真实构造「父目录授予可继承的 Users 写权限」这一危险前提，
+    /// 再调用**真实的** `set_dir_acl`，断言 Users 的写权限已被剥离。
+    /// 若把实现改回 `/inheritance:e`，本测试必须 FAILED（变异验证见提交说明）。
+    #[test]
+    fn set_dir_acl_strips_inherited_users_write() {
+        // 唯一测试目录（pid + 测试名，避免并行冲突）
+        let base = std::env::temp_dir().join(format!("airoot-acl-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let child = base.join("data");
+        std::fs::create_dir_all(&child).expect("创建测试目录失败");
+
+        // 1) 父目录授予 Users 可继承的写权限（复制 ProgramData 的危险前提）
+        let grant = Command::new("icacls")
+            .arg(base.to_string_lossy().to_string())
+            .arg("/grant")
+            .arg("Users:(OI)(CI)(WD,AD)")
+            .output()
+            .expect("icacls 授权父目录失败");
+        assert!(
+            grant.status.success(),
+            "测试前提构造失败：无法给父目录授予 Users 写权限"
+        );
+
+        // 2) 确认前提成立：子目录确实继承了 Users 写权限（含 (I) 标记）
+        let before = icacls_show(&child);
+        let inherited_write = before
+            .lines()
+            .any(|l| l.contains("Users") && l.contains("(I)") && (l.contains("WD") || l.contains("AD")));
+        assert!(
+            inherited_write,
+            "测试前提不成立：子目录未继承到 Users 写权限，本测试失去意义。\n实际 ACL:\n{before}"
+        );
+
+        // 3) 调用真实被测函数
+        set_dir_acl(&child);
+
+        // 4) 断言：Users 不再持有任何写权限位（WD/AD/WEA/WA/写类权限）
+        let after = icacls_show(&child);
+        let users_has_write = after.lines().any(|l| {
+            l.contains("Users")
+                && (l.contains("WD") || l.contains("AD") || l.contains("WEA") || l.contains("WA"))
+        });
+        assert!(
+            !users_has_write,
+            "安全缺陷回归：set_dir_acl 之后 Users 仍持有写权限，\
+             本地任意用户可覆写 token.txt 自授权。\n实际 ACL:\n{after}"
+        );
+
+        // 5) 断言：SYSTEM 仍为完全控制（不能把服务自己锁在外面）
+        let sys_full = after
+            .lines()
+            .any(|l| l.contains("SYSTEM") && l.contains("(F)"));
+        assert!(
+            sys_full,
+            "修复过度：SYSTEM 失去完全控制，服务将无法写日志/令牌。\n实际 ACL:\n{after}"
+        );
+
+        // 6) 断言：**当前用户仍保有只读 ACE**。
+        // 这条防的是「bare SID 缺 `*` 前缀」缺陷：icacls 把裸 SID 当账户名解析失败
+        // （报"账户名与安全标识间无任何映射完成"），该条 grant 静默失败。
+        // 变异验证实测：去掉 `*` 前缀后前 5 条断言全部通过 → 属真实漏检，故补此断言。
+        // 后果：智能体（用户身份）读不到 token.txt，SYSTEM 中继整体不可用。
+        //
+        // icacls 显示的是**账户名**（如 `KING\64391`）而非 SID，故需先解析出账户名。
+        // ⚠ 大小写不敏感比较：`whoami` 返回小写 `king\64391`，而 `icacls` 打印大写
+        // `KING\64391` —— Windows 账户名本身大小写不敏感，比较时必须归一化，
+        // 否则会在代码完全正确时误报失败（实测踩过）。
+        let user_name = current_user_name()
+            .expect("测试环境应能取到当前用户名")
+            .to_lowercase();
+        let user_readable = after.lines().any(|l| {
+            let low = l.to_lowercase();
+            low.contains(&user_name) && l.contains("(R)")
+        });
+        assert!(
+            user_readable,
+            "当前用户 ({user_name}) 失去只读 ACE。\
+             典型原因：icacls 的 SID 参数缺少 `*` 前缀，被当账户名解析失败而静默丢弃。\n实际 ACL:\n{after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `set_dir_acl` 必须幂等：重复调用不产生重复 ACE（防止服务反复启动时 ACE 膨胀）。
+    #[test]
+    fn set_dir_acl_is_idempotent() {
+        let base = std::env::temp_dir().join(format!("airoot-acl-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("创建测试目录失败");
+
+        set_dir_acl(&base);
+        set_dir_acl(&base);
+        set_dir_acl(&base);
+
+        let acl = icacls_show(&base);
+        // 统计 SYSTEM 的 ACE 条数：幂等实现下应恰好 1 条（不受继承干扰，已 /inheritance:r）
+        let sys_count = acl.lines().filter(|l| l.contains("SYSTEM")).count();
+        assert_eq!(
+            sys_count, 1,
+            "set_dir_acl 不幂等：SYSTEM ACE 出现 {sys_count} 次（期望 1）。\
+             /grant:r 的 replace 语义被破坏会导致 ACE 无限膨胀。\n实际 ACL:\n{acl}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
