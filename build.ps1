@@ -44,15 +44,18 @@ function Resolve-RustupRoot {
     if ($env:RUSTUP_HOME)      { $candidates += $env:RUSTUP_HOME }
 
     # 2) 让 rustup 自省(可移植关键: 不依赖硬编码路径)
+    #    注意: 变量名不能用 `$home` —— PowerShell 中 $HOME 是只读内置变量,
+    #    赋值会报 "Cannot overwrite variable HOME because it is read-only or constant."
+    #    (PowerShell 7 起严格; CI 的 windows-latest 即 PS7)
     $rustupCmd = Get-Command rustup -ErrorAction SilentlyContinue
     if ($rustupCmd) {
-        $home = & $rustupCmd.Source show home 2>$null | Select-Object -First 1
-        if ($home) { $candidates += $home }
+        $rustupHomeProbe = & $rustupCmd.Source show home 2>$null | Select-Object -First 1
+        if ($rustupHomeProbe) { $candidates += $rustupHomeProbe }
     }
 
     # 3) 常见默认位置(rustup 官方安装器的默认家目录)
-    $candidates += (Join-Path $env:USERPROFILE ".rustup")
-    if ($env:HOME) { $candidates += (Join-Path $env:HOME ".rustup") }
+    #    优先用 FOLDERID 解析出的用户家目录; $env:USERPROFILE 在 Windows 上始终可用
+    if ($env:USERPROFILE) { $candidates += (Join-Path $env:USERPROFILE ".rustup") }
 
     foreach ($c in $candidates) {
         if ($c -and (Test-Path (Join-Path $c "toolchains"))) { return $c }
