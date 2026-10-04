@@ -1,7 +1,55 @@
 # AI-Root
 
-> **面向 AI 智能体自调用的 LocalSystem 提权命令中继。**
-> 非提权（普通用户）的智能体进程，仅凭一个共享令牌即可通过命名管道以 `SYSTEM` 权限自治执行命令，全程无需 UAC 弹窗。本工具的主要消费方是 AI 智能体本身，文档聚焦于「如何可靠对接」而非「人怎么敲命令」。
+[![CI](https://github.com/Apr-YT/ai-root/actions/workflows/ci.yml/badge.svg)](https://github.com/Apr-YT/ai-root/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable%20%7C%20edition%202021-orange.svg)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6.svg)](#平台支持)
+[![Tests](https://img.shields.io/badge/tests-57%20passed-brightgreen.svg)](#测试)
+
+> **面向 AI 智能体的 LocalSystem 提权命令中继。**
+> 非提权（普通用户）的智能体进程，仅凭一个共享令牌即可通过命名管道以 `SYSTEM` 权限自治执行命令，全程无需 UAC 弹窗。
+
+主要消费方是 **AI 智能体本身**，因此文档聚焦「如何可靠对接」而非「人怎么敲命令」。
+
+```text
+  AI 智能体 (非提权)                      AI-Root 服务 (LocalSystem)
+  ┌──────────────┐   \\.\pipe\AI-Root   ┌────────────────────────┐
+  │  subprocess  │ ──── 令牌 + 命令 ───> │  鉴权 → 执行 cmd /C    │
+  │  读取令牌文件 │ <─── 退出码 + 输出 ── │  (SYSTEM 最高权限)     │
+  └──────────────┘                      └────────────────────────┘
+```
+
+---
+
+## 目录
+
+- [为什么需要](#为什么需要)
+- [快速开始](#快速开始)
+- [平台支持](#平台支持)
+- [部署](#部署仅需一次管理员)
+- [AI 调用契约](#ai-调用契约)
+  - [鉴权](#鉴权) · [调用形态](#调用形态) · [命令语义](#命令语义关键) · [帧协议](#帧协议直接对接管道时) · [编码](#输出编码) · [退出码](#退出码) · [事件流](#实时事件流eventsjsonl)
+- [安全模型](#安全模型)
+- [限制](#限制)
+- [构建](#构建)
+- [测试](#测试)
+- [环境变量](#环境变量)
+- [项目结构](#项目结构)
+- [文档](#文档)
+
+---
+
+## 为什么需要
+
+AI 智能体常需执行需要管理员权限的操作（装驱动、改注册表、写系统目录），而 UAC 弹窗会打断无人值守流程。AI-Root 把「提权」这件事**一次性**解决：
+
+- **一次管理员安装** → 注册 LocalSystem 自启服务。
+- **之后零提权**：智能体以普通用户身份连命名管道，由 SYSTEM 服务代为执行。
+- **凭据隔离**：令牌文件受 ACL 保护（仅 SYSTEM/Administrators 可写、安装用户可读），客户端与服务端共读同一文件。
+- **可审计**：每条命令落 `exec.log`（终身保留）+ `events.jsonl`（实时事件流）。
+- **可熔断**：`enabled.flag` 删除即整体禁用中继。
+
+---
 
 ## 快速开始
 
@@ -9,134 +57,47 @@
 
 | 情况 | 怎么做 |
 |---|---|
-| **只想用**（要一个能跑的 `AI-Root.exe`） | 下载 Release 中的 `AI-Root.exe`，**无需构建**。部署见 [§2](#2-部署仅需一次管理员)。 |
-| **要改代码 / 自己构建** | 见下方「从源码构建」。 |
+| **只想用** | 下载 Release 中的 `AI-Root.exe`，**无需构建**。跳到 [部署](#部署仅需一次管理员)。 |
+| **要改代码 / 自己构建** | 见 [构建](#构建)。 |
 
-### 从源码构建
-
-前置：**Rust（rustup）**。若未安装：
+最小可用流程（管理员 PowerShell，一次）：
 
 ```powershell
-winget install Rustlang.Rustup
-# 或访问 https://rustup.rs
+powershell -ExecutionPolicy Bypass -File install-service.ps1
 ```
 
-**推荐路线：msvc**（Windows 上 Rust 开发的标准做法，无需额外配置 binutils）
+之后（任意用户，无需提权）：
 
 ```powershell
-rustup toolchain install stable-x86_64-pc-windows-msvc
-# 并安装 VS Build Tools（提供 link.exe）：
-#   https://visualstudio.microsoft.com/visual-cpp-build-tools/
-powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
+AI-Root run --json "whoami"     # → nt authority\system
 ```
 
-**备选路线：gnu**（不依赖 VS，但**需要额外装 MinGW binutils**）
+---
 
-```bash
-# Git Bash 下执行
-# gnu 链接期需要完整 binutils（含 as.exe）；rustup 自带的那份缺 as.exe。
-# 先装 binutils（三选一，见脚本报错提示），再：
-export MINGW_BINUTILS_BIN=/c/msys64/mingw64/bin   # 指向含 as.exe 的目录
-bash build.sh
-```
+## 平台支持
 
-产物：`<仓库>\target\<target>\release\AI-Root.exe`。
-
-> 两个脚本都会**自动探测**工具链位置，正常无需设置任何环境变量。
-> 依赖缺失时会直接打印可复制执行的安装命令。
-
-**可用环境变量**（均有自动探测，通常无需设置）：
-
-| 变量 | 用途 |
+| 项 | 支持情况 |
 |---|---|
-| `AIROOT_RUST_ROOT` | rust 根目录（含 `cargo/` 与 `rustup/`），rust 装在非默认位置时用 |
-| `AIROOT_TARGET` | 目标三元组（默认 `x86_64-pc-windows-gnu`） |
-| `MINGW_BINUTILS_BIN` | MinGW binutils 的 `bin` 目录（仅 gnu 目标需要） |
-| `CARGO_TARGET_DIR` | 产物目录（默认 `<仓库>/target`） |
+| **操作系统** | 仅 **Windows x64**（依赖命名管道、`LocalSystem` 服务、`cmd.exe`） |
+| **目标三元组** | `x86_64-pc-windows-msvc`（推荐） / `x86_64-pc-windows-gnu` |
+| **Rust 版本** | stable，edition 2021 |
+| **构建 CI** | GitHub Actions `windows-latest`，msvc + gnu **双 job 全绿** |
+| **产物** | 单一 `AI-Root.exe`（console 子系统，约 1.07 MB，静态链接 CRT） |
+| **运行时依赖** | 无（无 DLL 分发、无 .NET、无 VC++ 可再发行包） |
 
-## 最近更新（2026-10-04）
-
-### 构建
-- **仓库须置于纯 ASCII 路径**（MinGW `ld`/`dlltool` 无法处理含中文的产物路径 —— 见 §7）。
-- **构建脚本大幅简化**，并把配置下沉到 `.cargo/config.toml`（单一事实来源）。
-- **脚本改为「向系统自省」而非猜测路径**：rust 根由 `rustup show home` 反推，cargo 由 `rustup which cargo` 直接定位，不再依赖任何硬编码位置。
-- **依赖自检与可行动报错**：缺 rustup / 缺 toolchain / 缺 binutils 时，直接打印可复制执行的修复命令。
-- 修复 `build.ps1` 不回写 `CARGO_HOME`/`RUSTUP_HOME` 的缺陷（曾导致两脚本使用不同 registry 源）。
-
-### 安全修复（本轮）
-- **§4.1 目录 ACL 隔离缺陷 A/B**：`set_dir_acl` 原先既未清除继承来的 `Users` 写权限（任意本地用户可覆写 `token.txt` 自授权拿 SYSTEM），又因 SID 缺 `*` 前缀导致授权静默全失败。已修复为 `/inheritance:r` + 逐条独立授权 + 收尾自检。
-- **§4.1.1 服务自降权限缺陷 C**：服务以 LocalSystem 启动时，`set_dir_acl` 把 SYSTEM 自己当成"待授权用户"并 replace 成只读，导致服务无法写数据目录。已通过 `granted_user_sid()` + 纯函数 `select_grant_sid()` 从结构上消除。
-- 数据目录 ACL 最终形态：`SYSTEM(F) + Administrators(F) + 安装用户(R)`，且服务反复重启后保持稳定。
-
-### 测试
-- 测试数 6 → **57**：新增 5 个 `handle_client` 端到端测试（真实管道驱动全链路），
-  ACL 安全回归 3 个，全部经**变异验证**（注入缺陷必须精确 FAILED）。
-- 新增 `select_grant_sid()` 纯逻辑内核，使"进程身份 = SYSTEM"这一测试环境无法复现的前提可被单元测试覆盖。
-
-> **关于二进制可复现性（实测结论，勿再追查）**：两脚本在**同一台机器、同一源码**下产出的 exe
-> 仍不会逐字节一致，且**同一脚本连续两次也不一致**。原因不在脚本，而在上游：
-> GNU binutils 的 `dlltool` 默认把**时间戳**写入 `kernel32_dll_imports_lib`，
-> 该 lib 的内容哈希又被编进最终产物（PE 内可见 `_head_D_..._kernel32_dll_imports_lib`），
-> 进而改变符号表布局。实测：同一 `.def` 间隔 1 秒生成两个 import lib → md5 不同；
-> 加 `--deterministic-libraries` 并固定输出路径 → md5 一致。但 rustc 内部直接调用 `dlltool`，
-> 无法经 `RUSTFLAGS` 注入该参数，故**当前不可行**。
-> 结论：**不要以二进制字节相等作为构建正确性标准**，应以「测试通过 + 源码级一致」为准。
-> 若确需可复现构建，须改用 msvc 工具链（`link.exe` 无此问题）。
-
-### 更早（2026-08-28）
-
-### 安全增强
-- **令牌轮转**：新增 `rotate_token()` 函数支持安全的令牌轮转
-- **命令安全**：阻止危险命令模式（format/diskpart等）执行
-- **输入验证**：添加请求数据验证，防止无效或恶意输入
-- **详细审计**：增强日志记录，包含完整的命令执行信息
-
-### 性能优化
-- **管道缓冲区**：从8KB增加到64KB，提高大输出命令吞吐量
-- **内存管理**：减少不必要的克隆，直接使用所有权转移
-- **连接控制**：添加5分钟最大连接时间，防止资源占用
-- **资源释放**：优化并发连接处理和资源管理
-
-### 稳定性改进
-- **错误处理**：添加更详细的错误日志和结构化事件记录
-- **超时保护**：改进命令执行超时处理机制
-- **进程管理**：增强进程状态检查和异常处理
-
-### 文档更新
-- **项目结构说明**：详细的项目结构和文件功能描述
-- **使用示例**：添加多种语言的集成示例
-- **优化总结**：完整的优化工作记录
-
-详见 [优化总结.md](docs/优化总结.md)
+> **GUI 已于 2026-08-07 彻底移除**。当前为纯终端版；调用 `AI-Root gui` 会明确报错而非静默失败。
+> 替代方案：`AI-Root tail` 实时跟随事件流，`exec.log` 供审计巡检。
 
 ---
 
-## 1. 架构
-
-```
-┌─────────────┐   命名管道 \\.\pipe\AI-Root    ┌──────────────────────┐
-│  AI 智能体   │ ──── 请求(令牌+命令) ───────> │  AI-Root 服务进程     │
-│ (非提权用户) │ <── 响应(退出码+stdout/stderr)─│  (LocalSystem 运行)   │
-└─────────────┘                               └──────────┬───────────┘
-                                                        │ cmd /C <command>
-                                                        ▼
-                                                  SYSTEM 最高权限执行
-```
-
-- **服务**：以 `LocalSystem` 注册为自启 Windows 服务（`SERVICE_NAME = "AI-Root"`）。
-- **管道**：`\\.\pipe\AI-Root`，SDDL 限制连接方为 `SYSTEM` / `Administrators` / `Interactive` + 安装用户 SID（确保智能体进程可无人值守连接）。
-- **令牌**：安装时生成 32 字节随机十六进制令牌，落盘于 `C:\ProgramData\AI-Root\token.txt`，目录 ACL 为 `SYSTEM(F) + Administrators(F) + 安装用户(R)`（隔离缺陷史见 §4.1 / §4.1.1）。
-
----
-
-## 2. 部署（仅需一次，管理员）
+## 部署（仅需一次，管理员）
 
 ```powershell
 # 以管理员身份打开 PowerShell，然后执行：
 powershell -ExecutionPolicy Bypass -File install-service.ps1
 ```
 
-`install-service.ps1` 分 6 步并逐步打印结果，**不含隐藏动作**：
+`install-service.ps1` 分 6 步并**逐步打印结果，不含隐藏动作**：
 
 | 步骤 | 内容 |
 |---|---|
@@ -147,100 +108,111 @@ powershell -ExecutionPolicy Bypass -File install-service.ps1
 | 4 | 安装后核对（服务注册与启动类型、`SERVICE_START_NAME`、部署副本与包装器、**Users 无写权限 + SYSTEM 保留 (F)**、`sid.txt`） |
 | 5-6 | 启动服务 + `sc qfailure` 失败恢复核对（应 60s/300s/600s） |
 
-> 若第 4 步 ACL 检查报 `[X]`（Users 仍持有写权限），**请立即停止使用并反馈** —— 说明 §4.1 的隔离修复未生效。
-> 同时应确认 `NT AUTHORITY\SYSTEM` 显示为 `(F)`；若显示 `(R)` 则说明命中 §4.1.1 的自降权限缺陷。
+> ⚠ 若第 4 步 ACL 检查报 `[X]`（Users 仍持有写权限），**请立即停止使用并反馈**。
+> 同时应确认 `NT AUTHORITY\SYSTEM` 为 `(F)`；若为 `(R)` 则命中自降权限缺陷。
+> 两处判据的成因与验证见 [docs/安全模型.md](docs/安全模型.md)。
 
-> 也可手动逐步执行：`AI-Root.exe install` → `AI-Root.exe start`（同样需管理员）。
+也可手动逐步执行：`AI-Root.exe install` → `AI-Root.exe start`（同样需管理员）。
 
-> **一次性管理员，之后零介入**：`install` 除注册服务外，还会给**当前用户 SID** 追加服务的
-> `GRGX` 权限（GENERIC_READ|GENERIC_EXECUTE，含 QUERY_STATUS/START/STOP，Windows 服务安全描述符
-> 标准机制；实测 SDDL 零散位 `RP/WP/LO` 组合不含 QUERY_STATUS，勿用）。此后智能体（用户身份、非提权）
-> 可自主执行 `AI-Root status/stop/start/update`，**更新服务二进制不再需要管理员**。
-
-部署产物：
+### 部署产物
 
 | 项 | 路径 |
 |---|---|
 | 服务二进制 | `%ProgramData%\AI-Root\AI-Root.exe`（可用 `AIROOT_DEPLOY_DIR` 覆盖） |
 | 全局包装器 | `C:\Windows\AI-Root.cmd` |
-| 数据/令牌目录 | `C:\ProgramData\AI-Root\` |
-| 令牌文件 | `C:\ProgramData\AI-Root\token.txt` |
-| 审计日志 | `C:\ProgramData\AI-Root\exec.log` |
-| 实时事件流 | `C:\ProgramData\AI-Root\events.jsonl`（`AI-Root tail` 实时跟随数据源） |
+| 数据/令牌目录 | `%ProgramData%\AI-Root\` |
+| 令牌文件 | `%ProgramData%\AI-Root\token.txt` |
+| 审计日志 | `%ProgramData%\AI-Root\exec.log` |
+| 实时事件流 | `%ProgramData%\AI-Root\events.jsonl`（`AI-Root tail` 实时跟随） |
 
-安装后服务自启。常用管理命令：
+### 命令一览
 
 ```text
-AI-Root install     # 注册为 LocalSystem 自启服务（管理员，仅首次；已存在时给出指引）
-AI-Root uninstall   # 卸载服务（管理员；同时清理部署目录/全局包装器/令牌/身份文件）
-AI-Root rotate-token  # 轮换共享令牌（写盘后服务端自动热加载，旧令牌立即失效）
-AI-Root start       # 启动服务（install 授权后非提权即可）
-AI-Root stop        # 停止服务（install 授权后非提权即可）
-AI-Root update <新exe路径>  # 自主更新服务二进制：PE 校验→停服务→覆盖→启服务（无需管理员）
-AI-Root status      # 查询服务状态
-AI-Root -h          # 命令行帮助（无参数双击 exe = 打印帮助并等待按键，防一闪而过）
+AI-Root install            注册为 LocalSystem 自启服务（管理员，仅首次）
+AI-Root uninstall          卸载服务（管理员；同时清理部署目录/包装器/令牌/身份文件）
+AI-Root rotate-token       轮换共享令牌（写盘后服务端自动热加载，旧令牌立即失效）
+AI-Root start              启动服务（install 授权后非提权即可）
+AI-Root stop               停止服务（install 授权后非提权即可）
+AI-Root status             查询服务状态
+AI-Root update <新exe路径>  自主更新服务二进制：PE 校验→停服务→覆盖→启服务（无需管理员）
+AI-Root run [选项] <命令>   以 SYSTEM 权限执行（智能体主入口）
+AI-Root server             前台运行管道服务（调试/隔离演练用）
+AI-Root tail [选项]        实时跟随 events.jsonl
+AI-Root -h                 命令行帮助
 ```
 
-> **失败自动重启**：`install` 会配置 SCM Recovery Actions（异常终止后 60s/300s/600s 依次自动重启），
-> 即使进程被意外杀死（7034）也会在 1 分钟内自愈，AI 无人值守不受影响。
+> **一次性管理员，之后零介入**：`install` 除注册服务外，还会给**当前用户 SID** 追加服务的 `GRGX`
+> 权限（`GENERIC_READ|GENERIC_EXECUTE`，含 `QUERY_STATUS`/`START`/`STOP`）。
+> 此后智能体（用户身份、非提权）可自主执行 `status`/`stop`/`start`/`update`，**更新服务二进制不再需要管理员**。
+>
+> **失败自动重启**：`install` 配置 SCM Recovery Actions（异常终止后 60s/300s/600s 依次重启），
+> 进程被意外杀死（7034）也会在 1 分钟内自愈，无人值守不受影响。
 
 ---
 
-## 3. AI 调用契约
+## AI 调用契约
 
-### 3.1 鉴权
+### 鉴权
 
-- 读取令牌：`C:\ProgramData\AI-Root\token.txt`（当前用户只读，AI 进程以安装用户身份运行即可读取）。
-- 每次请求须在 `Request.token` 字段携带正确令牌；令牌不符服务端拒绝执行。
-- **持有令牌即等价于拥有 SYSTEM 命令执行权**——令牌等同于高权限凭据，须妥善保管，不得写入日志、提交仓库或泄露。
+- 读取令牌：`%ProgramData%\AI-Root\token.txt`（**当前用户只读**，AI 进程以安装用户身份运行即可读取）。
+- 每次请求须在 `Request.token` 字段携带正确令牌；不符则服务端拒绝执行。
+- **持有令牌即等价于拥有 SYSTEM 命令执行权** —— 令牌等同于高权限凭据，须妥善保管，
+  **不得写入日志、提交仓库或泄露**。
 
-### 3.2 客户端调用形态
+### 调用形态
 
-`AI-Root run` 是智能体最常用的入口，有三种形态：
+`AI-Root run` 是智能体主入口：
 
 ```text
-# 单行命令（默认，非提权即可）
+# 单行命令（默认超时 60s，非提权即可）
 AI-Root run "whoami"
 
-# 覆盖默认 60s 超时（超时后整棵进程树被杀）
+# 覆盖超时（超时后整棵进程树被杀）
 AI-Root run --timeout 5000 "ping -n 10 127.0.0.1"
 
 # 多行脚本（文件）：&/&&/|/() 全部正常，推荐用于批量自治
 AI-Root run --file C:\tmp\batch.cmd
 
-# 从标准输入喂入脚本（多行）
+# 从标准输入喂入脚本
 type C:\tmp\batch.cmd | AI-Root run --stdin
 
 # 结构化输出（AI 消费推荐）：{ok,exit_code,stdout,stderr,error,truncated}
 AI-Root run --json "whoami"
 
-# 指定工作目录执行
+# 指定工作目录
 AI-Root run --cwd C:\Windows --json "cd"
 
-# 分隔符之后全部按字面量作为命令（不经任何解析）
+# 分隔符之后全部按字面量（不经任何解析）
 AI-Root run -- <原始命令>
 ```
 
-> **智能体直接拼参数的约定**：通过子进程 `subprocess` 等机制把含换行符的命令字符串传给 `AI-Root run` 时，
-> 服务端按「命令含 `\n`」自动判定为脚本模式，无需显式 `--file`/`--stdin`。
+> **直接拼参数的约定**：通过 `subprocess` 等机制把含换行符的命令字符串传给 `AI-Root run` 时，
+> 服务端按「命令含 `\n`」**自动判定为脚本模式**，无需显式 `--file`/`--stdin`。
 
-### 3.3 命令语义（关键）
+### 命令语义（关键）
 
-- **单行命令**：`^` 与 `&` 会被转义为字面量（防止 `cmd /C` 二次解析把含 `&` 的字面量如设备实例 ID 拆段）。
-  代价：**`&` 与 `&&` 串联在单行内失效**（退化为字面 `&`/`&&`）；仅 `|`/`<`/`>`/`()` 保留。
-  → 跑单行设备命令（如 `pnputil /remove-device "...&..."`）时这正是想要的保护行为。
-- **多行脚本 / `--file` / `--stdin`**：**不转义**，`&`/`&&`/`|`/`()` 恢复 `cmd` 正常语义。
-  实现上服务端把多行命令用 ` & ` 连接后经 `cmd /C` **直接传参**（UTF-16 命令行、不读文件），
-  **中文命令 100% 可靠**（cmd 读 `.cmd` 文件的代码页继承不稳定，故不落盘）。
-  → AI 批量执行多条命令、需要串联/管道时，**一律走多行脚本**。
-- **脚本模式注意事项**：
-  - 同一行内 `set x=1 & echo %x%` 的 `%x%` 在解析期展开为空，需写 `& call echo %x%`；
-  - 含 `(`/`)` 的括号块（`if (...)`、`for ... do (...)`）自动回退「包装脚本 + call」文件方案；
-  - 单脚本拼接后超过 6000 字符同样回退文件方案（cmd 命令行上限 8191）。
+| 形态 | 转义行为 | 适用场景 |
+|---|---|---|
+| **单行** | `^` 与 `&` 转义为字面量 | 单个命令；含 `&` 的字面量参数（如设备实例 ID） |
+| **多行 / `--file` / `--stdin`** | **不转义**，`&`/`&&`/`\|`/`()` 恢复 `cmd` 正常语义 | 批量执行、串联、管道 |
 
-### 3.4 帧协议（直接对接管道时）
+单行的转义代价：**`&` 与 `&&` 串联在单行内失效**（退化为字面 `&`/`&&`），仅 `|`/`<`/`>`/`()` 保留。
+这是为了防 `cmd /C` 二次解析把含 `&` 的字面量拆段 —— 跑单行设备命令时正是想要的保护行为。
 
-若智能体绕过 CLI 直接连管道，帧格式为：`[u32 LE 长度][payload bytes]`。
+**脚本模式实现要点**：服务端把多行命令用 ` & ` 连接后经 `cmd /C` **直接传参**（UTF-16 命令行、**不落盘**），
+因此**中文命令 100% 可靠**（cmd 读 `.cmd` 文件的代码页继承不稳定）。
+
+脚本模式注意事项：
+
+- 同一行内 `set x=1 & echo %x%` 的 `%x%` 在解析期展开为空 → 需写 `& call echo %x%`；
+- 含 `(`/`)` 的括号块（`if (...)`、`for ... do (...)`）自动回退「包装脚本 + call」文件方案；
+- 单脚本拼接后超过 **6000 字符**同样回退文件方案（`cmd` 命令行上限 8191）。
+
+> → **AI 批量执行、需要串联或管道时，一律走多行脚本。**
+
+### 帧协议（直接对接管道时）
+
+绕过 CLI 直接连管道时，帧格式为 `[u32 LE 长度][payload bytes]`：
 
 ```jsonc
 // 客户端 -> 服务端：Request
@@ -248,40 +220,44 @@ AI-Root run -- <原始命令>
   "token": "<32字节十六进制令牌>",
   "command": "<命令或脚本文本，含 \\n 即脚本模式>",
   "cwd": "<可选工作目录>",
-  "timeout_ms": 60000          // 可选，默认 60000；超时后服务端 taskkill /T 杀整棵进程树
+  "timeout_ms": 60000          // 可选，默认 60000；超时后 taskkill /T 杀整棵进程树
 }
 
 // 服务端 -> 客户端：Response
 {
   "ok": true,                  // 中继层是否成功（鉴权通过且命令已执行/已超时处理）
-  "exit_code": 0,              // 被执命令进程退出码；中继层错误时为 -1
+  "exit_code": 0,              // 被执命令退出码；中继层错误时为 -1
   "stdout": "...",
   "stderr": "...",
-  "error": null                // 中继层错误（鉴权失败/超时/spawn 失败）时非空
+  "error": null,               // 中继层错误（鉴权失败/超时/spawn 失败）时非空
+  "truncated": false           // stdout/stderr 是否因 1MB 上限被截断
 }
 ```
 
-- 鉴权失败 / 已禁用：`ok=false` 且 `error` 非空，`exit_code=-1`。
-- 超时：`ok=false`，`error="执行超时"`，命令进程已被终止。
+| 情形 | `ok` | `error` | `exit_code` |
+|---|---|---|---|
+| 正常 | `true` | `null` | 被执命令的退出码 |
+| 鉴权失败 / 已禁用 | `false` | 非空 | `-1` |
+| 超时 | `false` | `"执行超时"` | `-1`（进程树已终止） |
 
-### 3.5 输出编码约定
+### 输出编码
 
-同一 `cmd /C` 进程内输出编码不统一（`dir`/`ver` 用 GBK，`echo 中文` 用 UTF-8）。服务端采用**双解码**：
+同一 `cmd /C` 进程内输出编码**不统一**（`dir`/`ver` 用 GBK，`echo 中文` 用 UTF-8）。服务端采用**双解码**：
 
 1. 优先严格按 **UTF-8** 解码；
-2. 失败回退 **GBK（CP936 / `CP_OEMCP`）**。
+2. 失败回退 **GBK**（CP936 / `CP_OEMCP`）。
 
-**AI 侧解析 stdout/stderr 应沿用同一策略**：先按 UTF-8 解析，失败回退 GBK。
+**AI 侧解析 `stdout`/`stderr` 应沿用同一策略。**
 
-### 3.6 退出码
+### 退出码
 
-- `Response.exit_code` 透传被执命令进程的退出码（命令自身的成功/失败语义）。
-- 中继层自身错误（令牌不符、超时、spawn 失败）时 `exit_code = -1` 且 `error` 非空。
+- `exit_code` **透传**被执命令进程的退出码（命令自身的成功/失败语义）。
+- 中继层自身错误（令牌不符、超时、spawn 失败）→ `exit_code = -1` 且 `error` 非空。
 
-### 3.7 实时事件流（events.jsonl）
+### 实时事件流（events.jsonl）
 
-服务端在关键节点追加 JSONL 事件到 `C:\ProgramData\AI-Root\events.jsonl`（每行一个 JSON 对象），
-供 `AI-Root tail` 及外部监控**增量读取**（按字节偏移读新增行，`size <= offset` 安全返空）：
+服务端在关键节点追加 JSONL 到 `%ProgramData%\AI-Root\events.jsonl`（每行一个 JSON 对象），
+供 `AI-Root tail` 与外部监控**增量读取**（按字节偏移读新增行，`size <= offset` 安全返空）：
 
 | 事件类型 | 触发点 | 关键字段 |
 |---|---|---|
@@ -290,340 +266,175 @@ AI-Root run -- <原始命令>
 | `token_rotate` | 令牌轮换 | 无（**绝不记录令牌明文**） |
 | `service_start` | 服务启动 | `pipe` |
 
-示例：
-
 ```jsonc
 {"ts":"2026-08-06 19:30:00","type":"exec_start","caller":"MACHINE\\user","pid":32836,"cmd":"whoami","timeout_ms":60000}
 {"ts":"2026-08-06 19:30:00","type":"exec_done","caller":"MACHINE\\user","pid":32836,"cmd":"whoami","exit":0,"duration_ms":52,"out_preview":"nt authority\\system\r\n"}
 ```
 
-> 与 `exec.log`（审计：命令+退出码，终身保留）互补：事件流含执行中/完成状态、时长与输出摘要，文件超过 2MB 自动轮转（改名 `.1` 再写）。
+> 与 `exec.log`（审计：命令+退出码，终身保留）互补：事件流含执行中/完成状态、时长与输出摘要；
+> 文件超 2MB 自动轮转（改名 `.1` 再写）。
 
 ---
 
-## 4. 安全模型
+## 安全模型
 
-- 令牌仅安装时生成一次；目录 ACL `SYSTEM(F) + Administrators(F) + 安装用户(R)`，其余账户不可访问。
-  ⚠ **该隔离曾长期未真正生效**，见 §4.1；另曾出现"服务自降为只读"故障，见 §4.1.1。
-- **令牌轮换**：`AI-Root rotate-token`（管理员/SYSTEM）生成新令牌写盘，服务端按文件 mtime 变化**自动热加载**（无需重启），旧令牌立即失效。泄露后的标准处置流程：rotate → 更新 AI 侧令牌引用。
-- **审计日志**：`C:\ProgramData\AI-Root\exec.log` 逐行记录 `[时间] caller=DOMAIN\user pid=xxx exit=code cmd=...`。`caller` 来自服务端 `GetNamedPipeClientProcessId` 解析的**管道对端进程身份**（非服务自身环境变量），可精确追溯"谁在什么进程里执行了什么"。
-- 管道 SDDL 追加安装用户 SID，使以该用户身份运行的智能体（可能非交互登录）也能稳定连接。
-- 服务 DACL 在 install 时追加安装用户 SID 的 `GRGX`（GENERIC_READ|GENERIC_EXECUTE，含 QUERY_STATUS/START/STOP）——仅授权 status/stop/start/update 自身服务，不授予 CHANGE_CONFIG/WRITE_DAC 等管理权限、不涉及其他服务或系统级权限。
-- 受「启用开关」约束（`C:\ProgramData\AI-Root\enabled.flag` 存在即启用），删除即禁用中继（服务端拒绝一切命令，`ok=false, error="中继已禁用"`）。
-  **开关是运行期语义**：禁用后无法通过中继自身恢复（拒绝执行），需本地/管理员重建 flag，或直接非提权 `AI-Root stop` + `AI-Root start`（服务启动时自动重建 flag，已实测）。
-- 服务运行时（SYSTEM 身份）会重固化目录 ACL，但**绝不会**把 SYSTEM 自身当"待授权用户"
-  ——`granted_user_sid()` 从 `sid.txt` 取安装用户 SID 并硬性排除 `S-1-5-18`（见 §4.1.1）。
+- **令牌仅在安装时生成一次**；目录 ACL 为 `SYSTEM(F) + Administrators(F) + 安装用户(R)`，
+  其余账户不可访问。⚠ 该隔离**曾长期未真正生效**（缺陷 A/B）且曾出现服务自降只读（缺陷 C），
+  成因、验证与回归测试见 [docs/安全模型.md](docs/安全模型.md)。
+- **令牌轮换**：`AI-Root rotate-token` 生成新令牌写盘，服务端按文件 mtime 变化**自动热加载**（无需重启），
+  旧令牌立即失效。泄露后的标准处置：`rotate-token` → 更新 AI 侧令牌引用。
+- **审计日志**：`exec.log` 逐行记录 `[时间] caller=DOMAIN\user pid=xxx exit=code cmd=...`。
+  `caller` 来自服务端 `GetNamedPipeClientProcessId` 解析的**管道对端进程身份**（非服务自身环境变量），
+  可精确追溯「谁在什么进程里执行了什么」。
+- **管道 SDDL** 追加安装用户 SID，使以该用户身份运行的智能体（**可能非交互登录**）也能稳定连接。
+- **服务 DACL** 在 `install` 时追加安装用户 SID 的 `GRGX` —— 仅授权 `status`/`stop`/`start`/`update`
+  自身服务，**不授予** `CHANGE_CONFIG`/`WRITE_DAC` 等管理权限，不涉及其他服务或系统级权限。
+- **启用开关**：`enabled.flag` 存在即启用；删除即禁用（服务端拒绝一切命令，`ok=false`）。
+  开关是**运行期语义** —— 禁用后无法经中继自身恢复，需本地/管理员重建 flag，
+  或非提权 `AI-Root stop` + `start`（服务启动时自动重建，已实测）。
+- **SYSTEM 身份下重固化 ACL 时绝不会把自己当"待授权用户"** —— `granted_user_sid()`
+  从 `sid.txt` 取安装用户 SID 并硬性排除 `S-1-5-18`。
 
-### 4.1 目录 ACL 隔离缺陷（2026-10-04 发现并修复）
+### 运行时加固
 
-`common::set_dir_acl` 声称实现「仅 SYSTEM 完全控制 + 当前用户只读」，但原实现**未能达成**。
-两个缺陷互相遮蔽，须一并理解：
-
-**缺陷 A：`/grant:r` 不清除其它 SID 的 ACE**
-
-原实现用 `/inheritance:e` + `/grant:r`。而 `icacls /grant:r` 的 `:r`（replace）**只替换指定 SID 的那一条 ACE**，
-不会移除其它 SID 的 ACE。于是 `C:\ProgramData` 继承来的
-`BUILTIN\Users:(I)(CI)(WD,AD,WEA,WA)` 被**原样保留** —— 任意本地用户对该目录仍有**写权限**。
-
-后果链：`token.txt` 是授权执行 SYSTEM 命令的共享密钥，而设计上「目录 ACL 才是真正的权限边界」。
-用户可写该目录 ⇒ 可覆写 `token.txt` ⇒ **非提权用户自授权拿到 SYSTEM 命令执行**。
-
-实测对照（父目录含可继承的 Users 写 ACE）：
-
-| 实现 | 结果 |
+| 机制 | 参数 |
 |---|---|
-| `/inheritance:e`（原） | `BUILTIN\Users:(I)(OI)(CI)(WD,AD)` **残留** ❌ |
-| `/inheritance:r`（修复） | 仅 `SYSTEM:(OI)(CI)(F)` + 用户只读 ✅ |
+| **全局熔断** | 30s 窗口内累计失败 **20** 次 → 全局锁定 **120s**（期间拒绝一切请求） |
+| **按调用方定向封禁** | 同一 SID 在 60s 内失败 **5** 次 → 单独拒绝该 SID **300s**，不影响其他调用方 |
+| **恒定时间令牌比较** | 逐字节 XOR 累加判 0，防时序侧信道逐位猜令牌 |
+| **超时钳制** | 请求 `timeout_ms` 上限 10 分钟（`min(600_000)`） |
+| **并发信号量** | 同时处理连接上限 **8**（`AtomicU32` + RAII 释放），超出立即返回「服务繁忙」 |
+| **连接读超时** | 帧头/帧体读取带超时（`PeekNamedPipe` 轮询），防「连上不发数据」的线程泄漏 |
+| **输出截断** | `stdout`/`stderr` 各 **1MB** 上限，超出置 `truncated=true` |
+| **update 输入校验** | 先校验目标为有效 PE（MZ + PE 头 + x64/x86 Machine）并打印 SHA256，非 PE 拒绝 |
 
-**缺陷 B：`icacls` 的 SID 参数缺 `*` 前缀**
-
-`get_user_sid()` 返回裸 SID（`S-1-5-21-...`），原实现直接拼成 `{sid}:(OI)(CI)R`。
-`icacls` 会把裸 SID 当**账户名**去解析，失败即报「账户名与安全标识间无任何映射完成」，
-并**整条命令非零退出、一个 ACE 都不写**（grant 参数是全有或全无）。
-
-**为何两缺陷必须一起修**：缺陷 B 原本被缺陷 A 掩盖 ——
-`/inheritance:e` 保留了继承来的 `SYSTEM:F`，所以即使显式授权失败，服务照样有权限。
-一旦单独把 A 修成 `/inheritance:r` 而不管 B，继承 ACE 已清除、显式 ACE 又写入失败
-⇒ **目录 DACL 变空，SYSTEM 自己都进不去，服务彻底锁死**。
-
-**修复**（`common.rs::set_dir_acl`）：
-1. 先 `/inheritance:r` 断开继承并清除全部继承 ACE；
-2. 显式授予 `SYSTEM:(OI)(CI)F`、`Administrators:(OI)(CI)F`、`当前用户:(OI)(CI)R`
-   —— 均带 `(OI)(CI)` 传播标志，由目录自身向下继承，故「SYSTEM 写的事件文件用户可读」不受影响；
-3. SID 一律加 `*` 前缀标记为 SID 字面量；
-4. **逐条独立** `grant_one()` 调用（不再把三条 grant 塞进一条命令），单条失败不牵连其它；
-5. 收尾自检 `acl_has_system_full()`，若 SYSTEM 完全控制 ACE 缺失则立即补写
-   —— 从结构上消除「空 DACL 锁死」这一失败模式。
-
-回归测试 `common::tests::set_dir_acl_strips_inherited_users_write` 真实构造危险前提
-（父目录授予可继承的 Users 写权限）后调用**真实** `set_dir_acl`，断言写权限被剥离、
-SYSTEM 保留完全控制、当前用户保留只读。变异验证：还原缺陷 A / 缺陷 B 各一次，均 FAILED。
-
-### 4.1.1 缺陷 C：服务启动把自己降级为只读（2026-10-04 线上发现并修复）
-
-**症状**：服务安装并启动后，`C:\ProgramData\AI-Root` 的 ACL 变成 `NT AUTHORITY\SYSTEM:(OI)(CI)(R)` ——
-SYSTEM 只剩**只读**，于是以 LocalSystem 运行的服务**无法再写** `token.txt` / `events.jsonl` / `exec.log`，
-整个 SYSTEM 中继不可用（看似"服务在跑"实则已废）。
-
-**根因链**：
-1. `run_pipe_server()` 在服务启动时调用 `common::set_dir_acl(&data_dir())` 固化目录 ACL；
-2. 此时进程身份是 **LocalSystem**，而旧实现内部用 `get_user_sid()` 取"当前用户"；
-3. `get_user_sid()` 跑 `whoami /user` → 以 SYSTEM 身份返回 **`S-1-5-18`**（SYSTEM 自己），
-   而**不是**安装用户；
-4. 于是"授予当前用户只读"那步实际执行成 `grant_one("*S-1-5-18:(OI)(CI)R")`，
-   而 `:r` 是 **replace** 语义 → **覆盖掉刚授予的 `SYSTEM:(F)`**；
-5. 结果服务每次启动都自降为只读。
-
-**为何兜底没拦住**：`acl_has_system_full()` 自检确实检测到了缺失并补写，但补写用的 ACE 是
-`*S-1-5-18:(OI)(CI)F`，而**同一次调用里后面紧跟的用户授权又把它 replace 回 `(R)`**
-（`grant_one` 是逐条独立调用，顺序即"先 F 后 R"，后者覆盖前者）。属顺序性缺陷，
-非"兜底失效"。修复时通过 `granted_user_sid()` 从源头eliminate该 ACE 才真正解决。
-
-**实测证据**（真机复现）：停服务 → 手工 `icacls ... /grant:r "*S-1-5-18:(OI)(CI)F"`
-（SYSTEM 恢复 `(F)`）→ 启动服务 → ACL **立即退回** `SYSTEM:(R)`。反复稳定复现。
-
-**修复**（`common.rs`）：把"选谁作为待授权用户"抽成**纯函数** `select_grant_sid(persisted, current)`：
-1. 优先读持久化的 `sid.txt`（install 阶段以管理员身份写入，是**权威**来源）；
-2. 回退到当前进程身份，但**硬性拒绝** `S-1-5-18`；
-3. 两者皆 SYSTEM 或皆不可用 → `None`，走 Interactive 只读退化分支（而非降级 SYSTEM）。
-
-`granted_user_sid()` 负责取值（读文件 + `whoami`）后委托该纯函数；
-`set_dir_acl` 改用 `granted_user_sid()`。
-
-**为何必须抽纯函数**：测试进程**永远不是 SYSTEM**，无法在测试里构造
-"当前身份 = S-1-5-18"这一环境。首版回归测试直接断言 `granted_user_sid() != S-1-5-18`，
-**变异验证实测漏检**（把实现改回 `get_user_sid()` 后测试仍全绿）——
-因为测试环境里 `whoami` 本来就返回真实用户。抽出纯函数后可喂入
-`select_grant_sid(Some("S-1-5-18"), Some("S-1-5-18"))` 断言 `None`，变异验证随即 FAILED。
-
-**回归测试** `common::tests::set_dir_acl_never_downgrades_system`：
-- ① 纯逻辑组：6 条断言覆盖 `select_grant_sid` 的 persisted/current 全组合（含两者皆 SYSTEM、
-  sid.txt 被污染、非法值、空白裁剪）；
-- ② 集成组：人为把 scratch 目录 SYSTEM 降为 `(R)`（构造前提并断言成立），
-  调**真实** `set_dir_acl`，断言 SYSTEM 重新获得 `(F)`。
-
-变异验证（均 FAILED，见提交说明）：
-- 移除 `current` 分支的 `sid != LOCAL_SYSTEM_SID` 守卫；
-- 移除 `persisted` 分支的同一守卫。
-
-**真机修复后 ACL**（服务重启后仍保持）：
-
-| 主体 | 权限 |
-|---|---|
-| `<机器名>\<用户名>`（安装用户） | `(OI)(CI)(R)` |
-| `BUILTIN\Administrators` | `(OI)(CI)(F)` |
-| `NT AUTHORITY\SYSTEM` | `(OI)(CI)(F)` ✅ |
-
-端到端验证：非提权 `AI-Root run "whoami /user"` → `nt authority\system S-1-5-18`；
-`AI-Root run "cmd /c echo ... > C:\ProgramData\AI-Root\probe.txt"` → exit=0 且文件落盘成功。
-
-### 4.2 运行时安全加固
-
-- **鉴权失败节流（双层）**：
-  - **全局熔断**：30s 窗口内累计失败达 **20** 次 → 全局锁定 **120s**，期间拒绝一切请求（记 `<locked>`）。
-  - **按调用方定向封禁**：同一 SID 在 60s 窗口内失败达 **5** 次 → 单独拒绝该 SID **300s**，不影响其他调用方。
-  - 两层互补：定向封禁防「同一身份反复试探」，全局熔断兜底「无差别暴力尝试」。
-- **恒定时间令牌比较**：逐字节 XOR 累加判 0，防时序侧信道逐位猜令牌。
-- **超时钳制**：请求 `timeout_ms` 上限 10 分钟（`min(600_000)`），防客户端把服务端拖入超长占用。
-- **并发信号量**：同时处理连接上限 8（`AtomicU32` + RAII 释放），超出立即返回「服务繁忙」（AI 侧重试即可）。
-- **连接读超时**：帧头/帧体读取带超时（PeekNamedPipe 轮询），防「连上不发数据」的线程泄漏。
-- **输出截断**：stdout/stderr 各 1MB 上限，超出置 `truncated=true`（Response 含该字段，旧客户端 serde 默认兼容）。
-- **update 输入校验**：`AI-Root update` 先校验目标为有效 PE（MZ + PE 头 + x64/x86 Machine）并打印 SHA256，非 PE 拒绝，防被误导写入恶意文件。
+> 两层节流互补：定向封禁防「同一身份反复试探」，全局熔断兜底「无差别暴力尝试」。
 
 ---
 
-## 5. 纯终端版（无 GUI）
+## 限制
 
-> **GUI 已于 2026-08-07 彻底移除**：当前只有单一终端版，不再有 GUI 控制面板、系统托盘或 `AI-Root-gui.exe`。若调用 `AI-Root gui` 子命令，将直接报错「本构建为纯终端版，未包含 GUI 控制面板」。
-
-- **双击 exe（无参数）**：打印帮助信息并等待按键，防止终端一闪而过；CLI 交互输出经 `AttachConsole(ATTACH_PARENT_PROCESS)` 可见，管道/重定向不受影响。
-- **实时查看 AI 操作**：用 `AI-Root tail` 实时跟随 `events.jsonl`（支持 `--caller` / `--type` / `--since` 过滤），替代原 GUI「实时信息流」。
-- **审计日志查看**：`C:\ProgramData\AI-Root\exec.log` 逐行记录；人工巡检用任意文本工具或 `AI-Root tail` 查看。
-- **构建产物**：仅 `AI-Root.exe`（console 子系统，约 1.07 MB，MinGW 静态链接 CRT）。
-  > 体积经 `profile.release` 优化：`lto="thin"` + `codegen-units=1` + `strip="debuginfo"`。
-  > ⚠ **`strip` 取 `debuginfo` 而非 `symbols`**（2026-10-04 实测调整）：
-  >
-  > | 配置 | 体积 | 符号数 | panic 回溯 |
-  > |---|---|---|---|
-  > | `symbols` | 842 KB | 0 | **空**，仅一行 `note: Some details are omitted` |
-  > | `debuginfo` | 1.07 MB | 3333 | 完整函数名 + 调用链 |
-  > | `none` | 3.41 MB | 完整 | 多出体积几乎全是无用 debug 段 |
-  >
-  > 本项目以 LocalSystem 执行任意命令，线上崩溃拿不到符号的排障代价远高于 256 KB 体积。
-  > 另注：panic 的 `file:line:col` 位置信息编在 panic 元数据中，**两种配置下都有**，不受 `strip` 影响。
+- **仅 Windows**（命名管道 + LocalSystem 服务 + `cmd.exe`）。
+- 服务必须预先以管理员 `install` **一次**；之后智能体侧完全无需提权（含二进制更新）。
+- **令牌等同于高权限凭据**，泄露即等同于获得 SYSTEM 命令执行权。
+- **单行命令内 `&`/`&&` 串联失效**（设计使然，见 [命令语义](#命令语义关键)）；批量场景用多行脚本。
+- 单命令输出 **1MB 截断**（`truncated` 标记）。
+- 默认超时 **60s**（上限 10 分钟）；并发上限 **8**（超出返回「服务繁忙」，重试即可）。
+- 鉴权失败节流见 [运行时加固](#运行时加固)。
+- 构建产物**不保证逐字节可复现**（上游 `dlltool` 时间戳，见 [docs/构建说明.md](docs/构建说明.md)）。
 
 ---
 
-## 6. 限制
+## 构建
 
-- **仅 Windows**（依赖命名管道、LocalSystem 服务、cmd.exe）。
-- 服务必须预先以管理员 `install`/`deploy` **一次**；之后智能体侧完全无需提权（含二进制更新）。
-- 令牌等同于高权限凭据，泄露即等同于获得 SYSTEM 命令执行权。
-- 单行命令内 `&`/`&&` 串联失效（设计使然，见 3.3）；批量场景用多行脚本。
-- **单命令输出 1MB 截断**（`truncated` 标记）；默认超时 60s（上限 10 分钟）；并发上限 8（超出返回「服务繁忙」，重试即可）；鉴权失败节流见 4.1（全局 30s/20 次锁定 120s，单 SID 60s/5 次封禁 300s）。
+**推荐路线：msvc**（Windows 上 Rust 标准做法，无需额外配置 binutils）
 
----
-
-## 7. 构建与测试
-
-当前为**单一纯终端版**（无 `gui` feature、无双变体），构建产物仅 `AI-Root.exe`。
-
-> 新人请先看文首的 [快速开始](#快速开始)。本节讲设计取舍。
-
-```bash
-# gnu（Git Bash；需要外部 MinGW binutils，见下）
-bash build.sh
-
-# 自动选 target（本机与 CI 通用；msvc 无需额外 binutils）
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-msvc
+# 并安装 VS Build Tools（提供 link.exe）：
+#   https://visualstudio.microsoft.com/visual-cpp-build-tools/
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 ```
 
-**构建架构（2026-10-04 重构）**：配置与脚本职责分离。
+**备选路线：gnu**（不依赖 VS，但**需额外装 MinGW binutils**）
 
-- **`.cargo/config.toml`**：承载所有与机器无关的稳定配置（`target-dir` 等）。单一事实来源。
-- **`build.sh` / `build.ps1`**：只做**与机器相关**的事 —— 定位工具链、注入 binutils、调 cargo。
-  两者共享 `.cargo/config.toml`，不再各自维护一份会漂移的重复逻辑。
+```bash
+# Git Bash 下执行
+# gnu 链接期需要完整 binutils（含 as.exe）；rustup 自带的那份缺 as.exe。
+export MINGW_BINUTILS_BIN=/c/msys64/mingw64/bin   # 指向含 as.exe 的目录
+bash build.sh
+```
 
-**脚本的定位策略：优先向系统自省，而非猜测路径。**
+产物：`<仓库>\target\<target>\release\AI-Root.exe`。
 
-| 信息 | 获取方式 | 可移植性 |
-|---|---|---|
-| rust 根 | `rustup show home` 反推（**并校验 toolchain 真实存在**） | 高——只要 rustup 在 PATH |
-| cargo | 直连 toolchain 内的 `cargo.exe`（绕开 rustup shim） | 高 |
-| binutils | `MINGW_BINUTILS_BIN` → PATH 中的 `as.exe` → 常见 MSYS2/MinGW 安装位置 | 中——gnu 需用户提供 |
+### 设计取舍
 
-> 所有候选路径都会经过**存在性校验**后才采用；未命中任何候选时会打印可直接复制执行的修复命令，
-> 而不是以"文件不存在"的形式在链接期才炸掉。
->
-> ⚠ **`rustup show home` 只回显 `$RUSTUP_HOME`，不验证其存在性**。新装/迁移后会话常残留陈旧值
-> （指向已删目录），直接采信会得到"工具链不存在"的假结论。故**所有候选都必须校验后才采用**。
->
-> ⚠ **区分 `TARGET`(目标三元组) 与 `TOOLCHAIN`(工具链名)**：二者不同名
-> （工具链目录形如 `stable-x86_64-pc-windows-gnu`，多 `stable-` 前缀），混用会导致误判。
+- **配置与脚本职责分离**：`.cargo/config.toml` 承载所有与机器无关的稳定配置（`target-dir` 等），
+  是**单一事实来源**；`build.sh`/`build.ps1` 只做**与机器相关**的事（定位工具链、注入 binutils、调 cargo）。
+- **优先向系统自省，而非猜测路径**：
 
-**依赖自检**：缺 rustup / toolchain / binutils 时，脚本直接打印可复制执行的修复命令，
-而不是让用户对着链接期报错猜。
+  | 信息 | 获取方式 | 可移植性 |
+  |---|---|---|
+  | rust 根 | `rustup show home` 反推（**并校验 toolchain 真实存在**） | 高——只要 rustup 在 PATH |
+  | cargo | `rustup which cargo` 直接定位（绕开 rustup shim） | 高 |
+  | binutils | `MINGW_BINUTILS_BIN` → PATH 中的 `as.exe` → 常见 MSYS2/MinGW 位置 | 中——gnu 需用户提供 |
 
-**`build.ps1` 自动选 target**：
+- **依赖自检**：缺 rustup / toolchain / binutils 时直接打印**可复制执行**的修复命令，
+  而不是让用户对着链接期报错猜。
+- **仓库须置于纯 ASCII 路径**（MinGW `ld` 无法正确处理含中文的产物路径）。
+- **不硬编码任何本机路径**；非标准安装位置由环境变量告知（见 [环境变量](#环境变量)）。
 
-1. 已装 `x86_64-pc-windows-msvc` 且能找到 `link.exe`（VS Build Tools）→ msvc（CI `windows-latest` 走此路径，**且无需外部 binutils**）。
-2. 否则若已装 `x86_64-pc-windows-gnu` → gnu，并注入完整 MinGW binutils。
+> 构建踩坑的完整根因分析（host≠target、rustup 布局、资源嵌入、可复现性）见
+> [docs/构建说明.md](docs/构建说明.md)。
 
-> ⚠ **gnu 构建的硬约束**（2026-10-04 实测定位）：
->
-> 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。两个脚本按 `MINGW_BINUTILS_BIN`（环境变量）→ `PATH` 中已有 `as.exe` → 常见 MSYS2/MinGW 安装位置的顺序**自动探测**。安装方式见脚本报错提示（MSYS2 或清华镜像）。
-> 2. **Git Bash 下 PATH 只认 POSIX 形式**。把 `D:/...` 或 `D:\...` 写进 `PATH` 后，`command -v dlltool.exe` / `which` 一律查不到（不是 Permission denied，是彻底找不到），导致 cargo 回落到 `CARGO_HOME\bin` 的 rustup shim，最终报 `error calling dlltool 'dlltool.exe': program not found`。`build.sh` 用 `to_posix()` 统一转换，并直连 toolchain 内的真实 `cargo.exe`；`build.ps1` 为原生 Windows 路径语义，无此问题。
->
-> 📌 **关于「仓库路径必须纯 ASCII」**（2026-10-04 根治）：
-> 仓库若位于含中文的路径（如 `...\工具\AI-Root`）。MinGW 的 `ld` 按 ANSI 代码页解释路径参数，
-> 因此当**产物落进中文路径**时报「文件存在却找不到」：
-> ```
-> ld.exe: cannot find <中文路径>\target\release\deps\libsyn-xxx.rlib
-> No such file or directory
-> ```
-> （注意错误里的中文 **显示正常**，但 `ld` 实际按 GBK 解读 UTF-8 字节，故找不到真实文件。最先炸的是 proc-macro 依赖，
-> 因其必须先编成 `.dylib` 供 host 加载，这一步走 `ld`。）
->
-> 可用**外部 `CARGO_TARGET_DIR=<纯 ASCII 目录>` + ASCII 前置校验**临时绕过，代价是脚本里再添一整套绕行机制。
-> **根治方式：把仓库放在纯 ASCII 路径下** —— 绕行机制全部删除，脚本随之瘦身。
-> 经验：**不要用脚本对抗路径问题，要让路径不再有问题**。若日后必须使用非 ASCII 路径，外部 ASCII `CARGO_TARGET_DIR` 仍是有效的临时缓解。
+### CI
 
-**CI 双 job**（`.github/workflows/ci.yml`，`windows-latest`）：
+`.github/workflows/ci.yml` 在 `windows-latest` 上跑**双 job**（push 到 `main` / PR / 手动 `workflow_dispatch`）：
 
 | job | toolchain | 内容 |
 |---|---|---|
-| `build-msvc` | `x86_64-pc-windows-msvc` | `build.ps1` 构建 → `cargo test` → 打包上传 `AI-Root-windows-x64` 工件（30 天保留，打印 exe SHA256） |
-| `build-gnu` | `x86_64-pc-windows-gnu` | 经 `msys2/setup-msys2` 装完整 binutils → `bash build.sh` 构建 → `cargo test` |
+| `build-msvc` | `x86_64-pc-windows-msvc` | `build.ps1` 构建 → `cargo test` → 打包上传 `AI-Root-windows-x64` 工件（打印 exe SHA256） |
+| `build-gnu` | `x86_64-pc-windows-gnu` | 经 `msys2/setup-msys2` 装完整 binutils → `bash build.sh` → `cargo test` |
 
-> **为什么必须有两个 job**（2026-10-04 教训）：本机开发环境是 **gnu-only**，而 msvc job 不可能覆盖 gnu 路径。
-> `build.sh` 曾长期因 binutils/PATH 问题无法构建，**但 CI 一直是绿的** —— 因为只验了 msvc。`build-gnu` 专门堵住这个盲区：
-> 它走的是**开发者实际使用的 `build.sh`**，而非另写一套等价逻辑，确保 CI 验的就是本机跑的。
->
-> `build-gnu` 不手工下载 `.pkg.tar.zst`：该格式是 zstd 压缩，实测本机 GNU tar 1.35、Python 标准库（无 `zstandard`）均无法解压，runner 上是否可行无法在本地验证 —— 属于「靠猜」。改用 `msys2/setup-msys2` 由官方 action 保证正确性。
+> **为什么必须有两个 job**：本机开发环境是 **gnu-only**，msvc job 不可能覆盖 gnu 路径。
+> `build-gnu` 走的是**开发者实际使用的 `build.sh`**，而非另写一套等价逻辑 —— 确保 CI 验的就是本机跑的。
 
-`build.ps1` 构建产物随 job 上传。（重构后本机与 CI 均落各自仓库内 `target/`，天然分离，无需再手工指定 `CARGO_TARGET_DIR`。）
+---
 
-### 7.1 测试覆盖现状
+## 测试
 
 ```bash
 cargo test --release --target x86_64-pc-windows-gnu
 ```
 
-当前 **57 个测试**（2026-10-04 从 6 个扩充：44 个单元测试 + 5 个真实管道集成测试 + 3 个 ACL 安全回归测试 + 5 个 `handle_client` 端到端测试），分布：
+当前 **57 个测试**（[6 → 57](#测试策略)）：
 
 | 模块 | 数量 | 覆盖内容 |
 |---|---|---|
 | `exec` | 6 | cmd 元字符转义（引号内/外、`^`/`&`、未闭合引号） |
-| `common` | 3 | `set_dir_acl` 安全回归：剥离继承的 Users 写权限（§4.1 缺陷 A）+ 幂等性 + **不得把 SYSTEM 降级为只读**（§4.1.1 缺陷 C，含 `select_grant_sid` 纯函数全组合断言） |
-| `protocol` | 27 | `validate_request` 全字段边界（令牌长度/命令 8191/cwd MAX_PATH/超时上下限/校验顺序）；序列化向后兼容；`write_frame` 帧编码与 flush；**`read_frame_timeout` 真实命名管道集成测试**（正常往返、300 KB 大帧、空闲超时、超长长度前缀拒绝、对端关闭） |
-| `server` | 21 | `ct_eq` 恒定时间比较（含逐字节差异、首末字节）；`AuthThrottle` 熔断阈值/窗口重置/锁定过期；`record_sid_fail` 定向封禁/隔离/窗口过期；**`handle_client` 端到端**（见下） |
+| `common` | 3 | `set_dir_acl` 安全回归：剥离继承的 Users 写权限 + 幂等性 + **不得把 SYSTEM 降级为只读** |
+| `protocol` | 27 | `validate_request` 全字段边界；序列化向后兼容；`write_frame` 帧编码与 flush；**`read_frame_timeout` 真实命名管道集成测试** |
+| `server` | 21 | `ct_eq` 恒定时间比较；`AuthThrottle` 熔断/窗口重置/锁定过期；`record_sid_fail` 定向封禁；**`handle_client` 端到端** |
 
-> **集成测试用真实命名管道**：`read_frame_timeout` 的 5 个测试通过 `make_pipe_pair()` 在进程内自建 `CreateNamedPipeW` + `CreateFileW` 管道对（管道名含 `pid` + 测试标签，保证并行安全），**不 mock 任何 IO**。因此它真实覆盖了 `PeekNamedPipe` 轮询、分段超时预算、`FRAME_MAX_SIZE` 长度前缀校验这几条最容易出安全 bug 的路径。
->
-> **ACL 测试用真实 icacls**：`set_dir_acl_strips_inherited_users_write` 先构造「父目录授予可继承 Users 写权限」这一危险前提并断言前提成立，再调用真实 `set_dir_acl`，最后断言写权限被剥离 / SYSTEM 保留 / 用户保留只读。前提不成立时测试主动失败（避免"前提没了还假装通过"）。
->
-> 该组测试经变异验证有效：注入「去掉 `FRAME_MAX_SIZE` 校验」→ 仅 `read_frame_rejects_oversized_length_prefix` 失败；注入「去掉头部空闲超时检查」→ `read_frame_times_out_when_no_data_sent` **直接挂死**（被 `timeout 60` 杀掉）——恰好印证它守的是线程泄漏型 DoS 的兜底。
->
-> ACL 测试同样经变异验证：还原 §4.1 缺陷 A（`/inheritance:r` → `/inheritance:e`）→ 两个 ACL 测试均失败；还原缺陷 B（去掉 SID 的 `*` 前缀）→ 首次**未被捕获**，据此补了"当前用户保留只读 ACE"断言后才捕获。这正说明变异测试的价值：不跑一次就不知道断言其实没覆盖到。
->
-> §4.1.1 缺陷 C 的变异验证同样有价值：首版测试直接断言 `granted_user_sid() != S-1-5-18`，注入变异（改回 `get_user_sid()`）后**测试仍全绿**——因为测试进程本来就不是 SYSTEM。把选 SID 的逻辑抽成纯函数 `select_grant_sid()` 后可注入 `(SYSTEM, SYSTEM)` 组合，两种变异（persisted 守卫、current 守卫）随即均 FAILED。**教训：无法在测试环境复现的前提（此处是"进程身份 = SYSTEM"），要么抽成纯函数，要么就不算被测到。**
+### 测试策略
 
-> **`handle_client` 端到端测试（5 个）**：真实驱动「读请求帧 → 序列化校验 → 鉴权 → 执行 → 回写响应」全链路，主线程当客户端、工作线程跑真实 `handle_client`，**不 mock 任何环节**。覆盖：有效令牌正常执行、错误令牌拒绝且不执行命令、禁用开关生效、退出码透传（`cmd /c exit 7` → 7）、非法请求在执行前被拦。
->
-> 环境隔离三要点：① `AIROOT_DATA_DIR` 指向临时目录（令牌/flag 才有测试值）；② `AUTH_THROTTLE`/`SID_FAILS`/`ACTIVE_CONNS` 是进程级 static，必须用全局锁 `E2E_LOCK` **串行化**本组用例；③ `LOGGER`（OnceLock）首次写日志即绑定目录，故本组共享同一 `AIROOT_DATA_DIR`。
->
-> 变异验证（均精确命中，每次只有对应那一个测试 FAILED）：① 取消鉴权（`ct_eq` 恒真）→ 仅 `e2e_..._rejects_wrong_token` 失败；② 去掉 `is_enabled()` 检查 → 仅 `e2e_..._respects_disabled_flag` 失败；③ 退出码硬编码为 0 → 仅 `e2e_..._passes_through_exit_code` 失败。
+三条硬性原则，均经**变异测试**验证（改坏实现必须精确 FAILED）：
 
-> **测试用真实被测代码**：帧测试真实调用 `write_frame` 并校验落盘字节，而非在测试内重抄一遍编码逻辑（后者是「伪测试」——实现改错也照样通过）。
->
-> **阈值类断言硬编码期望值**，而非引用常量。否则「改常量」的变异不会被检出（测试跟着一起变）。这些数值是对外承诺的行为契约（见 4.1），变更应是有意识的决策。
->
-> **尚未覆盖**（已知缺口，优先级从高到低）：
-> - `connect_client` 的 `ERROR_PIPE_BUSY` 重试路径（需构造「实例全忙」场景，较难稳定复现）
-> - 命令黑名单（`format ` 等）的匹配规则
-> - 输出截断（1MB）、GBK 回退解码
+1. **测试必须调用真实被测代码** —— 帧测试真实调用 `write_frame` 并校验落盘字节，
+   而非在测试内重抄编码逻辑（后者是「伪测试」，实现改错也照样通过）。
+2. **无法在测试环境复现的前提，要么抽纯函数，要么就不算被测到** ——
+   「进程身份 = SYSTEM」无法在测试中构造，故把选 SID 的逻辑抽成纯函数 `select_grant_sid()`
+   后可注入 `(SYSTEM, SYSTEM)` 组合断言。
+3. **阈值类断言硬编码期望值**，而非引用常量 —— 否则「改常量」的变异不会被检出（测试跟着一起变）。
+   这些数值是对外承诺的**行为契约**。
 
-> 📌 **现状核对（2026-10-04 重构后）**：
-> - **源码仓库须置于纯 ASCII 路径**（MinGW `ld` 无法正确处理含中文的产物路径 —— 见 §7）。
-> - 构建产物落**仓库内** `target\x86_64-pc-windows-gnu\release\AI-Root.exe`（不再使用外部 `CARGO_TARGET_DIR`）。
-> - 服务部署副本：`%ProgramData%\AI-Root\AI-Root.exe`。
-> - 交付目录：仓库内构建后按需复制即可。
+集成测试用**真实命名管道**（`make_pipe_pair()` 进程内自建 `CreateNamedPipeW` + `CreateFileW`
+管道对，**不 mock 任何 IO**）与**真实 `icacls`**。
 
-**构建产物**（`<仓库>\target\<target>\release\AI-Root.exe`）：
+**已知缺口**（优先级从高到低）：`connect_client` 的 `ERROR_PIPE_BUSY` 重试、
+命令黑名单匹配规则、输出截断（1MB）、GBK 回退解码。
 
-| 文件 | 说明 |
-|---|---|
-| `AI-Root.exe` | 纯终端服务端（部署用，`update` 热更新到 `%ProgramData%\AI-Root\`） |
-
-**成品包组织**（exe + docs/）：
-
-```
-<交付目录>\
-├── AI-Root.exe        # 交付用二进制（与部署/构建产物一致）
-└── docs\README.md     # 本文档
-```
-
-取用流程：下载/构建得到 `AI-Root.exe` → `AI-Root update <该exe路径>`（服务在跑时热更新，无需管理员）。
-
-**部署流程（务必现场重建，勿复用早前构建）**：工作树存在并发编辑，旧的二进制可能滞后于源码（实测同尺寸但哈希不同）。固定流程：
-`bash build.sh`（本机 gnu；CI 走 `build.ps1` 自动选 msvc）→ `AI-Root update <新构建的 AI-Root.exe>` → 校验部署哈希一致 + `run --json whoami`=SYSTEM。
-
-**CI**：`.github/workflows/ci.yml` 在 GitHub Actions `windows-latest` 上跑 msvc + gnu 双 job（提交到 main、PR 或手动 `workflow_dispatch` 触发），详见第 7 节。
-
-依赖：`serde` / `serde_json` / `rand` / `chrono`（纯终端实现，无 GUI / egui / tray-icon 依赖）。
+> 各缺陷的变异验证记录见 [docs/安全模型.md](docs/安全模型.md) 与
+> [docs/测试说明.md](docs/测试说明.md)。
 
 ---
 
-## 8. 环境变量（隔离 / 多实例 / 测试）
+## 环境变量
 
-| 变量 | 默认 | 作用 |
-|---|---|---|
-| `AIROOT_DATA_DIR` | `C:\ProgramData\AI-Root` | 覆盖数据目录（token / exec.log / enabled.flag / sid.txt） |
-| `AIROOT_PIPE_NAME` | `\\.\pipe\AI-Root` | 覆盖命名管道名 |
+| 变量 | 默认 | 作用 | 适用 |
+|---|---|---|---|
+| `AIROOT_DATA_DIR` | `%ProgramData%\AI-Root` | 覆盖数据目录（token / exec.log / enabled.flag / sid.txt） | 运行期 |
+| `AIROOT_PIPE_NAME` | `\\.\pipe\AI-Root` | 覆盖命名管道名 | 运行期 |
+| `AIROOT_DEPLOY_DIR` | `%ProgramData%\AI-Root` | 覆盖部署目录（服务副本落地位置） | 安装期 |
+| `AIROOT_RUST_ROOT` | 自动探测 | rust 根目录（含 `cargo/` 与 `rustup/`） | 构建期 |
+| `AIROOT_TARGET` | `x86_64-pc-windows-gnu` | 目标三元组 | 构建期 |
+| `MINGW_BINUTILS_BIN` | 自动探测 | MinGW binutils 的 `bin` 目录（仅 gnu 目标需要） | 构建期 |
+| `CARGO_TARGET_DIR` | `<仓库>/target` | 产物目录 | 构建期 |
 
-**为什么需要**：AI-Root 的鉴权凭据（令牌）与监听管道名都是进程内唯一的。「临时演练中继」需要与生产服务完全隔离，否则会串到生产实例（实测教训：测试曾连到生产管道导致数据串扰）。
-
-**手动起隔离实例**（演练 / 压测 / 临时中继，不影响生产）：
+**为什么需要 `AIROOT_DATA_DIR` / `AIROOT_PIPE_NAME`**：鉴权凭据与监听管道名都是进程内唯一的。
+「临时演练中继」需要与生产服务完全隔离，否则会串到生产实例。
+注意：`install` 注册的**服务模式固定使用默认数据目录与管道名**；
+环境变量覆盖主要服务于前台 `server` 模式与多实例演练。
 
 ```powershell
 # 终端 A：起隔离服务（前台模式，Ctrl+C 退出）
@@ -631,10 +442,73 @@ $env:AIROOT_DATA_DIR = "C:\temp\airoot-demo"
 $env:AIROOT_PIPE_NAME = "\\.\pipe\AI-Root-demo"
 AI-Root.exe server
 
-# 终端 B：连接隔离实例（读写都走 demo 数据目录与管道）
+# 终端 B：连接隔离实例
 $env:AIROOT_DATA_DIR = "C:\temp\airoot-demo"
 $env:AIROOT_PIPE_NAME = "\\.\pipe\AI-Root-demo"
 AI-Root.exe run "whoami"
 ```
 
-> 注意：`install` 注册的**服务模式**固定使用默认数据目录与管道名；环境变量覆盖主要服务于前台 `server` 模式与多实例演练场景。
+---
+
+## 项目结构
+
+```text
+AI-Root/
+├── src/
+│   ├── main.rs          # CLI 入口与子命令分发
+│   ├── server.rs        # 命名管道服务端（鉴权/节流/并发/审计）
+│   ├── protocol.rs      # 帧协议、请求校验、管道连接
+│   ├── exec.rs          # 命令执行引擎（转义/超时/输出解码）
+│   ├── common.rs        # 令牌管理、路径、ACL、日志
+│   ├── service.rs       # Windows 服务注册与生命周期
+│   └── winapi_raw.rs    # Win32 API 原始绑定
+├── docs/                # 设计与参考文档
+├── assets/              # 图标与资源脚本
+├── .cargo/config.toml   # 构建配置（单一事实来源）
+├── build.rs / build.sh / build.ps1
+├── install-service.ps1  # 管理员安装脚本（6 步自检）
+└── .github/workflows/ci.yml
+```
+
+| 文件 | 行数 | 职责 |
+|---|---|---|
+| `src/server.rs` | 1247 | 管道监听、鉴权、节流、并发、审计 |
+| `src/common.rs` | 867 | 令牌、路径、ACL、日志 |
+| `src/protocol.rs` | 764 | 帧协议与校验 |
+| `src/main.rs` | 729 | CLI 与子命令 |
+| `src/service.rs` | 563 | 服务生命周期 |
+| `src/exec.rs` | 523 | 命令执行 |
+| `src/winapi_raw.rs` | 257 | Win32 绑定 |
+
+**运行时依赖**：`windows-service` / `serde` + `serde_json` / `rand` / `chrono`
+（纯终端实现，**无 GUI / egui / tray-icon 依赖**）。
+
+---
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/安全模型.md](docs/安全模型.md) | ACL 隔离缺陷 A/B/C 的成因、验证与回归测试 |
+| [docs/构建说明.md](docs/构建说明.md) | 工具链自省、host≠target、资源嵌入、可复现性结论 |
+| [docs/测试说明.md](docs/测试说明.md) | 测试矩阵、变异验证记录、已知缺口 |
+| [docs/项目结构说明.md](docs/项目结构说明.md) | 目录结构与文件职责 |
+| [docs/examples/使用示例.md](docs/examples/使用示例.md) | 多语言集成示例 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
+
+---
+
+## 许可
+
+本项目采用 [MIT 许可证](LICENSE)。
+
+## 免责声明
+
+AI-Root 以 `LocalSystem` 身份执行命令，**持有令牌即等同于拥有 SYSTEM 命令执行权**。
+请仅在自有、受控的主机上使用，并确保：
+
+- 令牌不被提交到仓库、写入日志或通过不安全通道传输；
+- 数据目录 ACL 保持 `SYSTEM(F) + Administrators(F) + 安装用户(R)`（安装脚本会自检）；
+- 定期用 `AI-Root rotate-token` 轮换令牌。
+
+使用者须自行确保其使用方式符合所在地区的法律法规与目标系统的服务条款。
