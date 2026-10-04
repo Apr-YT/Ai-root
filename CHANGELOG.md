@@ -79,6 +79,8 @@
 
 ## [0.9.0] — 2026-08-28
 
+> `0.9.0` 为 1.0.0 之前的开发里程碑，**未发布过 Release**，故无 tag 链接。
+
 ### Added
 
 - **令牌轮转**：`rotate_token()` 支持安全轮换，服务端按文件 mtime 自动热加载。
@@ -100,4 +102,3 @@
 
 [Unreleased]: https://github.com/Apr-YT/Ai-root/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/Apr-YT/Ai-root/releases/tag/v1.0.0
-[0.9.0]: https://github.com/Apr-YT/Ai-root/releases/tag/v0.9.0
