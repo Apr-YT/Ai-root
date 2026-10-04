@@ -87,52 +87,97 @@ $env:RUSTUP_HOME = $rustupRoot
 $env:CARGO_HOME  = Join-Path $rustRoot "cargo"
 
 # ---- 1) 选择 target ----
-$msvcDir = Join-Path $toolchainsDir "stable-x86_64-pc-windows-msvc"
-$gnuDir  = Join-Path $toolchainsDir "stable-x86_64-pc-windows-gnu"
-
-$TARGET = $null
-if (Test-Path $msvcDir) {
-    # msvc 需 link.exe 才能真正链接; 仅工具链存在但无 VS Build Tools 仍会失败。
-    # 探测: 先查 vswhere(最快最准), 再回退有限深度扫描。
-    $linkExe = $null
-    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (Test-Path $vswhere) {
-        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
-        if ($vsPath) {
-            $linkExe = Get-ChildItem (Join-Path $vsPath "VC\Tools\MSVC") -Directory -ErrorAction SilentlyContinue |
-                Sort-Object Name -Descending |
-                ForEach-Object { Join-Path $_.FullName "bin\Hostx64\x64\link.exe" } |
-                Where-Object { Test-Path $_ } | Select-Object -First 1
-        }
+# ⚠ 判断依据是「toolchains\ 下**是否装了该 target**」, 而非「是否存在同名目录」。
+#   原因见下方步骤 2 的说明: host 工具链名不必等于目标三元组。
+#   另外可用 AIROOT_TARGET 强制指定目标(与 build.sh 保持一致)。
+$allToolchains = Get-ChildItem $toolchainsDir -Directory -ErrorAction SilentlyContinue
+function Test-AnyToolchainHasTarget {
+    param([string]$Target)
+    foreach ($d in $allToolchains) {
+        if (Test-Path (Join-Path $d.FullName "lib\rustlib\$Target")) { return $true }
     }
-    if (-not $linkExe) {
-        $linkExe = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio" -Depth 6 -Filter link.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-    }
-    if ($linkExe) { $TARGET = "x86_64-pc-windows-msvc" }
+    return $false
 }
-if (-not $TARGET -and (Test-Path $gnuDir)) { $TARGET = "x86_64-pc-windows-gnu" }
+
+$TARGET = $env:AIROOT_TARGET
+if (-not $TARGET) {
+    # 默认优先 msvc(Windows 标准路径), 但需 link.exe 才能真正链接;
+    # 仅工具链存在而无 VS Build Tools 仍会失败, 故必须探测 link.exe。
+    if (Test-AnyToolchainHasTarget "x86_64-pc-windows-msvc") {
+        $linkExe = $null
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+            if ($vsPath) {
+                $linkExe = Get-ChildItem (Join-Path $vsPath "VC\Tools\MSVC") -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object Name -Descending |
+                    ForEach-Object { Join-Path $_.FullName "bin\Hostx64\x64\link.exe" } |
+                    Where-Object { Test-Path $_ } | Select-Object -First 1
+            }
+        }
+        if (-not $linkExe) {
+            $linkExe = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio" -Depth 6 -Filter link.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+        if ($linkExe) { $TARGET = "x86_64-pc-windows-msvc" }
+    }
+    if (-not $TARGET -and (Test-AnyToolchainHasTarget "x86_64-pc-windows-gnu")) {
+        $TARGET = "x86_64-pc-windows-gnu"
+    }
+}
 if (-not $TARGET) {
     Write-Error @"
-未找到可用工具链。
-  msvc 需: stable-x86_64-pc-windows-msvc 工具链 + Visual Studio Build Tools(提供 link.exe)
-  gnu  需: stable-x86_64-pc-windows-gnu 工具链 + MinGW binutils(提供 as.exe)
+未找到可用构建目标。
+  msvc 需: 已装 x86_64-pc-windows-msvc target + Visual Studio Build Tools(提供 link.exe)
+  gnu  需: 已装 x86_64-pc-windows-gnu target + MinGW binutils(提供 as.exe)
 
 推荐装 msvc(Windows 上 Rust 开发的标准做法, 无需额外配 binutils):
   rustup toolchain install stable-x86_64-pc-windows-msvc
   # 并安装 VS Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
 "@
 }
+Write-Host "[*] 目标平台: $TARGET"
 
 # ---- 2) 定位该 target 的 cargo ----
 # 直连 toolchain 内的真实 cargo.exe, 绕开 CARGO_HOME\bin 下的 rustup shim
 # (shim 是 rustup.exe 的硬链接, 转发时可能裁剪子进程 PATH)。
-$toolchainDir = Join-Path $toolchainsDir "stable-$TARGET"
+#
+# ⚠ host 工具链名**不必**等于目标三元组(CI 上验证的坑):
+#   `rustup toolchain install stable --target x86_64-pc-windows-gnu`
+#   装出的是 stable-x86_64-pc-windows-**msvc**(host 不变) + 附加 gnu target。
+#   此时 toolchains\ 下**没有** stable-x86_64-pc-windows-gnu 目录, 但用 msvc 的
+#   cargo 做 cross-compile 完全可行。故按「已装该 target」挑选, 而非按目录名硬匹配。
+function Test-ToolchainHasTarget {
+    param([string]$ToolchainDir, [string]$Target)
+    return (Test-Path (Join-Path $ToolchainDir "lib\rustlib\$Target"))
+}
+$toolchainDir = $null
+# a) 首选同名 host(如本机 gnu-only 环境)
+$sameName = Join-Path $toolchainsDir "stable-$TARGET"
+if ((Test-Path (Join-Path $sameName "bin\cargo.exe")) -and (Test-ToolchainHasTarget $sameName $TARGET)) {
+    $toolchainDir = $sameName
+}
+# b) 否则扫描所有 toolchain, 取第一个已装该 target 的(CI 的 cross-compile 情形)
+if (-not $toolchainDir) {
+    foreach ($d in (Get-ChildItem $toolchainsDir -Directory -ErrorAction SilentlyContinue)) {
+        if ((Test-Path (Join-Path $d.FullName "bin\cargo.exe")) -and (Test-ToolchainHasTarget $d.FullName $TARGET)) {
+            $toolchainDir = $d.FullName
+            break
+        }
+    }
+}
+if (-not $toolchainDir) {
+    Write-Error @"
+未找到可编 $TARGET 的工具链。请确认已安装对应 target:
+  rustup target add $TARGET
+"@
+}
 $cargoExe = Join-Path $toolchainDir "bin\cargo.exe"
 if (-not (Test-Path $cargoExe)) {
     $cargoExe = (Get-Command cargo -ErrorAction SilentlyContinue).Source
     if ($cargoExe) { Write-Host "[!] 未找到 toolchain 内 cargo, 回退: $cargoExe" -ForegroundColor Yellow }
 }
 if (-not $cargoExe) { Write-Error "未找到 cargo, 请先安装 Rust (rustup)" }
+Write-Host "[*] 工具链: $toolchainDir"
 
 # ---- 3) gnu target: 注入完整 MinGW binutils ----
 if ($TARGET -eq "x86_64-pc-windows-gnu") {
