@@ -11,7 +11,7 @@
 #    - rustup + 任一下载目标（推荐 msvc：装 VS Build Tools 即可，无需额外配置）
 #
 #  环境变量（可选，均有自动探测，正常无需设置）
-#    AIROOT_RUST_ROOT      rust 根目录（含 cargo/ 与 rustup/）
+#    AIROOT_RUST_ROOT      rust 根目录（含 cargo/ 与 rustup/；非标准安装位置时用）
 #    AIROOT_TARGET         目标三元组（默认 x86_64-pc-windows-gnu）
 #    AIROOT_TOOLCHAIN      首选 host 工具链名（默认 stable-<target>；找不到会自动
 #                          改用其它已装该 target 的工具链，故一般不设）
@@ -21,9 +21,10 @@
 #
 # 设计原则
 #   一、**优先向系统自省，而非猜测路径**。rust 根由 `rustup show home` 反推，
-#       工具链在 `toolchains/` 下按「是否已装目标 target」挑选 —— 只要 rustup
-#       在 PATH 中即可自举，不需要任何硬编码路径。硬编码的 "D:/Kiln/..." 仅作为
-#       **最后兜底**保留（本机私有位置；他人机器上不命中也不影响）。
+#       cargo 由 `rustup which cargo` 直接定位，工具链在 `toolchains/` 下按
+#       「是否已装目标 target」挑选 —— 只要 rustup 在 PATH 中即可自举。
+#       仓库内**不硬编码任何具体盘符路径**；非标准安装位置请用 AIROOT_RUST_ROOT
+#       / MINGW_BINUTILS_BIN 告知，把"环境相关配置"留在环境里。
 #   二、配置下沉到 .cargo/config.toml（target-dir 等稳定配置的唯一来源）。
 #       本脚本只做与机器相关的事：定位工具链、注入 binutils、调 cargo。
 #   三、**报错必须可行动**：依赖缺失时直接打印可复制执行的安装命令，
@@ -79,10 +80,21 @@ if [ -z "$RUSTUP_BIN" ]; then
     if [ -x "$cand" ]; then RUSTUP_BIN="$cand"; break; fi
   done
 fi
-# 最后兜底：本机私有位置（他人机器不命中）
+# 兜底：常见默认安装位置（rustup 官方安装器的默认家目录）
 if [ -z "$RUSTUP_BIN" ]; then
-  for cand in "D:/Kiln/rust/cargo/bin/rustup.exe" "D:/software/rust/cargo/bin/rustup.exe"; do
+  for cand in "$HOME/.cargo/bin/rustup.exe" "$USERPROFILE/.cargo/bin/rustup.exe"; do
     if [ -x "$(to_posix "$cand")" ]; then RUSTUP_BIN="$(to_posix "$cand")"; break; fi
+  done
+fi
+# 最后兜底：非标准安装位置（自定义 rust 根）用 AIROOT_RUST_ROOT 显式指定。
+# 仓库内**不硬编码任何具体盘符路径** —— 部署位置属于环境相关配置。
+# 注意：rustup.exe 通常在 <root>/cargo/bin/ 下（与 CARGO_HOME 共用 bin 目录）。
+if [ -z "$RUSTUP_BIN" ] && [ -n "${AIROOT_RUST_ROOT:-}" ]; then
+  for cand in "$(to_posix "$AIROOT_RUST_ROOT")/cargo/bin/rustup.exe" \
+              "$(to_posix "$AIROOT_RUST_ROOT")/rustup/bin/rustup.exe" \
+              "$(to_posix "$AIROOT_RUST_ROOT")/bin/rustup.exe" \
+              "$(to_posix "$AIROOT_RUST_ROOT")/rustup.exe"; do
+    if [ -x "$cand" ]; then RUSTUP_BIN="$cand"; break; fi
   done
 fi
 
@@ -98,7 +110,7 @@ fi
 #
 # ⚠ 关键教训一：**所有候选都必须校验真实存在**才采用。
 #   `rustup show home` 只是**回显 $RUSTUP_HOME 环境变量**，并不验证其存在性；
-#   新装/迁移后会话里常残留陈旧值（如 D:\software\rust\rustup，目录已删），
+#   新装/迁移后会话里常残留陈旧值（如指向已删除的旧 rust 目录），
 #   若直接采信会得到"工具链不存在"的假结论。凡涉及环境变量的候选一律校验。
 #
 # ⚠ 关键教训二（CI 上惨痛验证）：**host toolchain 名 ≠ 目标三元组**。
@@ -111,12 +123,12 @@ fi
 #
 # ⚠ 关键教训三（CI 上二次验证）：**不要假设 rust 根目录结构**。
 #   rustup 有两种常见布局：
-#     自定义布局(本机)   : D:\Kiln\rust\{cargo, rustup}         ← 无点前缀, 二者平级
-#     默认布局(CI/新人)  : %USERPROFILE%\{.cargo, .rustup}       ← 隐藏目录, 二者平级
+#     自定义布局         : <root>\{cargo, rustup}               ← 无点前缀, 二者平级
+#     默认布局(官方安装器): %USERPROFILE%\{.cargo, .rustup}      ← 隐藏目录, 二者平级
 #   二者**唯一的共同点是「cargo 与 rustup 是平级目录」，但绝不是 cargo/ 与 rustup/ 这样的固定名**。
 #   早期实现把 `<root>/cargo` 与 `<root>/rustup` 当固定结构写死 → 在 CI 上
-#   `dirname($RUSTUP_HOME)=C:\Users\runneradmin` 下根本没有 `cargo\` 子目录，
-#   四个候选全部落空。**本机恰好命中自定义布局，所以本机怎么测都测不出。**
+#   `dirname($RUSTUP_HOME)=C:\Users\<runner>` 下根本没有 `cargo\` 子目录，
+#   所有候选全部落空。**自定义布局的机器恰好命中，所以这类机器怎么测都测不出。**
 #
 #   → 正确做法：**直接问 rustup 要路径**（`rustup which cargo`），它返回当前
 #     活动 toolchain 的真实 cargo.exe 绝对路径，天然适配任何布局与任何 host 名。
@@ -189,9 +201,9 @@ if [ -z "$TOOLCHAIN_BIN" ]; then
   done
 fi
 
-# 1d) 最后兜底：本机私有位置（他人机器上不命中，仅为本机省一次自省）
+# 1d) 兜底：rustup 官方安装器的默认家目录
 if [ -z "$TOOLCHAIN_BIN" ]; then
-  for rh in "D:/Kiln/rust/rustup" "D:/software/rust/rustup" "$HOME/.rustup"; do
+  for rh in "$HOME/.rustup" "$USERPROFILE/.rustup"; do
     [ -d "$rh/toolchains" ] || continue
     if bin="$(find_toolchain_bin_in "$(to_posix "$rh")")"; then
       TOOLCHAIN_BIN="$bin"; CARGO_EXE_POSIX="$bin/cargo.exe"; break
@@ -201,7 +213,7 @@ fi
 
 if [ -z "$TOOLCHAIN_BIN" ]; then
   die "未找到可编 $TARGET_NAME 的 Rust 工具链。
-    已尝试: rustup which cargo、rustup show home、\$AIROOT_RUST_ROOT/\$RUSTUP_HOME/\$CARGO_HOME、本机兜底路径
+    已尝试: rustup which cargo、rustup show home、\$AIROOT_RUST_ROOT/\$RUSTUP_HOME/\$CARGO_HOME、默认安装位置
     请安装后重试：
       rustup target add $TARGET_NAME"
 fi
@@ -240,10 +252,19 @@ if [ "$TARGET_NAME" = "x86_64-pc-windows-gnu" ]; then
     fi
   fi
 
-  # 2b) 本机兜底候选（私有路径；他人机器不命中）
+  # 2b) 兜底：常见 MSYS2 / MinGW 安装位置
   if [ -z "$BINUTILS_BIN" ]; then
-    for cand in "D:/Kiln/mingw64/bin" "D:/Kiln/mingw-binutils/bin"; do
+    for cand in "/c/msys64/mingw64/bin" "/mingw64/bin" "/c/mingw64/bin"; do
       if [ -x "$(to_posix "$cand")/as.exe" ]; then BINUTILS_BIN="$cand"; break; fi
+    done
+  fi
+
+  # 2c) 兜底：与 rust 根同级的自定义布局（AIROOT_RUST_ROOT=D:\x\rust → D:\x\mingw64\bin）
+  #      非标准安装位置用环境变量告知，仓库内不硬编码任何盘符路径。
+  if [ -z "$BINUTILS_BIN" ] && [ -n "${AIROOT_RUST_ROOT:-}" ]; then
+    rr_parent="$(dirname "$(to_posix "$AIROOT_RUST_ROOT")")"
+    for cand in "$rr_parent/mingw64/bin" "$rr_parent/mingw-binutils/bin" "$rr_parent/mingw/bin"; do
+      if [ -x "$cand/as.exe" ]; then BINUTILS_BIN="$cand"; break; fi
     done
   fi
 

@@ -20,8 +20,8 @@
 # 只带 dlltool.exe/ld.exe, **缺 as.exe**, 无法独立完成链接。
 # binutils 探测顺序:
 #   a) $env:MINGW_BINUTILS_BIN (显式指定)
-#   b) D:\Kiln\mingw64\bin (本机当前实际位置)
-#   c) D:\Kiln\mingw-binutils\bin (旧位置, 保留兼容)
+#   b) 常见 MSYS2 / MinGW-w64 安装位置
+#   c) 从 PATH 中已存在的 dlltool/as 反推所在目录
 
 $ErrorActionPreference = "Stop"
 # cargo 把编译进度写到 stderr; PowerShell 在 "Stop" 下会把原生命令的 stderr 首行
@@ -31,7 +31,7 @@ $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 
 # ---- 0) 定位 rustup 根目录 ----
-# 顺序: 显式环境变量 → rustup 自省 → 常见位置 → 本机私有位置兜底
+# 顺序: 显式环境变量 → rustup 自省 → 常见默认位置
 #
 # ⚠ 所有候选必须**校验 toolchains 目录确实存在**后才采用。
 #   `rustup show home` 只是回显 $RUSTUP_HOME, 并不验证存在性;
@@ -50,12 +50,9 @@ function Resolve-RustupRoot {
         if ($home) { $candidates += $home }
     }
 
-    # 3) 常见默认位置
+    # 3) 常见默认位置(rustup 官方安装器的默认家目录)
     $candidates += (Join-Path $env:USERPROFILE ".rustup")
-
-    # 4) 本机私有位置兜底(他人机器上不命中)
-    $candidates += "D:\Kiln\rust\rustup"
-    $candidates += "D:\software\rust\rustup"
+    if ($env:HOME) { $candidates += (Join-Path $env:HOME ".rustup") }
 
     foreach ($c in $candidates) {
         if ($c -and (Test-Path (Join-Path $c "toolchains"))) { return $c }
@@ -67,7 +64,7 @@ $rustupRoot = Resolve-RustupRoot
 if (-not $rustupRoot) {
     Write-Error @"
 未找到 rustup 根目录(含 toolchains 子目录)。
-已尝试: AIROOT_RUST_ROOT, RUSTUP_HOME, rustup 自省, %USERPROFILE%\.rustup, 本机兜底路径
+已尝试: AIROOT_RUST_ROOT, RUSTUP_HOME, rustup 自省, %USERPROFILE%\.rustup
 
 请先安装 Rust(含 rustup):
   winget install Rustlang.Rustup
@@ -198,9 +195,10 @@ if ($TARGET -eq "x86_64-pc-windows-gnu") {
     # PATH 里已有的 as.exe(如 MSYS2/系统装的 binutils)
     $asOnPath = Get-Command as.exe -ErrorAction SilentlyContinue
     if ($asOnPath) { $binutilsCandidates += (Split-Path -Parent $asOnPath.Source) }
-    # 本机私有位置兜底(他人机器上不命中)
-    $binutilsCandidates += "D:\Kiln\mingw64\bin"
-    $binutilsCandidates += "D:\Kiln\mingw-binutils\bin"
+    # 常见 MSYS2 / MinGW-w64 安装位置
+    foreach ($cand in @("C:\msys64\mingw64\bin", "C:\msys32\mingw32\bin", "C:\mingw64\bin")) {
+        $binutilsCandidates += $cand
+    }
     $binutils = $binutilsCandidates | Where-Object { $_ -and (Test-Path (Join-Path $_ "as.exe")) } | Select-Object -First 1
     if (-not $binutils) {
         Write-Error @"

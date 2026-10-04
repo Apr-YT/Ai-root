@@ -9,7 +9,7 @@
 
 | 情况 | 怎么做 |
 |---|---|
-| **只想用**（要一个能跑的 `AI-Root.exe`） | 直接取 `D:\Finished product\AI-Root\AI-Root.exe`，**无需构建**。部署见 [§2](#2-部署仅需一次管理员)。 |
+| **只想用**（要一个能跑的 `AI-Root.exe`） | 下载 Release 中的 `AI-Root.exe`，**无需构建**。部署见 [§2](#2-部署仅需一次管理员)。 |
 | **要改代码 / 自己构建** | 见下方「从源码构建」。 |
 
 ### 从源码构建
@@ -57,10 +57,9 @@ bash build.sh
 ## 最近更新（2026-10-04）
 
 ### 构建
-- **仓库迁至纯 ASCII 路径** `D:\project\workbuddy\tools\AI-Root`，根治 MinGW `ld`/`dlltool` 无法处理含中文的产物路径问题。
+- **仓库须置于纯 ASCII 路径**（MinGW `ld`/`dlltool` 无法处理含中文的产物路径 —— 见 §7）。
 - **构建脚本大幅简化**，并把配置下沉到 `.cargo/config.toml`（单一事实来源）。
-- **脚本改为「向系统自省」而非猜测路径**：rust 根由 `rustup show home` 反推，不再依赖硬编码位置；
-  本机私有路径仅作最后兜底，**他人机器上不命中也不影响**。
+- **脚本改为「向系统自省」而非猜测路径**：rust 根由 `rustup show home` 反推，cargo 由 `rustup which cargo` 直接定位，不再依赖任何硬编码位置。
 - **依赖自检与可行动报错**：缺 rustup / 缺 toolchain / 缺 binutils 时，直接打印可复制执行的修复命令。
 - 修复 `build.ps1` 不回写 `CARGO_HOME`/`RUSTUP_HOME` 的缺陷（曾导致两脚本使用不同 registry 源）。
 
@@ -162,7 +161,7 @@ powershell -ExecutionPolicy Bypass -File install-service.ps1
 
 | 项 | 路径 |
 |---|---|
-| 服务二进制 | `D:\Kiln\AI-Root\AI-Root.exe` |
+| 服务二进制 | `%ProgramData%\AI-Root\AI-Root.exe`（可用 `AIROOT_DEPLOY_DIR` 覆盖） |
 | 全局包装器 | `C:\Windows\AI-Root.cmd` |
 | 数据/令牌目录 | `C:\ProgramData\AI-Root\` |
 | 令牌文件 | `C:\ProgramData\AI-Root\token.txt` |
@@ -294,8 +293,8 @@ AI-Root run -- <原始命令>
 示例：
 
 ```jsonc
-{"ts":"2026-08-06 19:30:00","type":"exec_start","caller":"king\\AprYT","pid":32836,"cmd":"whoami","timeout_ms":60000}
-{"ts":"2026-08-06 19:30:00","type":"exec_done","caller":"king\\AprYT","pid":32836,"cmd":"whoami","exit":0,"duration_ms":52,"out_preview":"nt authority\\system\r\n"}
+{"ts":"2026-08-06 19:30:00","type":"exec_start","caller":"MACHINE\\user","pid":32836,"cmd":"whoami","timeout_ms":60000}
+{"ts":"2026-08-06 19:30:00","type":"exec_done","caller":"MACHINE\\user","pid":32836,"cmd":"whoami","exit":0,"duration_ms":52,"out_preview":"nt authority\\system\r\n"}
 ```
 
 > 与 `exec.log`（审计：命令+退出码，终身保留）互补：事件流含执行中/完成状态、时长与输出摘要，文件超过 2MB 自动轮转（改名 `.1` 再写）。
@@ -411,7 +410,7 @@ SYSTEM 只剩**只读**，于是以 LocalSystem 运行的服务**无法再写** 
 
 | 主体 | 权限 |
 |---|---|
-| `KING\64391`（安装用户） | `(OI)(CI)(R)` |
+| `<机器名>\<用户名>`（安装用户） | `(OI)(CI)(R)` |
 | `BUILTIN\Administrators` | `(OI)(CI)(F)` |
 | `NT AUTHORITY\SYSTEM` | `(OI)(CI)(F)` ✅ |
 
@@ -491,9 +490,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 |---|---|---|
 | rust 根 | `rustup show home` 反推（**并校验 toolchain 真实存在**） | 高——只要 rustup 在 PATH |
 | cargo | 直连 toolchain 内的 `cargo.exe`（绕开 rustup shim） | 高 |
-| binutils | `MINGW_BINUTILS_BIN` → PATH 中的 `as.exe` → 本机兜底 | 中——gnu 需用户提供 |
+| binutils | `MINGW_BINUTILS_BIN` → PATH 中的 `as.exe` → 常见 MSYS2/MinGW 安装位置 | 中——gnu 需用户提供 |
 
-> 硬编码的 `D:\Kiln\...` 等本机私有路径**仅作最后兜底**，他人机器上不命中也不影响。
+> 所有候选路径都会经过**存在性校验**后才采用；未命中任何候选时会打印可直接复制执行的修复命令，
+> 而不是以"文件不存在"的形式在链接期才炸掉。
 >
 > ⚠ **`rustup show home` 只回显 `$RUSTUP_HOME`，不验证其存在性**。新装/迁移后会话常残留陈旧值
 > （指向已删目录），直接采信会得到"工具链不存在"的假结论。故**所有候选都必须校验后才采用**。
@@ -511,22 +511,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 
 > ⚠ **gnu 构建的硬约束**（2026-10-04 实测定位）：
 >
-> 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。两个脚本按 `MINGW_BINUTILS_BIN`（环境变量）→ `PATH` 中已有 `as.exe` → 本机兜底顺序**自动探测**。安装方式见脚本报错提示（MSYS2 或清华镜像）。
-> 2. **Git Bash 下 PATH 只认 POSIX 形式**。把 `D:/Kiln/...` 或 `D:\Kiln\...` 写进 `PATH` 后，`command -v dlltool.exe` / `which` 一律查不到（不是 Permission denied，是彻底找不到），导致 cargo 回落到 `CARGO_HOME\bin` 的 rustup shim，最终报 `error calling dlltool 'dlltool.exe': program not found`。`build.sh` 用 `to_posix()` 统一转换，并直连 toolchain 内的真实 `cargo.exe`；`build.ps1` 为原生 Windows 路径语义，无此问题。
+> 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。两个脚本按 `MINGW_BINUTILS_BIN`（环境变量）→ `PATH` 中已有 `as.exe` → 常见 MSYS2/MinGW 安装位置的顺序**自动探测**。安装方式见脚本报错提示（MSYS2 或清华镜像）。
+> 2. **Git Bash 下 PATH 只认 POSIX 形式**。把 `D:/...` 或 `D:\...` 写进 `PATH` 后，`command -v dlltool.exe` / `which` 一律查不到（不是 Permission denied，是彻底找不到），导致 cargo 回落到 `CARGO_HOME\bin` 的 rustup shim，最终报 `error calling dlltool 'dlltool.exe': program not found`。`build.sh` 用 `to_posix()` 统一转换，并直连 toolchain 内的真实 `cargo.exe`；`build.ps1` 为原生 Windows 路径语义，无此问题。
 >
 > 📌 **关于「仓库路径必须纯 ASCII」**（2026-10-04 根治）：
-> 仓库曾位于 `D:\project\workbuddy\工具\AI-Root`（含中文「工具」）。MinGW 的 `ld` 按 ANSI 代码页解释路径参数，
+> 仓库若位于含中文的路径（如 `...\工具\AI-Root`）。MinGW 的 `ld` 按 ANSI 代码页解释路径参数，
 > 因此当**产物落进中文路径**时报「文件存在却找不到」：
 > ```
-> ld.exe: cannot find D:\project\workbuddy\工具\AI-Root\target\release\deps\libsyn-xxx.rlib
+> ld.exe: cannot find <中文路径>\target\release\deps\libsyn-xxx.rlib
 > No such file or directory
 > ```
-> （注意错误里的 `工具` **显示正常**，但 `ld` 实际按 GBK 解读 UTF-8 字节，故找不到真实文件。最先炸的是 proc-macro 依赖，
+> （注意错误里的中文 **显示正常**，但 `ld` 实际按 GBK 解读 UTF-8 字节，故找不到真实文件。最先炸的是 proc-macro 依赖，
 > 因其必须先编成 `.dylib` 供 host 加载，这一步走 `ld`。）
 >
-> 当时用**外部 `CARGO_TARGET_DIR=D:\AI-Root-target` + ASCII 前置校验**绕过，代价是脚本里再添一整套绕行机制。
-> **根治方式：把仓库迁到纯 ASCII 路径**（现为 `D:\project\workbuddy\tools\AI-Root`）——绕行机制全部删除，脚本随之瘦身。
-> 经验：**不要用脚本对抗路径问题，要让路径不再有问题**。若日后必须迁回非 ASCII 路径，外部 ASCII `CARGO_TARGET_DIR` 仍是有效的临时缓解。
+> 可用**外部 `CARGO_TARGET_DIR=<纯 ASCII 目录>` + ASCII 前置校验**临时绕过，代价是脚本里再添一整套绕行机制。
+> **根治方式：把仓库放在纯 ASCII 路径下** —— 绕行机制全部删除，脚本随之瘦身。
+> 经验：**不要用脚本对抗路径问题，要让路径不再有问题**。若日后必须使用非 ASCII 路径，外部 ASCII `CARGO_TARGET_DIR` 仍是有效的临时缓解。
 
 **CI 双 job**（`.github/workflows/ci.yml`，`windows-latest`）：
 
@@ -584,30 +584,29 @@ cargo test --release --target x86_64-pc-windows-gnu
 > - 输出截断（1MB）、GBK 回退解码
 
 > 📌 **现状核对（2026-10-04 重构后）**：
-> - **源码仓库已迁至纯 ASCII 路径** `D:\project\workbuddy\tools\AI-Root`（原 `D:\project\workbuddy\工具\AI-Root`，因 MinGW `ld` 无法正确处理含中文的产物路径 —— 见 §7）。
+> - **源码仓库须置于纯 ASCII 路径**（MinGW `ld` 无法正确处理含中文的产物路径 —— 见 §7）。
 > - 构建产物落**仓库内** `target\x86_64-pc-windows-gnu\release\AI-Root.exe`（不再使用外部 `CARGO_TARGET_DIR`）。
-> - 服务部署副本：`D:\Kiln\AI-Root\AI-Root.exe`（服务已安装并运行）。
-> - 交付目录**已创建**：`D:\project\workbuddy\tools\AI-Root-build\`、`D:\Finished product\AI-Root\{AI-Root.exe, docs\README.md}`。
-> - 上述**四处 exe 哈希已校验一致**。
+> - 服务部署副本：`%ProgramData%\AI-Root\AI-Root.exe`。
+> - 交付目录：仓库内构建后按需复制即可。
 
-**产物交付目录 `AI-Root-build\`**（与源码平级，`D:\project\workbuddy\tools\AI-Root-build\`）：
+**构建产物**（`<仓库>\target\<target>\release\AI-Root.exe`）：
 
 | 文件 | 说明 |
 |---|---|
-| `AI-Root.exe` | 纯终端服务端（部署用，`update` 热更新到 `D:\Kiln\AI-Root\`） |
+| `AI-Root.exe` | 纯终端服务端（部署用，`update` 热更新到 `%ProgramData%\AI-Root\`） |
 
-**正式成品包**（2026-08-18 起，与 GG-Ghost 同规：exe + docs/）：
+**成品包组织**（exe + docs/）：
 
 ```
-D:\Finished product\AI-Root\
+<交付目录>\
 ├── AI-Root.exe        # 交付用二进制（与部署/构建产物一致）
 └── docs\README.md     # 本文档
 ```
 
-取用流程：`D:\Finished product\AI-Root\AI-Root.exe` → `AI-Root update <该exe路径>`（服务在跑时热更新，无需管理员）。
+取用流程：下载/构建得到 `AI-Root.exe` → `AI-Root update <该exe路径>`（服务在跑时热更新，无需管理员）。
 
-**部署流程（务必现场重建，勿复用早前构建）**：工作树存在并发编辑，`AI-Root-build` 中的旧二进制可能滞后于源码（实测同尺寸但哈希不同）。固定流程：
-`bash build.sh`（本机 gnu；CI 走 `build.ps1` 自动选 msvc）→ 复制到 `AI-Root-build` → `AI-Root update <AI-Root-build\AI-Root.exe>` → 校验部署哈希一致 + `run --json whoami`=SYSTEM。
+**部署流程（务必现场重建，勿复用早前构建）**：工作树存在并发编辑，旧的二进制可能滞后于源码（实测同尺寸但哈希不同）。固定流程：
+`bash build.sh`（本机 gnu；CI 走 `build.ps1` 自动选 msvc）→ `AI-Root update <新构建的 AI-Root.exe>` → 校验部署哈希一致 + `run --json whoami`=SYSTEM。
 
 **CI**：`.github/workflows/ci.yml` 在 GitHub Actions `windows-latest` 上跑 msvc + gnu 双 job（提交到 main、PR 或手动 `workflow_dispatch` 触发），详见第 7 节。
 

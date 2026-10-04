@@ -9,8 +9,8 @@
 #   哪、把它交给 cargo"这一件真正与机器相关的事。
 #
 # 前置（为什么现在能这么干净）：
-#   仓库已迁至纯 ASCII 路径 D:\project\workbuddy\tools\AI-Root。
-#   此前路径含中文「工具」，MinGW 的 ld/dlltool 按 ANSI 代码页解释路径导致
+#   仓库须置于纯 ASCII 路径下（例如 D:\src\AI-Root）。
+#   若路径含中文（如「工具」），MinGW 的 ld/dlltool 会按 ANSI 代码页解释路径，导致
 #   "cannot find ...\工具\...\libsyn-xxx.rlib"（文件存在却找不到），
 #   因而被迫引入外部 CARGO_TARGET_DIR + ASCII 校验等一整套绕行机制。路径 ASCII 化后
 #   这些机制全部不再需要 —— 直接用仓库内默认的 target/ 即可。
@@ -26,7 +26,7 @@ target-dir = "target"
 [target.x86_64-pc-windows-gnu]
 # gnu 目标的链接器与工具链由 PATH 中注入的完整 MinGW binutils 提供。
 # 不在此处硬编码 linker 路径 —— 因为 binutils 位置是本机相关的
-# （本机曾在 D:\Kiln\mingw-binutils 与 D:\Kiln\mingw64 之间变更），
+# （不同机器上可能在 msys64\mingw64、mingw-w64 或系统 PATH 的不同位置），
 # 硬编码会再次引入"路径漂移即构建失败"的脆弱性。由脚本探测并注入 PATH。
 #
 # 说明：rustup 自带的 self-contained 目录缺 as.exe，无法独立完成链接，

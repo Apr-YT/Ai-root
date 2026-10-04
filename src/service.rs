@@ -17,11 +17,31 @@ use crate::common;
 use crate::server;
 use crate::winapi_raw;
 
-/// 将自身部署到 D:\Kiln\AI-Root 并在 C:\Windows 写入 AI-Root.cmd 包装器，
+/// 解析部署目录（服务副本与全局包装器的落地位置）。
+///
+/// 优先级：
+///   1) 环境变量 `AIROOT_DEPLOY_DIR`（便于自定义/多实例/CI）
+///   2) 通用默认值 `%ProgramData%\AI-Root`（机器级、非用户级、SYSTEM 可写）
+///
+/// 之所以不写死在源码里某个盘符路径：部署位置属于**环境相关配置**，
+/// 硬编码会把某台机器的目录习惯带进发布物，也让他人无法按需调整。
+fn deploy_dir() -> std::path::PathBuf {
+    if let Ok(custom) = std::env::var("AIROOT_DEPLOY_DIR") {
+        if !custom.trim().is_empty() {
+            return std::path::PathBuf::from(custom);
+        }
+    }
+    // %ProgramData% 默认即 C:\ProgramData；取不到时退化为 C:\ProgramData。
+    let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
+    std::path::Path::new(&base).join("AI-Root")
+}
+
+/// 将自身部署到 [`deploy_dir`] 并在 C:\Windows 写入 AI-Root.cmd 包装器，
 /// 使 AI-Root 在任意目录、任意身份（含智能体非交互进程）下均可直接调用。
 /// 返回服务应指向的可执行文件路径（部署成功返回部署副本，失败回退到当前 exe）。
 fn deploy_global(src_exe: &std::path::Path) -> std::path::PathBuf {
-    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-Root");
+    let dir = deploy_dir();
+    let deploy_dir = dir.as_path();
     let deploy_exe = deploy_dir.join("AI-Root.exe");
     if let Err(e) = std::fs::create_dir_all(deploy_dir) {
         eprintln!("[warn] 无法创建部署目录 {}: {e}", deploy_dir.display());
@@ -158,7 +178,8 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ 服务已卸载: {}", common::SERVICE_NAME);
 
     // 清理部署残留（尽力而为，失败仅提示）
-    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-Root");
+    let dir = deploy_dir();
+    let deploy_dir = dir.as_path();
     if deploy_dir.exists() {
         let _ = std::fs::remove_dir_all(deploy_dir);
         println!("✓ 已清理部署目录: {}", deploy_dir.display());
@@ -410,7 +431,8 @@ pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::
     }
 
     // 2) 覆盖部署副本（与 install 的 deploy_global 同一路径）
-    let deploy_dir = std::path::Path::new("D:\\Kiln\\AI-Root");
+    let dir = deploy_dir();
+    let deploy_dir = dir.as_path();
     std::fs::create_dir_all(deploy_dir)?;
     let deploy_exe = deploy_dir.join("AI-Root.exe");
     // 自锁处理：update 若由部署 exe 自身运行，直接 copy 会因「映像被占用」报 os error 32。

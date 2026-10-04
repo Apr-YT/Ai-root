@@ -735,9 +735,9 @@ mod tests {
         // 变异验证实测：去掉 `*` 前缀后前 5 条断言全部通过 → 属真实漏检，故补此断言。
         // 后果：智能体（用户身份）读不到 token.txt，SYSTEM 中继整体不可用。
         //
-        // icacls 显示的是**账户名**（如 `KING\64391`）而非 SID，故需先解析出账户名。
-        // ⚠ 大小写不敏感比较：`whoami` 返回小写 `king\64391`，而 `icacls` 打印大写
-        // `KING\64391` —— Windows 账户名本身大小写不敏感，比较时必须归一化，
+        // icacls 显示的是**账户名**（如 `MACHINE\user`）而非 SID，故需先解析出账户名。
+        // ⚠ 大小写不敏感比较：`whoami` 返回小写 `machine\user`，而 `icacls` 打印大写
+        // `MACHINE\USER` —— Windows 账户名本身大小写不敏感，比较时必须归一化，
         // 否则会在代码完全正确时误报失败（实测踩过）。
         let user_name = current_user_name()
             .expect("测试环境应能取到当前用户名")

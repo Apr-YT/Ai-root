@@ -8,11 +8,11 @@
 # 注意：本文件必须以 UTF-8 **带 BOM** 保存。
 #   Windows PowerShell 5.1 默认按 ANSI(本机为 GBK/936) 读取 .ps1；
 #   无 BOM 的 UTF-8 文件里的中文会被解码成乱码，甚至因乱码产生 ? 与
-#   不配对的引号而导致语法错误。（本机实测踩过，见记忆）
+#   不配对的引号而导致语法错误。
 
-# 二进制路径与期望哈希：默认取仓库内构建产物（重构后不再用外部 CARGO_TARGET_DIR）。
+# 二进制路径与期望哈希：默认取仓库内构建产物（不再使用外部 CARGO_TARGET_DIR）。
 # 若从交付包安装，可显式覆盖，例如：
-#   .\install-service.ps1 -Exe "D:\Finished product\AI-Root\AI-Root.exe"
+#   .\install-service.ps1 -Exe "C:\some\path\AI-Root.exe"
 # 注：param() 必须是脚本中第一条可执行语句，故置于注释之后、其它语句之前。
 param(
     [string]$Exe = (Join-Path $PSScriptRoot "target\x86_64-pc-windows-gnu\release\AI-Root.exe"),
@@ -65,7 +65,8 @@ $svcBefore = Get-Service -Name "AI-Root" -ErrorAction SilentlyContinue
 if ($svcBefore) { Write-Host "  服务已存在: $($svcBefore.Status)" } else { Write-Host "  服务不存在（预期）" }
 Write-Host "  数据目录 ACL:"
 if (Test-Path "C:\ProgramData\AI-Root") { icacls "C:\ProgramData\AI-Root" | ForEach-Object { Write-Host "    $_" } }
-Write-Host ("  D:\Kiln\AI-Root 存在? " + (Test-Path "D:\Kiln\AI-Root"))
+$deployDir = if ($env:AIROOT_DEPLOY_DIR) { $env:AIROOT_DEPLOY_DIR } else { Join-Path $env:ProgramData "AI-Root" }
+Write-Host ("  $deployDir 存在? " + (Test-Path $deployDir))
 Write-Host ("  C:\Windows\AI-Root.cmd 存在? " + (Test-Path "C:\Windows\AI-Root.cmd"))
 
 # ---------- 3) 安装 ----------
@@ -86,7 +87,7 @@ if ($svc) {
     Bad "服务未注册"
 }
 
-if (Test-Path "D:\Kiln\AI-Root\AI-Root.exe") { Ok "已部署 D:\Kiln\AI-Root\AI-Root.exe" } else { Bad "部署副本缺失" }
+if (Test-Path (Join-Path $deployDir "AI-Root.exe")) { Ok "已部署 $(Join-Path $deployDir 'AI-Root.exe')" } else { Bad "部署副本缺失" }
 if (Test-Path "C:\Windows\AI-Root.cmd")      { Ok "已写全局包装器 C:\Windows\AI-Root.cmd" } else { Bad "全局包装器缺失" }
 
 Write-Host "  数据目录 ACL:"
