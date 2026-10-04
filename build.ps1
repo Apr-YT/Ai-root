@@ -82,9 +82,21 @@ $toolchainsDir = Join-Path $rustupRoot "toolchains"
 #   却没导出修正值 → cargo 继承旧值 → 该目录不存在就从 index.crates.io
 #   **重新下载全套 crate**(rsproxy 镜像配置失效), 于是 build.ps1 与 build.sh
 #   用了两套 registry(源路径不同 → 产物字节不一致)。
-$rustRoot = Split-Path -Parent $rustupRoot
+#
+# ⚠ 且**不能假设 cargo 目录名为 "cargo"**: rustup 有两种布局 ——
+#     自定义布局(本机): <parent>\{cargo, rustup}
+#     默认布局(CI/新人): %USERPROFILE%\{.cargo, .rustup}
+#   故此处按「与 rustup 同级、名为 cargo 或 .cargo」探测, 而非硬编码。
 $env:RUSTUP_HOME = $rustupRoot
-$env:CARGO_HOME  = Join-Path $rustRoot "cargo"
+$parent = Split-Path -Parent $rustupRoot
+$env:CARGO_HOME = $null
+foreach ($cc in @((Join-Path $parent "cargo"), (Join-Path $parent ".cargo"))) {
+    if (Test-Path $cc) { $env:CARGO_HOME = $cc; break }
+}
+if (-not $env:CARGO_HOME) {
+    # 兜底: 两个候选都不存在时, 仍导出一个合法路径避免 cargo 用陈旧值
+    $env:CARGO_HOME = Join-Path $parent "cargo"
+}
 
 # ---- 1) 选择 target ----
 # ⚠ 判断依据是「toolchains\ 下**是否装了该 target**」, 而非「是否存在同名目录」。

@@ -109,96 +109,123 @@ fi
 #   故此处**不能**要求目录名等于目标三元组 —— 只要有任一 toolchain 已装该
 #   target 即可。否则在 CI 上必然自省失败（曾因此让 gnu job 挂掉）。
 #
-# 内部统一用 POSIX 形式保存，仅在需要时转 Windows 形式，避免反斜杠转义问题。
-RUST_ROOT_POSIX=""
+# ⚠ 关键教训三（CI 上二次验证）：**不要假设 rust 根目录结构**。
+#   rustup 有两种常见布局：
+#     自定义布局(本机)   : D:\Kiln\rust\{cargo, rustup}         ← 无点前缀, 二者平级
+#     默认布局(CI/新人)  : %USERPROFILE%\{.cargo, .rustup}       ← 隐藏目录, 二者平级
+#   二者**唯一的共同点是「cargo 与 rustup 是平级目录」，但绝不是 cargo/ 与 rustup/ 这样的固定名**。
+#   早期实现把 `<root>/cargo` 与 `<root>/rustup` 当固定结构写死 → 在 CI 上
+#   `dirname($RUSTUP_HOME)=C:\Users\runneradmin` 下根本没有 `cargo\` 子目录，
+#   四个候选全部落空。**本机恰好命中自定义布局，所以本机怎么测都测不出。**
+#
+#   → 正确做法：**直接问 rustup 要路径**（`rustup which cargo`），它返回当前
+#     活动 toolchain 的真实 cargo.exe 绝对路径，天然适配任何布局与任何 host 名。
+#     这才是真正的"自省"，而非"猜结构"。
 
-# 校验：给一个候选根目录，是否具备可编 $TARGET_NAME 的 toolchain？
-# 返回 0 = 可用；同时把选中的 toolchain 目录名写入全局 TOOLCHAIN_DIR_NAME。
-TOOLCHAIN_DIR_NAME=""
-# 探测某 toolchain 是否已装目标 target（rustlib 下有对应目录即算装好）
+# 已确定的绝对路径（POSIX 形式），后续直接用
+CARGO_EXE_POSIX=""
+TOOLCHAIN_BIN=""
+
+# 探测某 toolchain 目录是否已装目标 target（rustlib 下有对应目录即算装好）
 toolchain_has_target() {
   [ -d "$1/lib/rustlib/$TARGET_NAME" ]
 }
-# 在给定 rust 根下挑一个可用 toolchain：优先同名 host，其次任意已装该 target 的
-pick_toolchain() {
-  local root="$1" tdirs d name
-  tdirs="$root/rustup/toolchains"
+
+# 在某个 RUSTUP_HOME 下找一个可编 $TARGET_NAME 的 toolchain；成功则输出其 bin 目录
+find_toolchain_bin_in() {
+  local rustup_home="$1" tdirs d
+  tdirs="$rustup_home/toolchains"
   [ -d "$tdirs" ] || return 1
-  # a) 首选 host 与目标同名（如本机 gnu-only 环境）
+  # a) 首选 host 与目标同名（本机 gnu-only 场景）
   if [ -x "$tdirs/$TOOLCHAIN_NAME/bin/cargo.exe" ] && toolchain_has_target "$tdirs/$TOOLCHAIN_NAME"; then
-    TOOLCHAIN_DIR_NAME="$TOOLCHAIN_NAME"; return 0
+    printf '%s' "$tdirs/$TOOLCHAIN_NAME/bin"; return 0
   fi
-  # b) 否则扫描所有 toolchain，取第一个已装该 target 的（CI 的 cross-compile 情形）
+  # b) 否则扫描，取第一个已装该 target 的（CI 的 cross-compile 场景）
   for d in "$tdirs"/*/; do
-    name="$(basename "$d")"
     if [ -x "$d/bin/cargo.exe" ] && toolchain_has_target "$d"; then
-      TOOLCHAIN_DIR_NAME="$name"; return 0
+      printf '%s' "${d%/}/bin"; return 0
     fi
   done
   return 1
 }
-# 校验一个候选 rust 根是否可用（同时确定 toolchain 目录）
-probe_rust_root() {
-  local root="$1"
-  [ -d "$root/cargo" ] || return 1
-  [ -d "$root/rustup/toolchains" ] || return 1
-  TOOLCHAIN_DIR_NAME=""
-  pick_toolchain "$root"
-}
 
-# 1a) 显式指定（最高优先级，用于覆盖探测结果）
-if [ -n "${AIROOT_RUST_ROOT:-}" ]; then
-  cand="$(to_posix "$AIROOT_RUST_ROOT")"
-  if probe_rust_root "$cand"; then
-    RUST_ROOT_POSIX="$cand"
-  else
-    die "AIROOT_RUST_ROOT=$AIROOT_RUST_ROOT 下未找到可编 $TARGET_NAME 的 toolchain。
-    请确认该目录含 cargo/ 与 rustup/，且已安装对应工具链：
-      rustup target add $TARGET_NAME"
+# 1a) 首选：直接问 rustup 当前活动 toolchain 的 cargo 在哪（最可靠，适配任意布局）
+#     注意：活动 toolchain 未必装了目标 target，故仍要校验；不通过则走 1b。
+rustup_which_cargo=""
+if [ -n "$RUSTUP_BIN" ]; then
+  rustup_which_cargo="$("$RUSTUP_BIN" which cargo 2>/dev/null | head -1 | tr -d '\r\n' || true)"
+fi
+if [ -n "$rustup_which_cargo" ] && [ -x "$(to_posix "$rustup_which_cargo")" ]; then
+  cand_bin="$(dirname "$(to_posix "$rustup_which_cargo")")"
+  if toolchain_has_target "$(dirname "$cand_bin")"; then
+    TOOLCHAIN_BIN="$cand_bin"
+    CARGO_EXE_POSIX="$(to_posix "$rustup_which_cargo")"
   fi
 fi
 
-# 1b) 让 rustup 自报家目录（可移植关键：不依赖硬编码路径）
-if [ -z "$RUST_ROOT_POSIX" ]; then
+# 1b) 活动 toolchain 不含目标 target 时：遍历 $RUSTUP_HOME 下的所有 toolchain
+if [ -z "$TOOLCHAIN_BIN" ]; then
   rustup_home="$("$RUSTUP_BIN" show home 2>/dev/null | head -1 | tr -d '\r\n' || true)"
   if [ -n "$rustup_home" ]; then
-    cand="$(dirname "$(to_posix "$rustup_home")")"
-    probe_rust_root "$cand" && RUST_ROOT_POSIX="$cand"
+    if bin="$(find_toolchain_bin_in "$(to_posix "$rustup_home")")"; then
+      TOOLCHAIN_BIN="$bin"; CARGO_EXE_POSIX="$bin/cargo.exe"
+    fi
   fi
 fi
 
-# 1c) 回退：从 CARGO_HOME/RUSTUP_HOME 推导（同样必须校验）
-if [ -z "$RUST_ROOT_POSIX" ]; then
-  for var in "${RUSTUP_HOME:-}" "${CARGO_HOME:-}"; do
+# 1c) 回退：从 AIROOT_RUST_ROOT / RUSTUP_HOME / CARGO_HOME 推导（同样校验后才采信）
+if [ -z "$TOOLCHAIN_BIN" ]; then
+  for var in "${AIROOT_RUST_ROOT:-}" "${RUSTUP_HOME:-}" "${CARGO_HOME:-}"; do
     [ -z "$var" ] && continue
-    cand="$(dirname "$(to_posix "$var")")"
-    if probe_rust_root "$cand"; then RUST_ROOT_POSIX="$cand"; break; fi
+    base="$(to_posix "$var")"
+    # 依次尝试：该目录本身当 rustup_home、其下 rustup/、其父目录下的常见名
+    for rh in "$base" "$base/rustup" "$(dirname "$base")/.rustup"; do
+      if [ -d "$rh/toolchains" ]; then
+        if bin="$(find_toolchain_bin_in "$rh")"; then
+          TOOLCHAIN_BIN="$bin"; CARGO_EXE_POSIX="$bin/cargo.exe"; break 2
+        fi
+      fi
+    done
   done
 fi
 
 # 1d) 最后兜底：本机私有位置（他人机器上不命中，仅为本机省一次自省）
-if [ -z "$RUST_ROOT_POSIX" ]; then
-  for cand in "D:/Kiln/rust" "D:/software/rust"; do
-    if probe_rust_root "$(to_posix "$cand")"; then RUST_ROOT_POSIX="$(to_posix "$cand")"; break; fi
+if [ -z "$TOOLCHAIN_BIN" ]; then
+  for rh in "D:/Kiln/rust/rustup" "D:/software/rust/rustup" "$HOME/.rustup"; do
+    [ -d "$rh/toolchains" ] || continue
+    if bin="$(find_toolchain_bin_in "$(to_posix "$rh")")"; then
+      TOOLCHAIN_BIN="$bin"; CARGO_EXE_POSIX="$bin/cargo.exe"; break
+    fi
   done
 fi
 
-if [ -z "$RUST_ROOT_POSIX" ]; then
+if [ -z "$TOOLCHAIN_BIN" ]; then
   die "未找到可编 $TARGET_NAME 的 Rust 工具链。
-    已尝试: AIROOT_RUST_ROOT、rustup 自省、\$CARGO_HOME/\$RUSTUP_HOME 推导、本机兜底路径
+    已尝试: rustup which cargo、rustup show home、\$AIROOT_RUST_ROOT/\$RUSTUP_HOME/\$CARGO_HOME、本机兜底路径
     请安装后重试：
-      rustup toolchain install stable --target $TARGET_NAME"
+      rustup target add $TARGET_NAME"
 fi
+
+TOOLCHAIN_DIR="$(dirname "$TOOLCHAIN_BIN")"          # .../toolchains/<name>
+TOOLCHAIN_DIR_NAME="$(basename "$TOOLCHAIN_DIR")"
+# rustup_home = toolchains 的父目录
+RUSTUP_HOME_POSIX="$(dirname "$(dirname "$TOOLCHAIN_BIN")")"
+# cargo home：与 rustup_home 平级，但名字可能是 cargo 或 .cargo
+CARGO_HOME_POSIX=""
+for cc in "$(dirname "$RUSTUP_HOME_POSIX")/cargo" "$(dirname "$RUSTUP_HOME_POSIX")/.cargo"; do
+  if [ -d "$cc" ]; then CARGO_HOME_POSIX="$cc"; break; fi
+done
 
 # 导出为大写盘符 Windows 形式（cargo 定位 registry 用；rustc 路径处理区分盘符大小写）
 to_win_upper() { printf '%s' "$1" | sed -E 's#^/([a-zA-Z])/#\U\1:/#' | tr '/' '\\'; }
-export CARGO_HOME="$(to_win_upper "$RUST_ROOT_POSIX/cargo")"
-export RUSTUP_HOME="$(to_win_upper "$RUST_ROOT_POSIX/rustup")"
+export RUSTUP_HOME="$(to_win_upper "$RUSTUP_HOME_POSIX")"
+if [ -n "$CARGO_HOME_POSIX" ]; then
+  export CARGO_HOME="$(to_win_upper "$CARGO_HOME_POSIX")"
+fi
 
-TOOLCHAIN_BIN="$RUST_ROOT_POSIX/rustup/toolchains/$TOOLCHAIN_DIR_NAME/bin"
-CARGO_EXE="$TOOLCHAIN_BIN/cargo.exe"
+CARGO_EXE="$CARGO_EXE_POSIX"
 [ -x "$CARGO_EXE" ] || die "cargo.exe 不可执行: $CARGO_EXE"
-RUST_ROOT="$(to_win_upper "$RUST_ROOT_POSIX")"
+RUST_ROOT="$(to_win_upper "$(dirname "$(dirname "$RUSTUP_HOME_POSIX")")")"
 
 # ---------- 2) gnu 目标：定位完整 MinGW binutils ----------
 # msvc 目标不需要（rustup 自带链完整）。
