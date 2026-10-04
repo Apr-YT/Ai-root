@@ -780,3 +780,233 @@ pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
 
     let _ = monitor.join();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ================= ct_eq：恒定时间令牌比较 =================
+
+    #[test]
+    fn ct_eq_matches_identical() {
+        assert!(ct_eq("abc", "abc"));
+        assert!(ct_eq("", ""), "两个空串应视为相等");
+    }
+
+    #[test]
+    fn ct_eq_rejects_different_length() {
+        // 长度不同直接判不等（不进入逐字节循环，故长度本身会泄露 —— 见下方说明）
+        assert!(!ct_eq("abc", "abcd"));
+        assert!(!ct_eq("", "a"));
+    }
+
+    #[test]
+    fn ct_eq_detects_single_byte_difference() {
+        let a = "a".repeat(64);
+        let mut b = a.clone();
+        // 逐位置翻转：任意单字节差异都必须被发现
+        for i in 0..a.len() {
+            let mut bytes = b.as_bytes().to_vec();
+            bytes[i] = if bytes[i] == b'a' { b'b' } else { b'a' };
+            b = String::from_utf8(bytes).unwrap();
+            assert!(!ct_eq(&a, &b), "第 {i} 字节差异未被检出");
+            b = a.clone();
+        }
+    }
+
+    #[test]
+    fn ct_eq_detects_difference_at_first_and_last_byte() {
+        // 首字节 / 末字节差异是最容易被「提前 return」实现漏掉的位置
+        let base = format!("{}Z", "a".repeat(63));
+        let mut first = base.clone().into_bytes();
+        first[0] = b'b';
+        let first = String::from_utf8(first).unwrap();
+        let mut last = base.clone().into_bytes();
+        let n = last.len() - 1;
+        last[n] = b'Y';
+        let last = String::from_utf8(last).unwrap();
+
+        assert!(!ct_eq(&base, &first));
+        assert!(!ct_eq(&base, &last));
+    }
+
+    #[test]
+    fn ct_eq_hex_tokens_like_real_use() {
+        // 贴近真实用法：64 位 hex 令牌
+        let t1 = "0123456789abcdef".repeat(4);
+        let t2 = "0123456789abcdee".repeat(4); // 倒数第 2 字符不同（每轮相同）
+        assert_eq!(t1.len(), 64);
+        assert!(ct_eq(&t1, &t1));
+        assert!(!ct_eq(&t1, &t2));
+    }
+
+    // ================= AuthThrottle：全局熔断 =================
+    // AuthThrottle 是局部 struct（AUTH_THROTTLE 只是承载它的 Mutex），
+    // 故可直接构造实例测试，不受全局状态污染影响。
+
+    #[test]
+    fn auth_throttle_starts_unlocked() {
+        let mut t = AuthThrottle::new();
+        assert!(!t.is_locked());
+    }
+
+    #[test]
+    fn auth_throttle_locks_at_threshold() {
+        // 注意：这里刻意**硬编码** 20，而非引用 AUTH_GLOBAL_FAIL_THRESHOLD。
+        // 若测试引用常量，则「改常量」这个变异无法被检出（测试会跟着一起变）。
+        // 这些数值是对外承诺的行为契约（README 有记载），变更应是有意识的决策。
+        const EXPECTED_THRESHOLD: u32 = 20;
+        assert_eq!(
+            AUTH_GLOBAL_FAIL_THRESHOLD, EXPECTED_THRESHOLD,
+            "全局熔断阈值变更需同步更新 README 与客户端预期"
+        );
+
+        let mut t = AuthThrottle::new();
+        // 前 N-1 次不触发
+        for i in 1..EXPECTED_THRESHOLD {
+            assert!(!t.record_fail(), "第 {i} 次失败不应触发熔断（阈值 {EXPECTED_THRESHOLD}）");
+        }
+        // 第 N 次触发
+        assert!(t.record_fail(), "第 {EXPECTED_THRESHOLD} 次失败应触发熔断");
+        assert!(t.is_locked(), "触发后应立即处于锁定态");
+    }
+
+    #[test]
+    fn auth_window_and_lock_durations_match_contract() {
+        // 同样硬编码，防止常量被默默改动（README 记载为 30s 窗口 / 120s 锁定）
+        assert_eq!(AUTH_WINDOW_SECS, 30, "统计窗口变更需同步文档");
+        assert_eq!(AUTH_LOCK_SECS, 120, "锁定时长变更需同步文档");
+    }
+
+    #[test]
+    fn auth_throttle_counts_failures() {
+        let mut t = AuthThrottle::new();
+        for _ in 0..5 {
+            t.record_fail();
+        }
+        assert_eq!(t.fail_count, 5);
+    }
+
+    #[test]
+    fn auth_throttle_expired_lock_auto_clears() {
+        // 直接把 locked_until 设为过去，验证 is_locked 会自动清理并复位计数
+        let mut t = AuthThrottle::new();
+        t.fail_count = AUTH_GLOBAL_FAIL_THRESHOLD;
+        t.locked_until = Some(Instant::now() - Duration::from_secs(1));
+
+        assert!(!t.is_locked(), "已过期的锁定应返回未锁定");
+        assert!(t.locked_until.is_none(), "过期锁定应被清理");
+        assert_eq!(t.fail_count, 0, "过期后失败计数应复位");
+    }
+
+    #[test]
+    fn auth_throttle_window_resets_fail_count() {
+        // 窗口过期后重新计数（把 window_start 推到窗口之外）
+        let mut t = AuthThrottle::new();
+        t.fail_count = 5;
+        t.window_start = Instant::now() - Duration::from_secs(AUTH_WINDOW_SECS + 1);
+
+        assert!(!t.record_fail(), "窗口过期后计数应重置，不应立刻熔断");
+        assert_eq!(t.fail_count, 1, "重置后本次失败应记为第 1 次");
+    }
+
+    // ================= record_sid_fail：按 SID 定向封禁 =================
+    // 该函数使用全局 static SID_FAILS，故每个用例必须用**唯一 SID 键**隔离，
+    // 避免测试并行执行时互相污染（cargo 默认多线程跑测试）。
+
+    /// 生成本次调用唯一的 SID 键，保证测试间隔离。
+    fn uniq_sid(tag: &str) -> String {
+        format!("S-1-5-21-TEST-{tag}-{}", std::process::id())
+    }
+
+    #[test]
+    fn sid_fail_blocks_at_threshold() {
+        // 硬编码而非引用常量：见 auth_throttle_locks_at_threshold 的说明
+        const EXPECTED: u32 = 5;
+        assert_eq!(
+            MAX_AUTH_FAILS_PER_SID, EXPECTED,
+            "单 SID 封禁阈值变更需同步文档与客户端预期"
+        );
+
+        let sid = uniq_sid("blocks");
+        // 前 N-1 次返回「未封禁」，第 N 次起返回「已封禁」
+        for i in 1..EXPECTED {
+            let (count, blocked) = record_sid_fail(&sid);
+            assert_eq!(count, i, "第 {i} 次失败计数不符");
+            assert!(!blocked, "第 {i} 次失败不应封禁（阈值 {EXPECTED}）");
+        }
+        let (count, blocked) = record_sid_fail(&sid);
+        assert_eq!(count, EXPECTED);
+        assert!(blocked, "达到阈值应封禁该 SID");
+    }
+
+    #[test]
+    fn sid_fail_stays_blocked_on_subsequent_calls() {
+        const EXPECTED: u32 = 5;
+        let sid = uniq_sid("stay");
+        for _ in 0..EXPECTED {
+            record_sid_fail(&sid);
+        }
+        // 封禁期内再次尝试：仍应拒绝，且不增加计数
+        let (count, blocked) = record_sid_fail(&sid);
+        assert!(blocked, "封禁期内应持续拒绝");
+        assert_eq!(
+            count, EXPECTED,
+            "封禁期内不应继续累加计数（否则计数无上限增长）"
+        );
+    }
+
+    #[test]
+    fn sid_fail_isolates_different_sids() {
+        // 一个 SID 被封禁不应影响另一个 SID
+        let blocked_sid = uniq_sid("iso-a");
+        let other_sid = uniq_sid("iso-b");
+
+        for _ in 0..5 {
+            record_sid_fail(&blocked_sid);
+        }
+        let (_, bad_blocked) = record_sid_fail(&blocked_sid);
+        assert!(bad_blocked, "前置条件：a 已被封禁");
+
+        let (count, blocked) = record_sid_fail(&other_sid);
+        assert_eq!(count, 1, "b 应是独立计数");
+        assert!(!blocked, "a 被封禁不应牵连 b");
+    }
+
+    #[test]
+    fn sid_fail_window_expiry_resets() {
+        let sid = uniq_sid("window");
+        record_sid_fail(&sid);
+        record_sid_fail(&sid);
+        assert!(SID_FAILS.lock().unwrap().as_ref().unwrap().contains_key(&sid));
+
+        // 手工把窗口起点推前（模拟超过 60s 窗口），且未封禁
+        {
+            let mut guard = SID_FAILS.lock().unwrap();
+            let map = guard.as_mut().unwrap();
+            if let Some(e) = map.get_mut(&sid) {
+                e.0 = Instant::now() - Duration::from_secs(61);
+            }
+        }
+        let (count, blocked) = record_sid_fail(&sid);
+        assert_eq!(count, 1, "窗口过期后应重新从 1 计数");
+        assert!(!blocked);
+    }
+
+    // ================= 并发信号量常量自洽性 =================
+
+    #[test]
+    fn concurrency_and_throttle_constants_are_sane() {
+        assert!(common::MAX_CONNS > 0, "并发上限必须为正");
+        assert!(
+            AUTH_GLOBAL_FAIL_THRESHOLD > common::MAX_CONNS,
+            "全局熔断阈值应大于并发上限，否则单个客户端即可轻易触发全局锁定"
+        );
+        assert!(
+            AUTH_LOCK_SECS >= AUTH_WINDOW_SECS,
+            "锁定时长不应短于统计窗口，否则窗口内可反复触发锁定"
+        );
+        assert!(MAX_AUTH_FAILS_PER_SID > 0);
+    }
+}
+

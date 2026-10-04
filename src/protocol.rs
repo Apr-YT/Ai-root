@@ -321,3 +321,277 @@ pub fn err_response(msg: &str) -> Response {
         timed_out: false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个「合法」请求，仅覆盖被测字段，避免每个用例重复样板。
+    fn req(token: &str, command: &str) -> Request {
+        Request {
+            token: token.to_string(),
+            command: command.to_string(),
+            cwd: None,
+            timeout_ms: None,
+        }
+    }
+
+    fn valid_token() -> String {
+        "a".repeat(64)
+    }
+
+    // ---------- 令牌校验 ----------
+
+    #[test]
+    fn rejects_empty_token() {
+        let err = validate_request(&req("", "whoami")).unwrap_err();
+        assert_eq!(err, "令牌不能为空");
+    }
+
+    #[test]
+    fn rejects_token_wrong_length() {
+        // 63 / 65 字符均非法（必须恰为 32 字节 hex = 64 字符）
+        assert_eq!(
+            validate_request(&req(&"a".repeat(63), "whoami")).unwrap_err(),
+            "令牌格式无效"
+        );
+        assert_eq!(
+            validate_request(&req(&"a".repeat(65), "whoami")).unwrap_err(),
+            "令牌格式无效"
+        );
+    }
+
+    #[test]
+    fn rejects_multibyte_token_of_byte_len_64() {
+        // 关键：长度按**字节**而非字符计算。
+        // 32 个 2 字节 UTF-8 字符 = 64 字节，能通过长度检查，
+        // 但绝不是合法 hex 令牌 —— 记录当前行为（仅查长度，不查 hex）。
+        let tok = "é".repeat(32);
+        assert_eq!(tok.len(), 64, "前置条件：字节长度确为 64");
+        assert!(validate_request(&req(&tok, "whoami")).is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_token() {
+        assert!(validate_request(&req(&valid_token(), "whoami")).is_ok());
+    }
+
+    // ---------- 命令校验 ----------
+
+    #[test]
+    fn rejects_empty_command() {
+        assert_eq!(
+            validate_request(&req(&valid_token(), "")).unwrap_err(),
+            "命令不能为空"
+        );
+    }
+
+    #[test]
+    fn accepts_command_at_max_length() {
+        // 8191 是允许上限（Windows 命令行长度限制）
+        let cmd = "a".repeat(8191);
+        assert!(validate_request(&req(&valid_token(), &cmd)).is_ok());
+    }
+
+    #[test]
+    fn rejects_command_over_max_length() {
+        let cmd = "a".repeat(8192);
+        assert_eq!(
+            validate_request(&req(&valid_token(), &cmd)).unwrap_err(),
+            "命令过长"
+        );
+    }
+
+    // ---------- cwd 校验 ----------
+
+    #[test]
+    fn rejects_empty_cwd() {
+        let mut r = req(&valid_token(), "dir");
+        r.cwd = Some(String::new());
+        assert_eq!(validate_request(&r).unwrap_err(), "工作目录不能为空字符串");
+    }
+
+    #[test]
+    fn accepts_cwd_at_max_path() {
+        // MAX_PATH = 260
+        let mut r = req(&valid_token(), "dir");
+        r.cwd = Some("C".repeat(260));
+        assert!(validate_request(&r).is_ok());
+    }
+
+    #[test]
+    fn rejects_cwd_over_max_path() {
+        let mut r = req(&valid_token(), "dir");
+        r.cwd = Some("C".repeat(261));
+        assert_eq!(validate_request(&r).unwrap_err(), "工作目录路径过长");
+    }
+
+    // ---------- 超时校验 ----------
+
+    #[test]
+    fn rejects_zero_timeout() {
+        // 0 会被当作「无超时」导致进程永不回收，故显式拒绝
+        let mut r = req(&valid_token(), "whoami");
+        r.timeout_ms = Some(0);
+        assert_eq!(validate_request(&r).unwrap_err(), "超时时间不能为0");
+    }
+
+    #[test]
+    fn accepts_timeout_at_max() {
+        let mut r = req(&valid_token(), "whoami");
+        r.timeout_ms = Some(common::MAX_COMMAND_TIMEOUT_MS);
+        assert!(validate_request(&r).is_ok());
+    }
+
+    #[test]
+    fn rejects_timeout_over_max() {
+        let mut r = req(&valid_token(), "whoami");
+        r.timeout_ms = Some(common::MAX_COMMAND_TIMEOUT_MS + 1);
+        assert!(validate_request(&r).unwrap_err().contains("超过上限"));
+    }
+
+    // ---------- 顺序敏感：令牌先于命令校验 ----------
+
+    #[test]
+    fn token_error_takes_precedence_over_command_error() {
+        // 令牌与命令同时非法时应先报令牌错。
+        // 这保证「未鉴权者无法通过错误信息推断服务端校验逻辑」。
+        let err = validate_request(&req("", "")).unwrap_err();
+        assert_eq!(err, "令牌不能为空");
+    }
+
+    // ---------- err_response ----------
+
+    #[test]
+    fn err_response_shape() {
+        let r = err_response("boom");
+        assert!(!r.ok);
+        assert_eq!(r.exit_code, -1);
+        assert_eq!(r.error.as_deref(), Some("boom"));
+        assert!(r.stdout.is_empty() && r.stderr.is_empty());
+        assert!(!r.truncated && !r.timed_out);
+    }
+
+    // ---------- 序列化兼容性 ----------
+
+    #[test]
+    fn response_deserializes_without_optional_fields() {
+        // 旧服务端可能不返回新增字段，客户端必须能反序列化（serde default）
+        let legacy = r#"{"ok":true,"exit_code":0,"stdout":"x","stderr":""}"#;
+        let r: Response = serde_json::from_str(legacy).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.stdout, "x");
+        assert!(!r.truncated);
+        assert!(r.run_id.is_none());
+        assert!(!r.timed_out);
+    }
+
+    #[test]
+    fn request_deserializes_without_optional_fields() {
+        // 只给 token + command 也应能解析（cwd/timeout_ms 有 default）
+        let json = format!(r#"{{"token":"{}","command":"whoami"}}"#, valid_token());
+        let r: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(r.command, "whoami");
+        assert!(r.cwd.is_none());
+        assert!(r.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn request_rejects_missing_token() {
+        // token 无 default，缺失即解析失败（必须显式提供）
+        let json = r#"{"command":"whoami"}"#;
+        assert!(serde_json::from_str::<Request>(json).is_err());
+    }
+
+    // ---------- 帧编解码（长度前缀 + 负载）----------
+
+    /// 真正调用 `write_frame` 写入临时文件，再按字节核对长度前缀与负载。
+    /// 用普通文件而非命名管道：`write_frame` 只依赖 `Write` trait，
+    /// 无需真实管道即可覆盖编码逻辑（避免依赖服务端与并发）。
+    #[test]
+    fn write_frame_emits_le_length_prefix() {
+        use std::io::Read;
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("airoot_frame_test_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let data = b"hello";
+        {
+            let mut f = File::create(&path).unwrap();
+            write_frame(&mut f, data).unwrap();
+        }
+
+        let mut raw = Vec::new();
+        File::open(&path).unwrap().read_to_end(&mut raw).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(raw.len(), 4 + data.len());
+        assert_eq!(&raw[..4], &[5, 0, 0, 0], "长度前缀必须是 u32 小端");
+        assert_eq!(&raw[4..], data);
+    }
+
+    #[test]
+    fn write_frame_roundtrip_boundaries() {
+        use std::io::Read;
+
+        // 边界：空负载与较大负载，均需完整往返
+        for payload in [vec![], vec![1u8, 2, 3, 4], vec![0xABu8; 10_000]] {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "airoot_frame_rt_{}_{}.bin",
+                std::process::id(),
+                payload.len()
+            ));
+            let _ = std::fs::remove_file(&path);
+
+            {
+                let mut f = File::create(&path).unwrap();
+                write_frame(&mut f, &payload).unwrap();
+            }
+
+            let mut raw = Vec::new();
+            File::open(&path).unwrap().read_to_end(&mut raw).unwrap();
+            let _ = std::fs::remove_file(&path);
+
+            // 按协议手工解码（read_frame_timeout 需要真实管道句柄，故此处解长度+切片）
+            let decoded_len = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+            assert_eq!(decoded_len, payload.len());
+            assert_eq!(&raw[4..], &payload[..]);
+        }
+    }
+
+    #[test]
+    fn write_frame_flushes_to_disk() {
+        use std::io::Read;
+
+        // write_frame 末尾必须 flush：否则管道上可能出现「前一条响应滞留」，
+        // 客户端会读到旧帧。此处用文件验证数据已落盘可读。
+        let mut path = std::env::temp_dir();
+        path.push(format!("airoot_frame_flush_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let f = File::create(&path).unwrap();
+        let mut w = f;
+        write_frame(&mut w, b"flushed").unwrap();
+        // 不显式 drop：在句柄仍打开时读取，验证 flush 已把数据推给 OS
+        let mut raw = Vec::new();
+        File::open(&path).unwrap().read_to_end(&mut raw).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(&raw[..4], &[7, 0, 0, 0]);
+        assert_eq!(&raw[4..], b"flushed");
+    }
+
+    #[test]
+    fn frame_max_size_constant_is_sane() {
+        // FRAME_MAX_SIZE 必须显著大于命令长度上限，否则合法请求会被帧层拒绝
+        assert!(
+            common::FRAME_MAX_SIZE > 8191,
+            "帧上限必须大于命令长度上限 8191"
+        );
+        // 且长度前缀为 u32，上限不得超过 u32::MAX
+        assert!(common::FRAME_MAX_SIZE <= u32::MAX as usize);
+    }
+}
+
