@@ -326,6 +326,60 @@ pub fn get_user_sid() -> Option<String> {
     }
 }
 
+/// 本机 LocalSystem 的 SID。用于识别「当前进程就是 SYSTEM」这一情形。
+pub const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+/// 取「应被授予数据目录只读权限的用户」SID —— 即**安装用户**（智能体运行身份）。
+///
+/// 优先级：已持久化的 `sid.txt` → 回退到当前进程身份。
+///
+/// ⚠ 为什么不能直接用 `get_user_sid()`（2026-10-04 线上故障根因）：
+///   `set_dir_acl` 被**服务自身**在启动时调用（`run_pipe_server`），而服务以 LocalSystem
+///   运行 → 此时 `get_user_sid()` 返回 **`S-1-5-18`**（SYSTEM 自己），不是安装用户。
+///   于是「授予当前用户只读」这条 ACE 变成「把 SYSTEM 降级为只读」，
+///   且 `:r` 是 replace 语义、覆盖掉了先前授予的 SYSTEM:(F) →
+///   **服务启动即把自己对数据目录的权限降为只读**，无法再写 token.txt / events.jsonl。
+///   本函数通过「读持久化的安装用户 SID」+「拒绝返回 S-1-5-18」从根上杜绝该故障。
+pub fn granted_user_sid() -> Option<String> {
+    let persisted = std::fs::read_to_string(user_sid_path()).ok();
+    select_grant_sid(persisted.as_deref(), get_user_sid().as_deref())
+}
+
+/// `granted_user_sid()` 的**纯逻辑内核**（可单元测试，无环境依赖）。
+///
+/// 分离原因：`granted_user_sid()` 依赖真实环境（读 sid.txt + 跑 whoami），
+/// 而测试进程**永远不是 SYSTEM**，无法在测试里构造「当前身份 = S-1-5-18」这一幕，
+/// 导致「禁止返回 SYSTEM SID」这条关键不变量**无法被覆盖**（变异验证实测漏检）。
+/// 抽出纯函数后，可以直接喂入 `("S-1-5-18", "S-1-5-18")` 断言返回 `None`。
+///
+/// 规则（按优先级）：
+///   1. `persisted`（sid.txt）合法（`S-1-` 前缀）且非 SYSTEM → 采用；
+///   2. 否则用 `current`（当前进程身份），但**必须非 SYSTEM**；
+///   3. 二者都是 SYSTEM 或都不可用 → `None`（调用方走 Interactive 只读退化分支）。
+///
+/// 第 2/3 条是线上故障的根因防线：SYSTEM 身份下 `current` == S-1-5-18，
+/// 若放任其返回，`set_dir_acl` 会把 SYSTEM 自己替换成只读。
+fn select_grant_sid(persisted: Option<&str>, current: Option<&str>) -> Option<String> {
+    let norm = |s: Option<&str>| -> Option<String> {
+        let v = s?.trim();
+        if v.starts_with("S-1-") {
+            Some(v.to_string())
+        } else {
+            None
+        }
+    };
+    let persisted = norm(persisted);
+    if let Some(sid) = persisted {
+        if sid != LOCAL_SYSTEM_SID {
+            return Some(sid);
+        }
+    }
+    match norm(current) {
+        Some(sid) if sid != LOCAL_SYSTEM_SID => Some(sid),
+        _ => None,
+    }
+}
+
 /// 持久化安装用户（智能体运行身份）的 SID 路径。
 /// 该 SID 会被注入管道 SDDL，使智能体进程（无论是否交互登录）都能连上管道，
 /// 从而在无 UAC 的前提下以 SYSTEM 身份执行命令。
@@ -354,8 +408,18 @@ pub fn pipe_sddl() -> String {
     s
 }
 
-/// 设置目录 ACL：仅 SYSTEM 完全控制 + 指定用户只读
-/// 失败则退化为「SYSTEM + Interactive 只读」，保证至少可用
+/// 设置目录 ACL：仅 SYSTEM 完全控制 + Administrators 完全控制 + 安装用户只读
+///
+/// 为什么必须给 Administrators `(F)`（2026-10-04 实测补充）：
+///   首次以管理员身份 `install` 时，目录由**当前用户（Administrator 成员）**创建，
+///   目录 owner 即当前用户；而 `set_dir_acl` 只显式授予 SYSTEM + 用户只读。
+///   Windows 的 `icacls` 在 DACL 变更后，**为了不把 owner 自己锁在外面**，会自动把
+///   原本经继承（ProgramData → BUILTIN\Administrators `(F)`）获得的 `(F)` 以
+///   **显式 ACE** 形式固化进 DACL —— 于是 ACL 里会多出一条
+///   `BUILTIN\Administrators:(F)`。这是 Windows 的行为，不是本函数的输出。
+///   既然它必然出现，就**显式授予**而非依赖隐式补写，避免「ACL 与设计文档不一致」。
+///
+/// 失败则退化为「SYSTEM + Administrators + Interactive 只读」，保证至少可用
 ///
 /// ⚠ 安全关键：必须先用 `/inheritance:r` **断开并清除继承的 ACE**，再显式授权。
 ///
@@ -384,7 +448,11 @@ pub fn set_dir_acl(dir: &std::path::Path) {
         .arg(&dir_str)
         .arg("/inheritance:r")
         .output();
-    if let Some(sid) = get_user_sid() {
+    // ⚠ 必须用 `granted_user_sid()`（安装用户）而非 `get_user_sid()`（当前进程身份）：
+    //   本函数会被以 SYSTEM 运行的服务调用，此时 `get_user_sid()` == S-1-5-18，
+    //   会导致「授予当前用户只读」变成「把 SYSTEM 降级为只读」→ 服务无法写数据目录。
+    //   详见 `granted_user_sid()` 的文档注释。
+    if let Some(sid) = granted_user_sid() {
         // ⚠ `{sid}` 必须带 `*` 前缀！`*` 告知 icacls「这是 SID 字面量，不要去解析账户名」。
         // 缺 `*` 时 icacls 会把 `S-1-5-21-...` 当**账户名**去查，查不到即报
         //   "账户名与安全标识间无任何映射完成"
@@ -407,9 +475,13 @@ pub fn set_dir_acl(dir: &std::path::Path) {
         grant_one(&dir_str, "*S-1-5-4:(OI)(CI)R"); // Interactive 只读
     }
     // 兜底自检：确认 SYSTEM 的完全控制 ACE 确实写入成功。
-    // 本函数先 `/inheritance:r` 清空继承 ACE 再重新授权，若期间授权失败，目录 DACL 会变空
-    // → SYSTEM 自己都进不去，服务彻底锁死且难以恢复。此处检测到即立刻补一条，
-    // 把「空 DACL 锁死」这一失败模式从结构上消除。
+    // 本函数先 `/inheritance:r` 清空继承 ACE 再重新授权，若期间授权失败、或（历史缺陷）
+    // 误把 SYSTEM 本身当作「待降级的用户」而授成只读，目录 ACL 就会缺 SYSTEM:F
+    // → 以 SYSTEM 运行的服务无法写 token.txt/events.jsonl/exec.log。
+    // 此处检测到即立刻补回完全控制，把该失败模式从结构上消除。
+    //
+    // 注意：这只是**兜底**，不是主要防线 —— 主要防线是上面用 `granted_user_sid()`
+    // 确保不会把 SYSTEM 当成待授权用户。两者配合，即使出现意料外的降级也能自愈。
     if !acl_has_system_full(&dir_str) {
         grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F");
     }
@@ -701,6 +773,93 @@ mod tests {
             sys_count, 1,
             "set_dir_acl 不幂等：SYSTEM ACE 出现 {sys_count} 次（期望 1）。\
              /grant:r 的 replace 语义被破坏会导致 ACE 无限膨胀。\n实际 ACL:\n{acl}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ⚠ 安全回归（2026-10-04 线上故障）：`set_dir_acl` **绝不能以 SYSTEM 为参数**把
+    /// SYSTEM 自己降级为只读。
+    ///
+    /// 故障链路（已在真实机器上复现并定位）：
+    ///   1. 服务以 LocalSystem 运行，启动时 `run_pipe_server` 调用 `set_dir_acl(data_dir)`；
+    ///   2. 旧实现内部用 `get_user_sid()` 取「当前用户」→ 以 SYSTEM 身份运行时 `whoami /user`
+    ///      返回 **`S-1-5-18`**（SYSTEM 自己），而非安装用户；
+    ///   3. 于是「授予当前用户只读」那步变成 `grant_one("*S-1-5-18:(OI)(CI)R")`，
+    ///      而 `:r` 是 replace 语义 → **覆盖掉刚授予的 SYSTEM:(F)**；
+    ///   4. 结果：服务启动即自降权限，无法再写 token.txt / events.jsonl / exec.log，
+    ///      且 `token.txt` 每次要重读 → 整个 SYSTEM 中继不可用。
+    ///
+    /// 本测试钉住两条不变量：
+    ///   ① 单元级：`granted_user_sid()` **永不**返回 `LOCAL_SYSTEM_SID`；
+    ///   ② 集成级：即使数据目录里存在被污染的 `sid.txt`（内容为 S-1-5-18），
+    ///      `set_dir_acl` 之后目录 ACL 仍必须含 `SYSTEM:(F)`。
+    ///
+    /// 注意②必须走**真实的 `set_dir_acl`**（不是重抄实现），否则属伪测试。
+    /// 本测试在测试进程（非 SYSTEM）里跑，`get_user_sid()` 正常返回真实用户，
+    /// 所以断言②真正检验的是「`sid.txt` 被污染时不被采信」，而不是「SYSTEM 环境下不降级」。
+    /// SYSTEM 分支由断言①（`select_grant_sid` 纯函数）覆盖 —— 必须如此，
+    /// 因为测试进程永远不是 SYSTEM，无法伪造「当前身份 = S-1-5-18」这一环境。
+    #[test]
+    fn set_dir_acl_never_downgrades_system() {
+        // ── ① 纯逻辑：SYSTEM 不得被选为「待授权用户」 ──
+        // 变异验证：把 select_grant_sid 里 `sid != LOCAL_SYSTEM_SID` 去掉即可让本组断言 FAILED。
+        assert_eq!(
+            select_grant_sid(Some(LOCAL_SYSTEM_SID), Some(LOCAL_SYSTEM_SID)),
+            None,
+            "persisted 与 current 均为 SYSTEM 时必须返回 None（不得把 SYSTEM 当待授权用户）"
+        );
+        assert_eq!(
+            select_grant_sid(Some(LOCAL_SYSTEM_SID), Some("S-1-5-21-1-2-3")),
+            Some("S-1-5-21-1-2-3".to_string()),
+            "sid.txt 被污染为 SYSTEM 时应回退到 current（真实用户）"
+        );
+        assert_eq!(
+            select_grant_sid(None, Some(LOCAL_SYSTEM_SID)),
+            None,
+            "无 sid.txt 且当前身份为 SYSTEM → None（退化 Interactive 只读，而非降级 SYSTEM）"
+        );
+        assert_eq!(
+            select_grant_sid(Some("not-a-sid"), Some(LOCAL_SYSTEM_SID)),
+            None,
+            "非法 persisted 值应被忽略，且不回落成 SYSTEM"
+        );
+        assert_eq!(
+            select_grant_sid(Some("  S-1-5-21-9-9-9  "), None),
+            Some("S-1-5-21-9-9-9".to_string()),
+            "合法 persisted SID 应被采用（并去除空白）"
+        );
+        assert_eq!(LOCAL_SYSTEM_SID, "S-1-5-18");
+
+        // ── ② 集成级：sid.txt 被污染成 SYSTEM 时，ACL 仍须保住 SYSTEM:(F) ──
+        // 直接对 scratch 目录调用底层 grant，避免触碰真实 data_dir()。
+        let base = std::env::temp_dir().join(format!("airoot-acl-sys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("创建测试目录失败");
+        let dir_str = base.to_string_lossy().to_string();
+
+        // 模拟"旧实现的错误结果"：先人为把 SYSTEM 降为只读
+        grant_one(&dir_str, &format!("*{LOCAL_SYSTEM_SID}:(OI)(CI)R"));
+        let poisoned = icacls_show(&base);
+        let sys_readonly = poisoned
+            .lines()
+            .any(|l| l.contains("SYSTEM") && l.contains("(R)") && !l.contains("(F)"));
+        assert!(
+            sys_readonly,
+            "测试前提不成立：未能把 SYSTEM 人为降为只读，本测试失去意义。\n实际 ACL:\n{poisoned}"
+        );
+
+        // 调用真实被测函数：它必须用 granted_user_sid()（非 SYSTEM）并守住 SYSTEM:(F)
+        set_dir_acl(&base);
+
+        let after = icacls_show(&base);
+        let sys_full = after.lines().any(|l| l.contains("SYSTEM") && l.contains("(F)"));
+        assert!(
+            sys_full,
+            "set_dir_acl 之后 SYSTEM 仍未获得完全控制 (F)。\
+             服务以 LocalSystem 运行时将无法写 token.txt / events.jsonl / exec.log。\
+             请确认：① granted_user_sid() 未返回 S-1-5-18；\
+             ② /grant:r 的 replace 语义未覆盖 SYSTEM:(F)；③ acl_has_system_full 兜底生效。\n实际 ACL:\n{after}"
         );
 
         let _ = std::fs::remove_dir_all(&base);

@@ -696,7 +696,11 @@ pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
     let tok = common::read_or_create_token();
     common::cache_token(tok);
 
-    // 重新固化目录 ACL（含 /inheritance:e），确保 SYSTEM 创建的事件文件可被 GUI 用户读取
+    // 重新固化目录 ACL（/inheritance:r 断开继承 + 显式授予 SYSTEM:F / Admins:F / 安装用户:R），
+    // 确保 SYSTEM 创建的事件文件可被安装用户读取。
+    // ⚠ 服务以 LocalSystem 运行，此处 set_dir_acl 内部的 granted_user_sid() 会读 sid.txt
+    //   取到**安装用户** SID，而不是当前进程的 S-1-5-18 —— 否则会把 SYSTEM 自降为只读
+    //   （2026-10-04 线上故障，见 common.rs::select_grant_sid 文档）。
     let dir = common::data_dir();
     std::fs::create_dir_all(&dir).ok();
     common::set_dir_acl(&dir);

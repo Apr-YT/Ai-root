@@ -3,7 +3,18 @@
 > **面向 AI 智能体自调用的 LocalSystem 提权命令中继。**
 > 非提权（普通用户）的智能体进程，仅凭一个共享令牌即可通过命名管道以 `SYSTEM` 权限自治执行命令，全程无需 UAC 弹窗。本工具的主要消费方是 AI 智能体本身，文档聚焦于「如何可靠对接」而非「人怎么敲命令」。
 
-## 最近更新（2026-08-28）
+## 最近更新（2026-10-04）
+
+### 安全修复（本轮）
+- **§4.1 目录 ACL 隔离缺陷 A/B**：`set_dir_acl` 原先既未清除继承来的 `Users` 写权限（任意本地用户可覆写 `token.txt` 自授权拿 SYSTEM），又因 SID 缺 `*` 前缀导致授权静默全失败。已修复为 `/inheritance:r` + 逐条独立授权 + 收尾自检。
+- **§4.1.1 服务自降权限缺陷 C**：服务以 LocalSystem 启动时，`set_dir_acl` 把 SYSTEM 自己当成"待授权用户"并 replace 成只读，导致服务无法写数据目录。已通过 `granted_user_sid()` + 纯函数 `select_grant_sid()` 从结构上消除。
+- 数据目录 ACL 最终形态：`SYSTEM(F) + Administrators(F) + 安装用户(R)`，且服务反复重启后保持稳定。
+
+### 测试
+- 测试数 6 → **52**，其中 3 个 ACL 安全回归测试全部经**变异验证**（注入缺陷必须 FAILED）。
+- 新增 `select_grant_sid()` 纯逻辑内核，使"进程身份 = SYSTEM"这一测试环境无法复现的前提可被单元测试覆盖。
+
+### 更早（2026-08-28）
 
 ### 安全增强
 - **令牌轮转**：新增 `rotate_token()` 函数支持安全的令牌轮转
@@ -45,7 +56,7 @@
 
 - **服务**：以 `LocalSystem` 注册为自启 Windows 服务（`SERVICE_NAME = "AI-Root"`）。
 - **管道**：`\\.\pipe\AI-Root`，SDDL 限制连接方为 `SYSTEM` / `Administrators` / `Interactive` + 安装用户 SID（确保智能体进程可无人值守连接）。
-- **令牌**：安装时生成 32 字节随机十六进制令牌，落盘于 `C:\ProgramData\AI-Root\token.txt`，目录 ACL 为 `SYSTEM(F) + Administrators(F) + 当前用户(R)`（隔离缺陷史见 §4.1）。
+- **令牌**：安装时生成 32 字节随机十六进制令牌，落盘于 `C:\ProgramData\AI-Root\token.txt`，目录 ACL 为 `SYSTEM(F) + Administrators(F) + 安装用户(R)`（隔离缺陷史见 §4.1 / §4.1.1）。
 
 ---
 
@@ -68,6 +79,7 @@ powershell -ExecutionPolicy Bypass -File install-service.ps1
 | 5-6 | 启动服务 + `sc qfailure` 失败恢复核对（应 60s/300s/600s） |
 
 > 若第 4 步 ACL 检查报 `[X]`（Users 仍持有写权限），**请立即停止使用并反馈** —— 说明 §4.1 的隔离修复未生效。
+> 同时应确认 `NT AUTHORITY\SYSTEM` 显示为 `(F)`；若显示 `(R)` 则说明命中 §4.1.1 的自降权限缺陷。
 
 > 也可手动逐步执行：`AI-Root.exe install` → `AI-Root.exe start`（同样需管理员）。
 
@@ -222,15 +234,16 @@ AI-Root run -- <原始命令>
 
 ## 4. 安全模型
 
-- 令牌仅安装时生成一次；目录 ACL `SYSTEM(F) + Administrators(F) + 当前用户(R)`，其余账户不可访问。
-  ⚠ **该隔离曾长期未真正生效**，见 §4.1。
+- 令牌仅安装时生成一次；目录 ACL `SYSTEM(F) + Administrators(F) + 安装用户(R)`，其余账户不可访问。
+  ⚠ **该隔离曾长期未真正生效**，见 §4.1；另曾出现"服务自降为只读"故障，见 §4.1.1。
 - **令牌轮换**：`AI-Root rotate-token`（管理员/SYSTEM）生成新令牌写盘，服务端按文件 mtime 变化**自动热加载**（无需重启），旧令牌立即失效。泄露后的标准处置流程：rotate → 更新 AI 侧令牌引用。
 - **审计日志**：`C:\ProgramData\AI-Root\exec.log` 逐行记录 `[时间] caller=DOMAIN\user pid=xxx exit=code cmd=...`。`caller` 来自服务端 `GetNamedPipeClientProcessId` 解析的**管道对端进程身份**（非服务自身环境变量），可精确追溯"谁在什么进程里执行了什么"。
 - 管道 SDDL 追加安装用户 SID，使以该用户身份运行的智能体（可能非交互登录）也能稳定连接。
 - 服务 DACL 在 install 时追加安装用户 SID 的 `GRGX`（GENERIC_READ|GENERIC_EXECUTE，含 QUERY_STATUS/START/STOP）——仅授权 status/stop/start/update 自身服务，不授予 CHANGE_CONFIG/WRITE_DAC 等管理权限、不涉及其他服务或系统级权限。
 - 受「启用开关」约束（`C:\ProgramData\AI-Root\enabled.flag` 存在即启用），删除即禁用中继（服务端拒绝一切命令，`ok=false, error="中继已禁用"`）。
   **开关是运行期语义**：禁用后无法通过中继自身恢复（拒绝执行），需本地/管理员重建 flag，或直接非提权 `AI-Root stop` + `AI-Root start`（服务启动时自动重建 flag，已实测）。
-- 服务运行时（SYSTEM 身份）不会改写令牌/SID，避免错误写入 `S-1-5-18`。
+- 服务运行时（SYSTEM 身份）会重固化目录 ACL，但**绝不会**把 SYSTEM 自身当"待授权用户"
+  ——`granted_user_sid()` 从 `sid.txt` 取安装用户 SID 并硬性排除 `S-1-5-18`（见 §4.1.1）。
 
 ### 4.1 目录 ACL 隔离缺陷（2026-10-04 发现并修复）
 
@@ -276,6 +289,64 @@ AI-Root run -- <原始命令>
 回归测试 `common::tests::set_dir_acl_strips_inherited_users_write` 真实构造危险前提
 （父目录授予可继承的 Users 写权限）后调用**真实** `set_dir_acl`，断言写权限被剥离、
 SYSTEM 保留完全控制、当前用户保留只读。变异验证：还原缺陷 A / 缺陷 B 各一次，均 FAILED。
+
+### 4.1.1 缺陷 C：服务启动把自己降级为只读（2026-10-04 线上发现并修复）
+
+**症状**：服务安装并启动后，`C:\ProgramData\AI-Root` 的 ACL 变成 `NT AUTHORITY\SYSTEM:(OI)(CI)(R)` ——
+SYSTEM 只剩**只读**，于是以 LocalSystem 运行的服务**无法再写** `token.txt` / `events.jsonl` / `exec.log`，
+整个 SYSTEM 中继不可用（看似"服务在跑"实则已废）。
+
+**根因链**：
+1. `run_pipe_server()` 在服务启动时调用 `common::set_dir_acl(&data_dir())` 固化目录 ACL；
+2. 此时进程身份是 **LocalSystem**，而旧实现内部用 `get_user_sid()` 取"当前用户"；
+3. `get_user_sid()` 跑 `whoami /user` → 以 SYSTEM 身份返回 **`S-1-5-18`**（SYSTEM 自己），
+   而**不是**安装用户；
+4. 于是"授予当前用户只读"那步实际执行成 `grant_one("*S-1-5-18:(OI)(CI)R")`，
+   而 `:r` 是 **replace** 语义 → **覆盖掉刚授予的 `SYSTEM:(F)`**；
+5. 结果服务每次启动都自降为只读。
+
+**为何兜底没拦住**：`acl_has_system_full()` 自检确实检测到了缺失并补写，但补写用的 ACE 是
+`*S-1-5-18:(OI)(CI)F`，而**同一次调用里后面紧跟的用户授权又把它 replace 回 `(R)`**
+（`grant_one` 是逐条独立调用，顺序即"先 F 后 R"，后者覆盖前者）。属顺序性缺陷，
+非"兜底失效"。修复时通过 `granted_user_sid()` 从源头eliminate该 ACE 才真正解决。
+
+**实测证据**（真机复现）：停服务 → 手工 `icacls ... /grant:r "*S-1-5-18:(OI)(CI)F"`
+（SYSTEM 恢复 `(F)`）→ 启动服务 → ACL **立即退回** `SYSTEM:(R)`。反复稳定复现。
+
+**修复**（`common.rs`）：把"选谁作为待授权用户"抽成**纯函数** `select_grant_sid(persisted, current)`：
+1. 优先读持久化的 `sid.txt`（install 阶段以管理员身份写入，是**权威**来源）；
+2. 回退到当前进程身份，但**硬性拒绝** `S-1-5-18`；
+3. 两者皆 SYSTEM 或皆不可用 → `None`，走 Interactive 只读退化分支（而非降级 SYSTEM）。
+
+`granted_user_sid()` 负责取值（读文件 + `whoami`）后委托该纯函数；
+`set_dir_acl` 改用 `granted_user_sid()`。
+
+**为何必须抽纯函数**：测试进程**永远不是 SYSTEM**，无法在测试里构造
+"当前身份 = S-1-5-18"这一环境。首版回归测试直接断言 `granted_user_sid() != S-1-5-18`，
+**变异验证实测漏检**（把实现改回 `get_user_sid()` 后测试仍全绿）——
+因为测试环境里 `whoami` 本来就返回真实用户。抽出纯函数后可喂入
+`select_grant_sid(Some("S-1-5-18"), Some("S-1-5-18"))` 断言 `None`，变异验证随即 FAILED。
+
+**回归测试** `common::tests::set_dir_acl_never_downgrades_system`：
+- ① 纯逻辑组：6 条断言覆盖 `select_grant_sid` 的 persisted/current 全组合（含两者皆 SYSTEM、
+  sid.txt 被污染、非法值、空白裁剪）；
+- ② 集成组：人为把 scratch 目录 SYSTEM 降为 `(R)`（构造前提并断言成立），
+  调**真实** `set_dir_acl`，断言 SYSTEM 重新获得 `(F)`。
+
+变异验证（均 FAILED，见提交说明）：
+- 移除 `current` 分支的 `sid != LOCAL_SYSTEM_SID` 守卫；
+- 移除 `persisted` 分支的同一守卫。
+
+**真机修复后 ACL**（服务重启后仍保持）：
+
+| 主体 | 权限 |
+|---|---|
+| `KING\64391`（安装用户） | `(OI)(CI)(R)` |
+| `BUILTIN\Administrators` | `(OI)(CI)(F)` |
+| `NT AUTHORITY\SYSTEM` | `(OI)(CI)(F)` ✅ |
+
+端到端验证：非提权 `AI-Root run "whoami /user"` → `nt authority\system S-1-5-18`；
+`AI-Root run "cmd /c echo ... > C:\ProgramData\AI-Root\probe.txt"` → exit=0 且文件落盘成功。
 
 ### 4.2 运行时安全加固
 
@@ -370,12 +441,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 cargo test --release --target x86_64-pc-windows-gnu
 ```
 
-当前 **51 个测试**（2026-10-04 从 6 个扩充：44 个单元测试 + 5 个真实管道集成测试 + 2 个 ACL 安全回归测试），分布：
+当前 **52 个测试**（2026-10-04 从 6 个扩充：44 个单元测试 + 5 个真实管道集成测试 + 3 个 ACL 安全回归测试），分布：
 
 | 模块 | 数量 | 覆盖内容 |
 |---|---|---|
 | `exec` | 6 | cmd 元字符转义（引号内/外、`^`/`&`、未闭合引号） |
-| `common` | 2 | `set_dir_acl` 安全回归：剥离继承的 Users 写权限（§4.1 缺陷 A）+ 幂等性 |
+| `common` | 3 | `set_dir_acl` 安全回归：剥离继承的 Users 写权限（§4.1 缺陷 A）+ 幂等性 + **不得把 SYSTEM 降级为只读**（§4.1.1 缺陷 C，含 `select_grant_sid` 纯函数全组合断言） |
 | `protocol` | 27 | `validate_request` 全字段边界（令牌长度/命令 8191/cwd MAX_PATH/超时上下限/校验顺序）；序列化向后兼容；`write_frame` 帧编码与 flush；**`read_frame_timeout` 真实命名管道集成测试**（正常往返、300 KB 大帧、空闲超时、超长长度前缀拒绝、对端关闭） |
 | `server` | 16 | `ct_eq` 恒定时间比较（含逐字节差异、首末字节）；`AuthThrottle` 熔断阈值/窗口重置/锁定过期；`record_sid_fail` 定向封禁/隔离/窗口过期 |
 
@@ -386,6 +457,8 @@ cargo test --release --target x86_64-pc-windows-gnu
 > 该组测试经变异验证有效：注入「去掉 `FRAME_MAX_SIZE` 校验」→ 仅 `read_frame_rejects_oversized_length_prefix` 失败；注入「去掉头部空闲超时检查」→ `read_frame_times_out_when_no_data_sent` **直接挂死**（被 `timeout 60` 杀掉）——恰好印证它守的是线程泄漏型 DoS 的兜底。
 >
 > ACL 测试同样经变异验证：还原 §4.1 缺陷 A（`/inheritance:r` → `/inheritance:e`）→ 两个 ACL 测试均失败；还原缺陷 B（去掉 SID 的 `*` 前缀）→ 首次**未被捕获**，据此补了"当前用户保留只读 ACE"断言后才捕获。这正说明变异测试的价值：不跑一次就不知道断言其实没覆盖到。
+>
+> §4.1.1 缺陷 C 的变异验证同样有价值：首版测试直接断言 `granted_user_sid() != S-1-5-18`，注入变异（改回 `get_user_sid()`）后**测试仍全绿**——因为测试进程本来就不是 SYSTEM。把选 SID 的逻辑抽成纯函数 `select_grant_sid()` 后可注入 `(SYSTEM, SYSTEM)` 组合，两种变异（persisted 守卫、current 守卫）随即均 FAILED。**教训：无法在测试环境复现的前提（此处是"进程身份 = SYSTEM"），要么抽成纯函数，要么就不算被测到。**
 
 > **测试用真实被测代码**：帧测试真实调用 `write_frame` 并校验落盘字节，而非在测试内重抄一遍编码逻辑（后者是「伪测试」——实现改错也照样通过）。
 >
