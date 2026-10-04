@@ -6,11 +6,17 @@ on:
   pull_request:
   workflow_dispatch:
 
-env:
-  # 构建产物统一放 runner 临时目录, 不污染 checkout。
-  # 注: 简化后的 build.ps1 / build.sh 默认落仓库内 target/, 但显式设置本变量时
-  #     两者都会被 cargo 覆盖(优先级: 环境变量 > .cargo/config.toml), 故此处仍有效。
-  CARGO_TARGET_DIR: ${{ runner.temp }}\ai-root-target
+# 注: 这里**不要**放顶层 env。
+#   `runner` 上下文在「工作流顶层 env」中不可用(runner 尚未分配, 而顶层 env 在
+#   解析阶段就要展开), 写成 runner.temp 表达式会让**整份工作流解析失败**:
+#     Invalid Argument - failed to parse workflow:
+#     (Line: 13, Col: 21): Unrecognized named-value: 'runner'
+#   症状极具误导性: 无任何 job / 无日志 / push 后数秒即 failure / workflow_dispatch
+#   报 422「没有该 trigger」/ 工作流名退化为文件路径而非 `name: CI`。
+#   同理, job 级 env 也不可用 runner 上下文; 只有 **step 级 env** 与 run 脚本内可用。
+#
+#   本仓库无需该变量: build.sh / build.ps1 默认落仓库内 target/, 而 CI 的
+#   checkout 本就是一次性的, 不存在「污染」问题。
 
 jobs:
   build-msvc:
@@ -37,7 +43,8 @@ jobs:
       - name: Package artifact
         shell: pwsh
         run: |
-          $exe = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\AI-Root.exe"
+          # 产物目录: 未设 CARGO_TARGET_DIR 时, 两个构建脚本都落仓库内 target\
+          $exe = Join-Path $env:GITHUB_WORKSPACE "target\x86_64-pc-windows-msvc\release\AI-Root.exe"
           if (-not (Test-Path $exe)) { throw "构建产物不存在: $exe" }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item $exe dist\AI-Root.exe
