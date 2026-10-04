@@ -1,6 +1,6 @@
 # AI-Root
 
-[![CI](https://github.com/Apr-YT/ai-root/actions/workflows/ci.yml/badge.svg)](https://github.com/Apr-YT/ai-root/actions/workflows/ci.yml)
+[![CI](https://github.com/Apr-YT/Ai-root/actions/workflows/ci.yml/badge.svg)](https://github.com/Apr-YT/Ai-root/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable%20%7C%20edition%202021-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6.svg)](#平台支持)

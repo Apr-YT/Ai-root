@@ -98,6 +98,6 @@
 
 ---
 
-[Unreleased]: https://github.com/Apr-YT/ai-root/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/Apr-YT/ai-root/releases/tag/v1.0.0
-[0.9.0]: https://github.com/Apr-YT/ai-root/releases/tag/v0.9.0
+[Unreleased]: https://github.com/Apr-YT/Ai-root/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/Apr-YT/Ai-root/releases/tag/v1.0.0
+[0.9.0]: https://github.com/Apr-YT/Ai-root/releases/tag/v0.9.0
