@@ -12,7 +12,8 @@
 #        dlltool.exe/ld.exe/x86_64-w64-mingw32-gcc.exe, **缺 as.exe**,
 #        故该目录不可作为候选(2026-10-04 实测确认)。探测顺序:
 #          a) $env:MINGW_BINUTILS_BIN (显式指定)
-#          b) D:\Kiln\mingw-binutils\bin (本机惯例)
+#          b) D:\Kiln\mingw64\bin (本机当前实际位置, 2026-10-04 变更)
+#          c) D:\Kiln\mingw-binutils\bin (旧位置, 保留兼容)
 #        找不到完整 binutils 时明确报错并给出获取方式, 不再以晦涩的
 #        "dlltool: CreateProcess" 报错收场。
 #
@@ -105,6 +106,8 @@ if (-not $cargoExe) { Write-Error "未找到 cargo, 请先安装 Rust (rustup)" 
 if ($TARGET -eq "x86_64-pc-windows-gnu") {
     $binutilsCandidates = @()
     if ($env:MINGW_BINUTILS_BIN) { $binutilsCandidates += $env:MINGW_BINUTILS_BIN }
+    # 2026-10-04 本机把 D:\Kiln\mingw-binutils 改成了 D:\Kiln\mingw64, 故两处都探测
+    $binutilsCandidates += "D:\Kiln\mingw64\bin"
     $binutilsCandidates += "D:\Kiln\mingw-binutils\bin"
     # 注意: rustup self-contained 目录实测缺 as.exe, 不作为候选(否则必然误判为"已找到")
     $binutils = $binutilsCandidates | Where-Object { $_ -and (Test-Path (Join-Path $_ "as.exe")) } | Select-Object -First 1
@@ -114,9 +117,9 @@ if ($TARGET -eq "x86_64-pc-windows-gnu") {
 已探测:
 $(($binutilsCandidates | ForEach-Object { "  - $_" }) -join "`n")
 请任选其一:
-  A) 下载完整 binutils 到 D:\Kiln\mingw-binutils\bin
+  A) 下载完整 binutils 到 D:\Kiln\mingw64\bin
      清华镜像: https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/mingw64/mingw-w64-x86_64-binutils-2.43.1-1-any.pkg.tar.zst
-     解压后将 mingw64\bin 内容放入 D:\Kiln\mingw-binutils\bin
+     解压后将 mingw64\bin 内容放入该目录
   B) 安装 Visual Studio Build Tools 后改用 msvc target(推荐, CI 即此路径)
   C) 设置环境变量 MINGW_BINUTILS_BIN 指向已有的 binutils\bin
 "@

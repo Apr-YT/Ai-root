@@ -12,9 +12,12 @@
 #
 # 前置:
 #   - rustup toolchain: stable-x86_64-pc-windows-gnu
-#   - 完整 MinGW binutils(含 as.exe) 位于 D:\Kiln\mingw-binutils\bin
+#   - 完整 MinGW binutils(含 as.exe)。查找顺序:
+#       1) 环境变量 MINGW_BINUTILS_BIN(最高优先级)
+#       2) D:/Kiln/mingw64/bin          (当前本机实际位置, 2026-10-04 变更)
+#       3) D:/Kiln/mingw-binutils/bin   (旧位置, 保留兼容)
 #     获取: 清华 msys2 镜像 mingw-w64-x86_64-binutils-*.pkg.tar.zst, 解压后
-#           把 mingw64/bin 内容放入 D:\Kiln\mingw-binutils\bin
+#           把 mingw64/bin 内容放入上述任一目录
 #
 # ── 关键坑(2026-10-04 实测定位, 勿回退) ────────────────────────────────────
 #   MSYS/Git Bash 的 PATH **查找** 只认 POSIX 形式路径 (/d/Kiln/...), 不认
@@ -69,7 +72,21 @@ is_ascii() {
 CARGO_HOME_WIN="${CARGO_HOME:-D:/software/rust/cargo}"
 RUSTUP_HOME_WIN="${RUSTUP_HOME:-D:/software/rust/rustup}"
 CARGO_TARGET_DIR_WIN="${CARGO_TARGET_DIR:-D:/AI-Root-target}"
-BINUTILS_BIN_WIN="${MINGW_BINUTILS_BIN:-D:/Kiln/mingw-binutils/bin}"
+
+# binutils 位置自动探测: 环境变量 > 新位置 > 旧位置
+# (2026-10-04 本机把 D:/Kiln/mingw-binutils 改成了 D:/Kiln/mingw64,
+#  硬编码单一旧路径会导致脚本直接失效, 故改为候选列表。)
+BINUTILS_BIN_WIN="${MINGW_BINUTILS_BIN:-}"
+if [ -z "$BINUTILS_BIN_WIN" ]; then
+  for cand in "D:/Kiln/mingw64/bin" "D:/Kiln/mingw-binutils/bin"; do
+    if [ -x "$(to_posix "$cand")/as.exe" ]; then
+      BINUTILS_BIN_WIN="$cand"
+      break
+    fi
+  done
+  # 都没找到时保留首选候选, 让下方校验给出明确报错
+  [ -z "$BINUTILS_BIN_WIN" ] && BINUTILS_BIN_WIN="D:/Kiln/mingw64/bin"
+fi
 
 CARGO_HOME_POSIX="$(to_posix "$CARGO_HOME_WIN")"
 RUSTUP_HOME_POSIX="$(to_posix "$RUSTUP_HOME_WIN")"
@@ -91,6 +108,8 @@ fi
 
 if [ ! -x "$BINUTILS_BIN_POSIX/as.exe" ]; then
   echo "[X] 未找到完整 MinGW binutils: $BINUTILS_BIN_POSIX/as.exe" >&2
+  echo "    已尝试: D:/Kiln/mingw64/bin, D:/Kiln/mingw-binutils/bin" >&2
+  echo "    可用 MINGW_BINUTILS_BIN 环境变量指定实际位置。" >&2
   echo "    获取方式见本脚本头部注释。" >&2
   exit 1
 fi

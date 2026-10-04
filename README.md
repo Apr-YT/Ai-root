@@ -11,8 +11,13 @@
 - 数据目录 ACL 最终形态：`SYSTEM(F) + Administrators(F) + 安装用户(R)`，且服务反复重启后保持稳定。
 
 ### 测试
-- 测试数 6 → **52**，其中 3 个 ACL 安全回归测试全部经**变异验证**（注入缺陷必须 FAILED）。
+- 测试数 6 → **57**：新增 5 个 `handle_client` 端到端测试（真实管道驱动全链路），
+  ACL 安全回归 3 个，全部经**变异验证**（注入缺陷必须精确 FAILED）。
 - 新增 `select_grant_sid()` 纯逻辑内核，使"进程身份 = SYSTEM"这一测试环境无法复现的前提可被单元测试覆盖。
+
+### 构建
+- `build.sh` / `build.ps1` 的 binutils 路径改为**自动探测**（`MINGW_BINUTILS_BIN` → `D:\Kiln\mingw64\bin` → `D:\Kiln\mingw-binutils\bin`），
+  不再硬编码单一目录（本机曾把 `mingw-binutils` 改名为 `mingw64`，硬编码会直接导致脚本失效）。
 
 ### 更早（2026-08-28）
 
@@ -416,7 +421,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 
 > ⚠ **gnu 构建的两个硬约束**（2026-10-04 实测定位）：
 >
-> 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。本机位于 `D:\Kiln\mingw-binutils\bin`（可用 `MINGW_BINUTILS_BIN` 覆盖）。获取：清华 msys2 镜像 `mingw-w64-x86_64-binutils-*.pkg.tar.zst`，解压后把 `mingw64/bin` 内容放入该目录。
+> 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。两个构建脚本按 `MINGW_BINUTILS_BIN`（环境变量）→ `D:\Kiln\mingw64\bin` → `D:\Kiln\mingw-binutils\bin` 顺序**自动探测**（见注释：2026-10-04 本机把目录从 `mingw-binutils` 改名为 `mingw64`，硬编码单路径会直接失效）。获取：清华 msys2 镜像 `mingw-w64-x86_64-binutils-*.pkg.tar.zst`，解压后把 `mingw64/bin` 内容放入上述任一目录。
 > 2. **Git Bash 下 PATH 只认 POSIX 形式**。把 `D:/Kiln/...` 或 `D:\Kiln\...` 写进 `PATH` 后，`command -v dlltool.exe` / `which` 一律查不到（不是 Permission denied，是彻底找不到），导致 cargo 解析回落到 `CARGO_HOME\bin` 的 rustup shim，最终报 `error calling dlltool 'dlltool.exe': program not found`。`build.sh` 用 `to_posix()` 统一转换，并直接调用 toolchain 内的真实 `cargo.exe`；`build.ps1` 侧为原生 Windows 路径语义，无此问题。
 > 3. **gnu 目标的 `CARGO_TARGET_DIR` 必须是纯 ASCII 路径**。MinGW binutils（`dlltool`/`ld`）按 ANSI 代码页解释路径参数，遇到非 ASCII（本项目路径含 `工具`）会把它毁成 `????`，报 `dlltool.exe: Can't create .lib file: ...\????\...\kernel32.dll_imports.lib` —— 错误信息里路径已乱码，极难定位。因此**不要**用仓库内默认的 `target/`（本项目路径非 ASCII），本机固定 `D:\AI-Root-target`。两个构建脚本均已加前置校验，命中时直接给出可执行的修复建议而非让链接期失败。
 
@@ -441,14 +446,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 cargo test --release --target x86_64-pc-windows-gnu
 ```
 
-当前 **52 个测试**（2026-10-04 从 6 个扩充：44 个单元测试 + 5 个真实管道集成测试 + 3 个 ACL 安全回归测试），分布：
+当前 **57 个测试**（2026-10-04 从 6 个扩充：44 个单元测试 + 5 个真实管道集成测试 + 3 个 ACL 安全回归测试 + 5 个 `handle_client` 端到端测试），分布：
 
 | 模块 | 数量 | 覆盖内容 |
 |---|---|---|
 | `exec` | 6 | cmd 元字符转义（引号内/外、`^`/`&`、未闭合引号） |
 | `common` | 3 | `set_dir_acl` 安全回归：剥离继承的 Users 写权限（§4.1 缺陷 A）+ 幂等性 + **不得把 SYSTEM 降级为只读**（§4.1.1 缺陷 C，含 `select_grant_sid` 纯函数全组合断言） |
 | `protocol` | 27 | `validate_request` 全字段边界（令牌长度/命令 8191/cwd MAX_PATH/超时上下限/校验顺序）；序列化向后兼容；`write_frame` 帧编码与 flush；**`read_frame_timeout` 真实命名管道集成测试**（正常往返、300 KB 大帧、空闲超时、超长长度前缀拒绝、对端关闭） |
-| `server` | 16 | `ct_eq` 恒定时间比较（含逐字节差异、首末字节）；`AuthThrottle` 熔断阈值/窗口重置/锁定过期；`record_sid_fail` 定向封禁/隔离/窗口过期 |
+| `server` | 21 | `ct_eq` 恒定时间比较（含逐字节差异、首末字节）；`AuthThrottle` 熔断阈值/窗口重置/锁定过期；`record_sid_fail` 定向封禁/隔离/窗口过期；**`handle_client` 端到端**（见下） |
 
 > **集成测试用真实命名管道**：`read_frame_timeout` 的 5 个测试通过 `make_pipe_pair()` 在进程内自建 `CreateNamedPipeW` + `CreateFileW` 管道对（管道名含 `pid` + 测试标签，保证并行安全），**不 mock 任何 IO**。因此它真实覆盖了 `PeekNamedPipe` 轮询、分段超时预算、`FRAME_MAX_SIZE` 长度前缀校验这几条最容易出安全 bug 的路径。
 >
@@ -460,18 +465,22 @@ cargo test --release --target x86_64-pc-windows-gnu
 >
 > §4.1.1 缺陷 C 的变异验证同样有价值：首版测试直接断言 `granted_user_sid() != S-1-5-18`，注入变异（改回 `get_user_sid()`）后**测试仍全绿**——因为测试进程本来就不是 SYSTEM。把选 SID 的逻辑抽成纯函数 `select_grant_sid()` 后可注入 `(SYSTEM, SYSTEM)` 组合，两种变异（persisted 守卫、current 守卫）随即均 FAILED。**教训：无法在测试环境复现的前提（此处是"进程身份 = SYSTEM"），要么抽成纯函数，要么就不算被测到。**
 
+> **`handle_client` 端到端测试（5 个）**：真实驱动「读请求帧 → 序列化校验 → 鉴权 → 执行 → 回写响应」全链路，主线程当客户端、工作线程跑真实 `handle_client`，**不 mock 任何环节**。覆盖：有效令牌正常执行、错误令牌拒绝且不执行命令、禁用开关生效、退出码透传（`cmd /c exit 7` → 7）、非法请求在执行前被拦。
+>
+> 环境隔离三要点：① `AIROOT_DATA_DIR` 指向临时目录（令牌/flag 才有测试值）；② `AUTH_THROTTLE`/`SID_FAILS`/`ACTIVE_CONNS` 是进程级 static，必须用全局锁 `E2E_LOCK` **串行化**本组用例；③ `LOGGER`（OnceLock）首次写日志即绑定目录，故本组共享同一 `AIROOT_DATA_DIR`。
+>
+> 变异验证（均精确命中，每次只有对应那一个测试 FAILED）：① 取消鉴权（`ct_eq` 恒真）→ 仅 `e2e_..._rejects_wrong_token` 失败；② 去掉 `is_enabled()` 检查 → 仅 `e2e_..._respects_disabled_flag` 失败；③ 退出码硬编码为 0 → 仅 `e2e_..._passes_through_exit_code` 失败。
+
 > **测试用真实被测代码**：帧测试真实调用 `write_frame` 并校验落盘字节，而非在测试内重抄一遍编码逻辑（后者是「伪测试」——实现改错也照样通过）。
 >
 > **阈值类断言硬编码期望值**，而非引用常量。否则「改常量」的变异不会被检出（测试跟着一起变）。这些数值是对外承诺的行为契约（见 4.1），变更应是有意识的决策。
 >
 > **尚未覆盖**（已知缺口，优先级从高到低）：
-> - `handle_client` 端到端流程（鉴权→执行→回写）、`connect_client` 的 `ERROR_PIPE_BUSY` 重试路径
+> - `connect_client` 的 `ERROR_PIPE_BUSY` 重试路径（需构造「实例全忙」场景，较难稳定复现）
 > - 命令黑名单（`format ` 等）的匹配规则
 > - 输出截断（1MB）、GBK 回退解码
->
-> 端到端验证目前靠手工执行（`server` 前台 + `run` 组合），**尚未固化为自动化测试**。
 
-> 📌 **现状核对（2026-10-04）**：下述交付目录**当前均不存在** —— `D:\project\workbuddy\工具\AI-Root-build\` 与 `D:\Finished product\AI-Root\` 都未创建，`D:\Kiln\` 下也只有 `mingw-binutils`（无 `AI-Root` 部署目录）。构建产物目前只落在 `CARGO_TARGET_DIR`（本机 `D:\AI-Root-target\x86_64-pc-windows-gnu\release\AI-Root.exe`）。首次部署时需按下文流程创建。
+> 📌 **现状核对（2026-10-04）**：下述交付目录**当前均不存在** —— `D:\project\workbuddy\工具\AI-Root-build\` 与 `D:\Finished product\AI-Root\` 都未创建。`D:\Kiln\` 下有 `AI-Root`（服务部署副本，服务已安装运行）。构建产物落在 `CARGO_TARGET_DIR`（本机 `D:\AI-Root-target\x86_64-pc-windows-gnu\release\AI-Root.exe`）。首次部署时需按下文流程创建。
 
 **产物交付目录 `AI-Root-build\`**（与源码平级，`D:\project\workbuddy\工具\AI-Root-build\`）：
 

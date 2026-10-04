@@ -1012,5 +1012,236 @@ mod tests {
         );
         assert!(MAX_AUTH_FAILS_PER_SID > 0);
     }
+
+    // ================= handle_client 端到端流程 =================
+    //
+    // 这一组测试真实驱动 `handle_client`（鉴权 → 执行 → 回写全链路），
+    // 而非只测它的某个纯函数片段。此前该流程**只有手工验证、零自动化覆盖**，
+    // 是最容易在重构中静默损坏的部分。
+    //
+    // ⚠ 测试环境隔离（三个必须处理的全局状态）：
+    //   1. `common::data_dir()` → 用 `AIROOT_DATA_DIR` 指向临时目录，
+    //      `cached_token()` / `is_enabled()` 才会读到测试令牌与 flag；
+    //   2. `AUTH_THROTTLE` / `SID_FAILS` / `ACTIVE_CONNS` 是**进程级 static**，
+    //      cargo 默认多线程跑测试 → 必须用一把全局测试锁把本组用例**串行化**，
+    //      否则一个用例的失败计数会污染另一个用例的鉴权结果；
+    //   3. `LOGGER`（OnceLock）首次写日志时按当时的 `data_dir()` 绑定句柄，
+    //      一旦绑定就不再改 → 本组共享同一个 `AIROOT_DATA_DIR`，日志落同一处。
+    static E2E_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 端到端测试专用数据目录（进程内唯一；本组共享，保证 LOGGER 绑定一致）。
+    fn e2e_data_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("airoot-e2e-{}", std::process::id()))
+    }
+
+    /// 建立一条「服务端 File ←→ 客户端 File」的真实命名管道对，两端在**同一进程内**连接。
+    ///
+    /// 管道名固定为本测试专用名：`handle_client` 要用 `GetNamedPipeClientProcessId` 取对端
+    /// PID，本进程即是"客户端"，故能取到真实 PID（非 0），从而走到真实身份解析分支。
+    fn e2e_pipe_pair(tag: &str) -> (File, File) {
+        use std::sync::mpsc;
+        let name = format!(r"\\.\pipe\airoot-e2e-{}-{}", std::process::id(), tag);
+        let wide = common::to_wide(&name);
+        let (tx, rx) = mpsc::channel::<bool>();
+
+        let name_for_thread = wide.clone();
+        let srv_thread = std::thread::spawn(move || -> Option<File> {
+            let h = unsafe {
+                winapi_raw::CreateNamedPipeW(
+                    name_for_thread.as_ptr(),
+                    winapi_raw::PIPE_ACCESS_DUPLEX,
+                    winapi_raw::PIPE_TYPE_BYTE | winapi_raw::PIPE_READMODE_BYTE,
+                    winapi_raw::PIPE_UNLIMITED_INSTANCES,
+                    65536,
+                    65536,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if h == winapi_raw::INVALID_HANDLE_VALUE {
+                tx.send(false).unwrap();
+                return None;
+            }
+            tx.send(true).unwrap();
+            let ok = unsafe { winapi_raw::ConnectNamedPipe(h, std::ptr::null_mut()) };
+            let err = unsafe { winapi_raw::GetLastError() };
+            if ok == 0 && err != winapi_raw::ERROR_PIPE_CONNECTED {
+                unsafe { winapi_raw::CloseHandle(h) };
+                return None;
+            }
+            Some(unsafe { File::from_raw_handle(h as RawHandle) })
+        });
+
+        assert!(rx.recv().expect("管道创建失败"), "CreateNamedPipeW 失败");
+        let cli_h = unsafe {
+            winapi_raw::CreateFileW(
+                wide.as_ptr(),
+                winapi_raw::GENERIC_READ | winapi_raw::GENERIC_WRITE,
+                winapi_raw::FILE_SHARE_READ | winapi_raw::FILE_SHARE_WRITE,
+                std::ptr::null(),
+                winapi_raw::OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            cli_h != winapi_raw::INVALID_HANDLE_VALUE,
+            "客户端连接失败 (last_err={})",
+            unsafe { winapi_raw::GetLastError() }
+        );
+        let srv = srv_thread.join().unwrap().expect("服务端连接失败");
+        let cli = unsafe { File::from_raw_handle(cli_h as RawHandle) };
+        (srv, cli)
+    }
+
+    /// 准备端到端环境：设置 `AIROOT_DATA_DIR`、写测试令牌与 enabled flag。返回令牌。
+    /// 调用方**必须**持有 `E2E_LOCK`。
+    fn e2e_setup() -> String {
+        let dir = e2e_data_dir();
+        std::fs::create_dir_all(&dir).expect("创建测试数据目录失败");
+        std::env::set_var("AIROOT_DATA_DIR", &dir);
+        let token = "0123456789abcdef".repeat(4); // 64 位 hex，与真实令牌同形
+        std::fs::write(dir.join("token.txt"), &token).expect("写测试令牌失败");
+        std::fs::write(dir.join("enabled.flag"), b"1").expect("写启用标志失败");
+        token
+    }
+
+    /// 一次完整对话：服务端线程跑 `handle_client`，主线程当客户端收发帧。返回响应。
+    fn e2e_roundtrip(tag: &str, req_json: &str) -> Response {
+        let (srv, mut cli) = e2e_pipe_pair(tag);
+
+        let srv_thread = std::thread::spawn(move || {
+            handle_client(srv);
+        });
+
+        protocol::write_frame(&mut cli, req_json.as_bytes()).expect("写请求帧失败");
+        let resp_bytes =
+            protocol::read_frame_timeout(&mut cli, 10_000).expect("读响应帧应成功");
+        let resp: Response = serde_json::from_slice(&resp_bytes).expect("响应应为合法 JSON");
+
+        srv_thread.join().expect("服务端线程 panic");
+        resp
+    }
+
+    /// 端到端正向：正确令牌 + 简单命令 → ok=true、exit_code=0、stdout 含预期输出。
+    /// 这是整条链路的主干契约；破坏鉴权/执行/回写任一环，本测试必须 FAILED。
+    #[test]
+    fn e2e_handle_client_executes_command_with_valid_token() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+
+        let mark = format!("AIROOT_E2E_OK_{}", std::process::id());
+        let req = serde_json::json!({
+            "token": token,
+            "command": format!("echo {}", mark),
+        })
+        .to_string();
+
+        let resp = e2e_roundtrip("ok", &req);
+
+        assert!(resp.ok, "有效令牌的请求应成功，实际 error={:?}", resp.error);
+        assert_eq!(resp.exit_code, 0, "echo 应返回 0");
+        assert!(
+            resp.stdout.contains(&mark),
+            "stdout 应包含预期标记 {mark}，实际 stdout={:?}",
+            resp.stdout
+        );
+        assert!(resp.error.is_none(), "成功响应不应带 error");
+    }
+
+    /// 端到端反向：错误令牌 → ok=false、exit_code=-1、error 非空，且**不执行命令**。
+    /// 变异验证：把 `ct_eq(&req.token, &token)` 改成恒真（取消鉴权），本测试必须 FAILED。
+    #[test]
+    fn e2e_handle_client_rejects_wrong_token() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        e2e_setup();
+
+        let mark = format!("AIROOT_E2E_LEAK_{}", std::process::id());
+        let req = serde_json::json!({
+            "token": "deadbeefdeadbeef".repeat(4), // 长度合法、字形接近，但不是真实令牌
+            "command": format!("echo {}", mark),
+        })
+        .to_string();
+
+        let resp = e2e_roundtrip("badtoken", &req);
+
+        assert!(!resp.ok, "错误令牌必须被拒绝");
+        assert_eq!(resp.exit_code, -1, "鉴权失败 exit_code 应为 -1");
+        assert!(resp.error.is_some(), "鉴权失败必须带 error 说明");
+        assert!(
+            !resp.stdout.contains(&mark),
+            "鉴权失败绝不能执行命令（stdout 泄露了输出：{:?}）",
+            resp.stdout
+        );
+    }
+
+    /// 端到端：中继被禁用（无 enabled.flag）→ 拒绝执行，即使令牌正确。
+    /// 变异验证：去掉 `is_enabled()` 检查，本测试必须 FAILED。
+    #[test]
+    fn e2e_handle_client_respects_disabled_flag() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+        let flag = e2e_data_dir().join("enabled.flag");
+        let _ = std::fs::remove_file(&flag);
+
+        let req = serde_json::json!({
+            "token": token,
+            "command": "echo should_not_run",
+        })
+        .to_string();
+        let resp = e2e_roundtrip("disabled", &req);
+
+        // 恢复标志，避免影响同组后续用例
+        std::fs::write(&flag, b"1").expect("恢复启用标志失败");
+
+        assert!(!resp.ok, "禁用状态下必须拒绝");
+        assert!(
+            resp.error.as_deref().unwrap_or("").contains("禁用"),
+            "错误信息应说明中继已禁用，实际 {:?}",
+            resp.error
+        );
+        assert!(!resp.stdout.contains("should_not_run"));
+    }
+
+    /// 端到端：退出码透传（`cmd /c exit 7` → exit_code=7，ok=true 表示中继层成功）。
+    /// 区分「中继层成功」与「被执命令成功」是协议关键语义（README §3.6）。
+    #[test]
+    fn e2e_handle_client_passes_through_exit_code() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+
+        let req = serde_json::json!({
+            "token": token,
+            "command": "cmd /c exit 7",
+        })
+        .to_string();
+        let resp = e2e_roundtrip("exitcode", &req);
+
+        assert!(resp.ok, "中继层应视为成功（命令已执行完）");
+        assert_eq!(resp.exit_code, 7, "被执命令退出码应原样透传");
+    }
+
+    /// 端到端：非法请求（令牌长度不对）在**执行前**被 `validate_request` 拦截。
+    #[test]
+    fn e2e_handle_client_rejects_invalid_request_before_exec() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        e2e_setup();
+
+        let req = serde_json::json!({
+            "token": "tooshort",
+            "command": "echo should_not_run",
+        })
+        .to_string();
+        let resp = e2e_roundtrip("invalid", &req);
+
+        assert!(!resp.ok);
+        assert_eq!(resp.exit_code, -1);
+        assert!(
+            resp.error.as_deref().unwrap_or("").contains("验证失败"),
+            "应为请求验证失败，实际 {:?}",
+            resp.error
+        );
+        assert!(!resp.stdout.contains("should_not_run"));
+    }
 }
 
