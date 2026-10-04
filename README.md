@@ -3,7 +3,66 @@
 > **面向 AI 智能体自调用的 LocalSystem 提权命令中继。**
 > 非提权（普通用户）的智能体进程，仅凭一个共享令牌即可通过命名管道以 `SYSTEM` 权限自治执行命令，全程无需 UAC 弹窗。本工具的主要消费方是 AI 智能体本身，文档聚焦于「如何可靠对接」而非「人怎么敲命令」。
 
+## 快速开始
+
+**你是哪种情况？**
+
+| 情况 | 怎么做 |
+|---|---|
+| **只想用**（要一个能跑的 `AI-Root.exe`） | 直接取 `D:\Finished product\AI-Root\AI-Root.exe`，**无需构建**。部署见 [§2](#2-部署仅需一次管理员)。 |
+| **要改代码 / 自己构建** | 见下方「从源码构建」。 |
+
+### 从源码构建
+
+前置：**Rust（rustup）**。若未安装：
+
+```powershell
+winget install Rustlang.Rustup
+# 或访问 https://rustup.rs
+```
+
+**推荐路线：msvc**（Windows 上 Rust 开发的标准做法，无需额外配置 binutils）
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-msvc
+# 并安装 VS Build Tools（提供 link.exe）：
+#   https://visualstudio.microsoft.com/visual-cpp-build-tools/
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
+```
+
+**备选路线：gnu**（不依赖 VS，但**需要额外装 MinGW binutils**）
+
+```bash
+# Git Bash 下执行
+# gnu 链接期需要完整 binutils（含 as.exe）；rustup 自带的那份缺 as.exe。
+# 先装 binutils（三选一，见脚本报错提示），再：
+export MINGW_BINUTILS_BIN=/c/msys64/mingw64/bin   # 指向含 as.exe 的目录
+bash build.sh
+```
+
+产物：`<仓库>\target\<target>\release\AI-Root.exe`。
+
+> 两个脚本都会**自动探测**工具链位置，正常无需设置任何环境变量。
+> 依赖缺失时会直接打印可复制执行的安装命令。
+
+**可用环境变量**（均有自动探测，通常无需设置）：
+
+| 变量 | 用途 |
+|---|---|
+| `AIROOT_RUST_ROOT` | rust 根目录（含 `cargo/` 与 `rustup/`），rust 装在非默认位置时用 |
+| `AIROOT_TARGET` | 目标三元组（默认 `x86_64-pc-windows-gnu`） |
+| `MINGW_BINUTILS_BIN` | MinGW binutils 的 `bin` 目录（仅 gnu 目标需要） |
+| `CARGO_TARGET_DIR` | 产物目录（默认 `<仓库>/target`） |
+
 ## 最近更新（2026-10-04）
+
+### 构建
+- **仓库迁至纯 ASCII 路径** `D:\project\workbuddy\tools\AI-Root`，根治 MinGW `ld`/`dlltool` 无法处理含中文的产物路径问题。
+- **构建脚本大幅简化**，并把配置下沉到 `.cargo/config.toml`（单一事实来源）。
+- **脚本改为「向系统自省」而非猜测路径**：rust 根由 `rustup show home` 反推，不再依赖硬编码位置；
+  本机私有路径仅作最后兜底，**他人机器上不命中也不影响**。
+- **依赖自检与可行动报错**：缺 rustup / 缺 toolchain / 缺 binutils 时，直接打印可复制执行的修复命令。
+- 修复 `build.ps1` 不回写 `CARGO_HOME`/`RUSTUP_HOME` 的缺陷（曾导致两脚本使用不同 registry 源）。
 
 ### 安全修复（本轮）
 - **§4.1 目录 ACL 隔离缺陷 A/B**：`set_dir_acl` 原先既未清除继承来的 `Users` 写权限（任意本地用户可覆写 `token.txt` 自授权拿 SYSTEM），又因 SID 缺 `*` 前缀导致授权静默全失败。已修复为 `/inheritance:r` + 逐条独立授权 + 收尾自检。
@@ -14,18 +73,6 @@
 - 测试数 6 → **57**：新增 5 个 `handle_client` 端到端测试（真实管道驱动全链路），
   ACL 安全回归 3 个，全部经**变异验证**（注入缺陷必须精确 FAILED）。
 - 新增 `select_grant_sid()` 纯逻辑内核，使"进程身份 = SYSTEM"这一测试环境无法复现的前提可被单元测试覆盖。
-
-### 构建
-- **仓库迁至纯 ASCII 路径** `D:\project\workbuddy\tools\AI-Root`，根治 MinGW `ld`/`dlltool` 无法处理含中文的产物路径问题。
-- **构建脚本大幅简化**：`build.sh` 212 → 116 行、`build.ps1` 207 → 约 145 行。
-  配置下沉到 `.cargo/config.toml`（单一事实来源），产物统一落**仓库内 `target/`**，
-  不再使用外部 `CARGO_TARGET_DIR`，不再需要 ASCII 前置校验。
-- binutils / rust 根目录仍**自动探测**（`MINGW_BINUTILS_BIN` → `D:\Kiln\mingw64\bin` → `D:\Kiln\mingw-binutils\bin`；
-  rust 根支持 `AIROOT_RUST_ROOT` → 环境变量推导 → 候选探测），但每个候选都会**校验真实存在**才采用
-  （已运行的 shell 会话可能带迁移前的陈旧环境变量）。
-- **修复缺陷**：`build.ps1` 此前只读取 `CARGO_HOME`/`RUSTUP_HOME` 用于推导 rustup 根，
-  却**不回写**修正值 → 会话带着陈旧值时 cargo 从上游 `index.crates.io` 重新下载全套 crate，
-  导致与 `build.sh`（用 rsproxy 镜像）产出**两套 registry 的二进制**。现已无条件回写。
 
 > **关于二进制可复现性（实测结论，勿再追查）**：两脚本在**同一台机器、同一源码**下产出的 exe
 > 仍不会逐字节一致，且**同一脚本连续两次也不一致**。原因不在脚本，而在上游：
@@ -422,31 +469,49 @@ SYSTEM 只剩**只读**，于是以 LocalSystem 运行的服务**无法再写** 
 
 当前为**单一纯终端版**（无 `gui` feature、无双变体），构建产物仅 `AI-Root.exe`。
 
-```bash
-# 本机构建（git bash 执行 build.sh）
-bash build.sh
-# → target/x86_64-pc-windows-gnu/release/AI-Root.exe（约 1.09 MB，MinGW 静态链接 CRT）
+> 新人请先看文首的 [快速开始](#快速开始)。本节讲设计取舍。
 
-# 或 PowerShell（本机与 CI 通用，自动选 target）
+```bash
+# gnu（Git Bash；需要外部 MinGW binutils，见下）
+bash build.sh
+
+# 自动选 target（本机与 CI 通用；msvc 无需额外 binutils）
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 ```
 
 **构建架构（2026-10-04 重构）**：配置与脚本职责分离。
 
 - **`.cargo/config.toml`**：承载所有与机器无关的稳定配置（`target-dir` 等）。单一事实来源。
-- **`build.sh` / `build.ps1`**：只做**与机器相关**的事 —— 找出本机完整 MinGW binutils 并注入 PATH，然后调 cargo。
+- **`build.sh` / `build.ps1`**：只做**与机器相关**的事 —— 定位工具链、注入 binutils、调 cargo。
   两者共享 `.cargo/config.toml`，不再各自维护一份会漂移的重复逻辑。
 
-**产物统一落仓库内 `target/`**（各脚本从 212/207 行削至 116/约 140 行）。
+**脚本的定位策略：优先向系统自省，而非猜测路径。**
+
+| 信息 | 获取方式 | 可移植性 |
+|---|---|---|
+| rust 根 | `rustup show home` 反推（**并校验 toolchain 真实存在**） | 高——只要 rustup 在 PATH |
+| cargo | 直连 toolchain 内的 `cargo.exe`（绕开 rustup shim） | 高 |
+| binutils | `MINGW_BINUTILS_BIN` → PATH 中的 `as.exe` → 本机兜底 | 中——gnu 需用户提供 |
+
+> 硬编码的 `D:\Kiln\...` 等本机私有路径**仅作最后兜底**，他人机器上不命中也不影响。
+>
+> ⚠ **`rustup show home` 只回显 `$RUSTUP_HOME`，不验证其存在性**。新装/迁移后会话常残留陈旧值
+> （指向已删目录），直接采信会得到"工具链不存在"的假结论。故**所有候选都必须校验后才采用**。
+>
+> ⚠ **区分 `TARGET`(目标三元组) 与 `TOOLCHAIN`(工具链名)**：二者不同名
+> （工具链目录形如 `stable-x86_64-pc-windows-gnu`，多 `stable-` 前缀），混用会导致误判。
+
+**依赖自检**：缺 rustup / toolchain / binutils 时，脚本直接打印可复制执行的修复命令，
+而不是让用户对着链接期报错猜。
 
 **`build.ps1` 自动选 target**：
 
-1. 已装 `x86_64-pc-windows-msvc` 且能找到 `link.exe`（VS Build Tools）→ msvc（CI `windows-latest` 走此路径）。
+1. 已装 `x86_64-pc-windows-msvc` 且能找到 `link.exe`（VS Build Tools）→ msvc（CI `windows-latest` 走此路径，**且无需外部 binutils**）。
 2. 否则若已装 `x86_64-pc-windows-gnu` → gnu，并注入完整 MinGW binutils。
 
 > ⚠ **gnu 构建的硬约束**（2026-10-04 实测定位）：
 >
-> 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。两个脚本按 `MINGW_BINUTILS_BIN`（环境变量）→ `D:\Kiln\mingw64\bin` → `D:\Kiln\mingw-binutils\bin` 顺序**自动探测**（本机曾把目录从 `mingw-binutils` 改名为 `mingw64`，硬编码单路径会直接失效）。获取：清华 msys2 镜像 `mingw-w64-x86_64-binutils-*.pkg.tar.zst`，解压后把 `mingw64/bin` 内容放入上述任一目录。
+> 1. **需要含 `as.exe` 的完整 binutils**。rustup 的 `self-contained` 目录实测只有 `dlltool.exe`/`ld.exe`/`x86_64-w64-mingw32-gcc.exe`，**缺 `as.exe`**，不能单独使用。两个脚本按 `MINGW_BINUTILS_BIN`（环境变量）→ `PATH` 中已有 `as.exe` → 本机兜底顺序**自动探测**。安装方式见脚本报错提示（MSYS2 或清华镜像）。
 > 2. **Git Bash 下 PATH 只认 POSIX 形式**。把 `D:/Kiln/...` 或 `D:\Kiln\...` 写进 `PATH` 后，`command -v dlltool.exe` / `which` 一律查不到（不是 Permission denied，是彻底找不到），导致 cargo 回落到 `CARGO_HOME\bin` 的 rustup shim，最终报 `error calling dlltool 'dlltool.exe': program not found`。`build.sh` 用 `to_posix()` 统一转换，并直连 toolchain 内的真实 `cargo.exe`；`build.ps1` 为原生 Windows 路径语义，无此问题。
 >
 > 📌 **关于「仓库路径必须纯 ASCII」**（2026-10-04 根治）：

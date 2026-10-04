@@ -31,17 +31,32 @@ $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 
 # ---- 0) 定位 rustup 根目录 ----
-# ⚠ 候选必须**逐个校验 toolchains 目录确实存在**后才采用:
-#   本机曾把 rust 从 D:\software\rust 迁到 D:\Kiln\rust, 用户级环境变量已更新,
-#   但**已在运行的会话仍带迁移前的旧 $env:RUSTUP_HOME**(陈旧继承)。
-#   若不校验直接采信, 会指向已不存在的目录 → 构建失败且报错无提示。
+# 顺序: 显式环境变量 → rustup 自省 → 常见位置 → 本机私有位置兜底
+#
+# ⚠ 所有候选必须**校验 toolchains 目录确实存在**后才采用。
+#   `rustup show home` 只是回显 $RUSTUP_HOME, 并不验证存在性;
+#   新装/迁移后会话里常残留陈旧值(目录已删), 直接采信会得到"工具链不存在"的假结论。
 function Resolve-RustupRoot {
     $candidates = @()
+
+    # 1) 显式指定
     if ($env:AIROOT_RUST_ROOT) { $candidates += (Join-Path $env:AIROOT_RUST_ROOT "rustup") }
     if ($env:RUSTUP_HOME)      { $candidates += $env:RUSTUP_HOME }
+
+    # 2) 让 rustup 自省(可移植关键: 不依赖硬编码路径)
+    $rustupCmd = Get-Command rustup -ErrorAction SilentlyContinue
+    if ($rustupCmd) {
+        $home = & $rustupCmd.Source show home 2>$null | Select-Object -First 1
+        if ($home) { $candidates += $home }
+    }
+
+    # 3) 常见默认位置
     $candidates += (Join-Path $env:USERPROFILE ".rustup")
-    $candidates += "D:\Kiln\rust\rustup"        # 本机当前实际位置
-    $candidates += "D:\software\rust\rustup"    # 旧位置, 保留兼容
+
+    # 4) 本机私有位置兜底(他人机器上不命中)
+    $candidates += "D:\Kiln\rust\rustup"
+    $candidates += "D:\software\rust\rustup"
+
     foreach ($c in $candidates) {
         if ($c -and (Test-Path (Join-Path $c "toolchains"))) { return $c }
     }
@@ -52,8 +67,12 @@ $rustupRoot = Resolve-RustupRoot
 if (-not $rustupRoot) {
     Write-Error @"
 未找到 rustup 根目录(含 toolchains 子目录)。
-已尝试: AIROOT_RUST_ROOT, RUSTUP_HOME, $env:USERPROFILE\.rustup, D:\Kiln\rust\rustup, D:\software\rust\rustup
-可用 AIROOT_RUST_ROOT 环境变量指定 rust 根目录(含 cargo\ 与 rustup\)。
+已尝试: AIROOT_RUST_ROOT, RUSTUP_HOME, rustup 自省, %USERPROFILE%\.rustup, 本机兜底路径
+
+请先安装 Rust(含 rustup):
+  winget install Rustlang.Rustup
+或访问 https://rustup.rs。安装后重开终端再试。
+若 rust 装在非默认位置, 可用 AIROOT_RUST_ROOT 指定其根目录(含 cargo\ 与 rustup\)。
 "@
 }
 $toolchainsDir = Join-Path $rustupRoot "toolchains"
@@ -93,7 +112,15 @@ if (Test-Path $msvcDir) {
 }
 if (-not $TARGET -and (Test-Path $gnuDir)) { $TARGET = "x86_64-pc-windows-gnu" }
 if (-not $TARGET) {
-    Write-Error "未找到可用工具链(需 msvc 工具链+link.exe, 或 gnu 工具链)。请先 rustup toolchain install stable"
+    Write-Error @"
+未找到可用工具链。
+  msvc 需: stable-x86_64-pc-windows-msvc 工具链 + Visual Studio Build Tools(提供 link.exe)
+  gnu  需: stable-x86_64-pc-windows-gnu 工具链 + MinGW binutils(提供 as.exe)
+
+推荐装 msvc(Windows 上 Rust 开发的标准做法, 无需额外配 binutils):
+  rustup toolchain install stable-x86_64-pc-windows-msvc
+  # 并安装 VS Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+"@
 }
 
 # ---- 2) 定位该 target 的 cargo ----
@@ -111,19 +138,28 @@ if (-not $cargoExe) { Write-Error "未找到 cargo, 请先安装 Rust (rustup)" 
 if ($TARGET -eq "x86_64-pc-windows-gnu") {
     $binutilsCandidates = @()
     if ($env:MINGW_BINUTILS_BIN) { $binutilsCandidates += $env:MINGW_BINUTILS_BIN }
-    $binutilsCandidates += "D:\Kiln\mingw64\bin"         # 本机当前实际位置
-    $binutilsCandidates += "D:\Kiln\mingw-binutils\bin"  # 旧位置, 保留兼容
+    # PATH 里已有的 as.exe(如 MSYS2/系统装的 binutils)
+    $asOnPath = Get-Command as.exe -ErrorAction SilentlyContinue
+    if ($asOnPath) { $binutilsCandidates += (Split-Path -Parent $asOnPath.Source) }
+    # 本机私有位置兜底(他人机器上不命中)
+    $binutilsCandidates += "D:\Kiln\mingw64\bin"
+    $binutilsCandidates += "D:\Kiln\mingw-binutils\bin"
     $binutils = $binutilsCandidates | Where-Object { $_ -and (Test-Path (Join-Path $_ "as.exe")) } | Select-Object -First 1
     if (-not $binutils) {
         Write-Error @"
-[gnu] 未找到含 as.exe 的完整 MinGW binutils (dlltool 链接期需要 as)。
-已探测:
-$(($binutilsCandidates | ForEach-Object { "  - $_" }) -join "`n")
-请任选其一:
-  A) 下载完整 binutils 到 D:\Kiln\mingw64\bin
-     清华镜像: https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/mingw64/mingw-w64-x86_64-binutils-2.43.1-1-any.pkg.tar.zst
-  B) 安装 Visual Studio Build Tools 后改用 msvc target(CI 即此路径)
-  C) 设置环境变量 MINGW_BINUTILS_BIN 指向已有的 binutils\bin
+[gnu] 需要完整 MinGW binutils(含 as.exe), 未找到。
+rustup 自带的 self-contained 目录缺 as.exe, 无法独立完成链接。
+
+三选一:
+  A) 改用 msvc(推荐, 无需额外配 binutils):
+       安装 VS Build Tools 后:
+         rustup toolchain install stable-x86_64-pc-windows-msvc
+         powershell -File build.ps1
+  B) 用 MSYS2 安装 binutils:
+       pacman -S mingw-w64-x86_64-binutils
+       然后 \$env:MINGW_BINUTILS_BIN = "C:\msys64\mingw64\bin"
+  C) 已有 binutils 时直接指定其 bin 目录:
+       \$env:MINGW_BINUTILS_BIN = "<你的 binutils>\bin"
 "@
     }
     # 顺序: binutils 在 toolchain bin **之前**, 确保同名工具(dlltool/as/ld)用完整版。
