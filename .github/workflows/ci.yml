@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   # 构建产物统一放 runner 临时目录, 不污染 checkout
@@ -26,3 +27,26 @@ jobs:
       - name: Build (release)
         shell: pwsh
         run: ./build.ps1
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\AI-Root.exe"
+          if (-not (Test-Path $exe)) { throw "构建产物不存在: $exe" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item $exe dist\AI-Root.exe
+          # 附带安装所需的辅助脚本与资源(若存在)
+          foreach ($f in @("build.ps1", "README.md")) {
+            if (Test-Path $f) { Copy-Item $f dist\ }
+          }
+          Get-ChildItem dist | Format-Table Name, Length
+          # 输出产物 SHA256, 供下载后校验
+          (Get-FileHash dist\AI-Root.exe -Algorithm SHA256).Hash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Root-windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
