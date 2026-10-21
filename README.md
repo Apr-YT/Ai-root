@@ -9,11 +9,20 @@
 用命名管道把命令转交给 LocalSystem 服务执行，让非提权的智能体进程拿到 SYSTEM 权限，不需要 UAC 弹窗。装一次服务，之后靠一个共享令牌和一份服务端授权策略运行。
 
 ```text
-  AI 智能体 (非提权)                      AI-Root 服务 (LocalSystem)
-  ┌──────────────┐   \\.\pipe\AI-Root   ┌────────────────────────┐
-  │  subprocess  │ ──── 令牌 + 命令 ───> │  鉴权 → 执行 cmd /C    │
-  │  读取令牌文件 │ <─── 退出码 + 输出 ── │  (SYSTEM 最高权限)     │
-  └──────────────┘                      └────────────────────────┘
+AI 智能体（非提权进程）
+  │
+  ├─ 读 %ProgramData%\AI-Root\secrets\token.txt
+  ├─ 连命名管道 \\.\pipe\AI-Root，发「令牌 + 请求」
+  │
+  ▼
+AI-Root 服务（LocalSystem）
+  │
+  ├─ 校验令牌
+  ├─ 策略判定：Allow / Confirm / Deny
+  └─ 以 SYSTEM 执行程序或命令
+  │
+  ▼
+退出码 + stdout / stderr 返回调用方
 ```
 
 ---
