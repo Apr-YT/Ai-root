@@ -115,7 +115,7 @@ fn main() {
             // 需对 token.txt 有写权限（管理员/SYSTEM）；输出仅打印一次，勿写入日志。
             match common::rotate_token() {
                 Ok(tok) => {
-                    println!("✓ 令牌已轮换（服务端自动热加载，旧令牌立即失效）");
+                    println!("[ok] 令牌已轮换（服务端自动热加载，旧令牌立即失效）");
                     println!("新令牌: {tok}");
                     println!("[安全] 令牌等同 SYSTEM 凭据，请妥善传递，勿写入日志/提交仓库");
                     Ok(())
@@ -143,8 +143,8 @@ fn main() {
             match service::query_status() {
                 Ok(state) => {
                     let (label, code) = match state {
-                        ServiceState::Running => ("● 运行中", C_GREEN),
-                        ServiceState::Stopped => ("○ 已停止", C_DIM),
+                        ServiceState::Running => ("运行中", C_GREEN),
+                        ServiceState::Stopped => ("已停止", C_DIM),
                         ServiceState::StartPending | ServiceState::StopPending => {
                             ("◐ 启动/停止中…", C_YELLOW)
                         }
@@ -593,7 +593,7 @@ fn do_approve(id: Option<&str>) -> Result<(), String> {
     require_admin()?;
     let dir = common::data_dir();
     let r = consent::approve(&dir, id)?;
-    println!("✓ 已批准请求 {}", r.id);
+    println!("[ok] 已批准请求 {}", r.id);
     println!("  操作  : {}", r.op);
     println!("  参数  : {}", r.params);
     println!("  风险  : {}", r.risk);
@@ -608,7 +608,7 @@ fn do_deny(id: Option<&str>) -> Result<(), String> {
     require_admin()?;
     let dir = common::data_dir();
     consent::deny(&dir, id)?;
-    println!("✓ 已拒绝请求 {id}");
+    println!("[ok] 已拒绝请求 {id}");
     Ok(())
 }
 
@@ -650,7 +650,7 @@ fn show_policy() -> Result<(), String> {
         }
     );
     if p.file.approved_services.is_empty() {
-        println!("  已批准服务: （空 → restart_service 需逐次确认）");
+        println!("  已批准服务: 空（restart_service 需逐次确认）");
     } else {
         println!("  已批准服务: {}", p.file.approved_services.join(", "));
     }
@@ -772,7 +772,7 @@ fn do_trust_publisher(path: Option<&str>) -> Result<(), String> {
         "{}",
         c(
             C_GREEN,
-            &format!("✓ 已加入可信发布者列表，此后仅接受该证书签名的更新包（{t}）"),
+            &format!("[ok] 已加入可信发布者列表，此后仅接受该证书签名的更新包（{t}）"),
             on
         )
     );
@@ -1081,7 +1081,7 @@ fn event_line_text(line: &str, on: bool) -> String {
         "exec_start" => format!(
             "{} {} {} ({}{})",
             ts_s,
-            c(C_CYAN, "▶ 开始", on),
+            c(C_CYAN, "开始", on),
             c(C_BOLD, &cmd, on),
             c(C_DIM, "caller=", on),
             c(C_DIM, caller, on)
@@ -1404,7 +1404,7 @@ fn config_init() -> Result<(), String> {
     config::write_default_policy(&paths)?;
     let _ = common::set_dir_acl(&paths.machine);
     config::invalidate_cache();
-    println!("✓ 已生成默认策略: {}", paths.policy().display());
+    println!("[ok] 已生成默认策略: {}", paths.policy().display());
     println!("  下一步: `AI-Root config check` 校验，或直接 `AI-Root install`");
     Ok(())
 }
@@ -1416,7 +1416,7 @@ fn config_migrate() -> Result<(), String> {
     let actions = config::migrate_layout(&paths)?;
     common::set_dir_acl(&paths.machine).map_err(|e| format!("迁移后设置 ACL 失败: {e}"))?;
     config::invalidate_cache();
-    println!("✓ 配置迁移完成，共 {} 步：", actions.len());
+    println!("[ok] 配置迁移完成，共 {} 步：", actions.len());
     for a in actions {
         println!("  - {a}");
     }

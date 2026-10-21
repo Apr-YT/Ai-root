@@ -52,7 +52,7 @@ fn deploy_global(src_exe: &std::path::Path) -> std::path::PathBuf {
             if let Err(e) = std::fs::write(wrapper, content) {
                 eprintln!("[warn] 无法写入全局包装器 {}: {e}", wrapper.display());
             } else {
-                println!("✓ 已部署全局命令: AI-Root (C:\\Windows\\AI-Root.cmd)");
+                println!("[ok] 已部署全局命令: AI-Root (C:\\Windows\\AI-Root.cmd)");
             }
             deploy_exe
         }
@@ -95,7 +95,7 @@ fn configure_failure_actions(svc: &windows_service::service::Service) {
         )
     };
     if ok != 0 {
-        println!("✓ 已配置失败自动重启（60s/300s/600s）");
+        println!("[ok] 已配置失败自动重启（60s/300s/600s）");
     } else {
         eprintln!("[warn] 配置失败恢复策略失败, last_err={}", unsafe {
             winapi_raw::GetLastError()
@@ -162,7 +162,7 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     }
     common::set_enabled(true)?;
 
-    println!("✓ 服务已注册: {} (LocalSystem, 自启)", common::SERVICE_NAME);
+    println!("[ok] 服务已注册: {} (LocalSystem, 自启)", common::SERVICE_NAME);
     println!("启动命令: AI-Root start");
     Ok(())
 }
@@ -214,7 +214,7 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     service.delete()?;
-    println!("✓ 服务已卸载: {}", common::SERVICE_NAME);
+    println!("[ok] 服务已卸载: {}", common::SERVICE_NAME);
 
     let dir = deploy_dir();
 
@@ -231,7 +231,7 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
         match remove_file_retry(&p, 6) {
             Ok(()) => {
                 removed_program += 1;
-                println!("✓ 已删除程序文件: {}", p.display());
+                println!("[ok] 已删除程序文件: {}", p.display());
             }
             // 重试仍失败才提示（例如被杀软长期锁定）。这不是安全问题
             // （凭据与配置已按下面的范围处理），如实说明而不是静默吞掉。
@@ -245,7 +245,7 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
         let p = state.join(name);
         if p.exists() {
             match std::fs::remove_dir_all(&p) {
-                Ok(()) => println!("✓ 已清理运行期残留: {}", p.display()),
+                Ok(()) => println!("[ok] 已清理运行期残留: {}", p.display()),
                 Err(e) => eprintln!("[warn] 清理失败 {}: {e}", p.display()),
             }
         }
@@ -259,7 +259,7 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     let wrapper = std::path::Path::new("C:\\Windows\\AI-Root.cmd");
     if wrapper.exists() {
         match std::fs::remove_file(wrapper) {
-            Ok(()) => println!("✓ 已清理全局包装器: {}", wrapper.display()),
+            Ok(()) => println!("[ok] 已清理全局包装器: {}", wrapper.display()),
             Err(e) => eprintln!("[warn] 清理包装器失败 {}: {e}", wrapper.display()),
         }
     }
@@ -268,14 +268,14 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     let tok = common::token_path();
     if tok.exists() {
         match std::fs::remove_file(&tok) {
-            Ok(()) => println!("✓ 已清除令牌文件（SYSTEM 凭据不残留）"),
+            Ok(()) => println!("[ok] 已清除令牌文件（SYSTEM 凭据不残留）"),
             Err(e) => eprintln!("[warn] 令牌删除失败（请手工确认）{}: {e}", tok.display()),
         }
     }
     let sid = common::user_sid_path();
     if sid.exists() {
         match std::fs::remove_file(&sid) {
-            Ok(()) => println!("✓ 已清除安装用户 SID 记录"),
+            Ok(()) => println!("[ok] 已清除安装用户 SID 记录"),
             Err(e) => eprintln!("[warn] SID 记录删除失败 {}: {e}", sid.display()),
         }
     }
@@ -334,13 +334,13 @@ pub fn start_svc() -> Result<(), Box<dyn std::error::Error>> {
     // 轮询等待 Running（最多 15s，防「报成功但未真正起来」）
     for _ in 0..30 {
         if service.query_status()?.current_state == ServiceState::Running {
-            println!("✓ 服务已启动");
+            println!("[ok] 服务已启动");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(500));
     }
     println!(
-        "✓ 启动指令已下发（服务状态: {:?}）",
+        "[ok] 启动指令已下发（服务状态: {:?}）",
         service.query_status()?.current_state
     );
     Ok(())
@@ -434,7 +434,7 @@ pub fn grant_acl() -> Result<(), Box<dyn std::error::Error>> {
             .into(),
         );
     }
-    println!("✓ 服务 ACL 已授权用户 STOP/START（智能体可自主更新）");
+    println!("[ok] 服务 ACL 已授权用户 STOP/START（智能体可自主更新）");
     Ok(())
 }
 
@@ -628,7 +628,7 @@ pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::
     }
 
     println!(
-        "✓ 签名验证通过：{}",
+        "[ok] 签名验证通过：{}",
         report.signer_subject.as_deref().unwrap_or("<未知发布者>")
     );
     if let Some(h) = &report.file_sha256 {
@@ -730,7 +730,7 @@ pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::
         let _ = service.start::<OsString>(&[]);
         return Err(format!("替换失败（已回滚到旧版本）: {e}").into());
     }
-    println!("✓ 已替换: {}", deploy_exe.display());
+    println!("[ok] 已替换: {}", deploy_exe.display());
 
     // ── 6. 启动 + 健康检查；失败自动回滚 ──
     let started = service.start::<OsString>(&[]).is_ok();
@@ -751,7 +751,7 @@ pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::
             "新版本未能在 20s 内进入 Running，已回滚到上一版本并重启。请检查事件日志。".into(),
         );
     }
-    println!("✓ 服务已启动并通过健康检查");
+    println!("[ok] 服务已启动并通过健康检查");
 
     // ── 7. 清理备份（失败仅提示，可被下轮更新覆盖）──
     if let Err(e) = std::fs::remove_file(&backup) {
@@ -776,7 +776,7 @@ pub fn stop_svc() -> Result<(), Box<dyn std::error::Error>> {
         ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
     )?;
     service.stop()?;
-    println!("✓ 服务已停止");
+    println!("[ok] 服务已停止");
     Ok(())
 }
 

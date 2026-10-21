@@ -134,6 +134,6 @@ Write-Host ""
 Write-Host "下一步:" -ForegroundColor Gray
 Write-Host "  测试     : scripts\test.ps1"
 Write-Host "  安装     : scripts\install.ps1" -ForegroundColor Gray
-Write-Host "  安装(已装): scripts\install.ps1 -Update" -ForegroundColor Gray
+Write-Host "  换版本  : scripts\install.ps1 -Force   (本地构建无签名，-Update 会被签名门控拒绝)" -ForegroundColor Gray
 
 exit 0

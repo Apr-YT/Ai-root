@@ -934,16 +934,18 @@ fn run_structured_op(
             restart_service(name)
         }
 
-        // 读取状态文件：只允许数据目录下的白名单，绝不返回 token.txt
+        // 读取状态文件：只允许数据目录下的白名单，绝不返回令牌
         OpKind::ReadStateFile => {
-            const ALLOWED: &[&str] = &["policy.json"];
+            // 用常量而非字面量：策略文件名变过一次（policy.json → policy.toml），
+            // 写死字面量会让白名单悄悄指向不存在的文件，op 直接失效。
+            let allowed: &[&str] = &[config::POLICY_FILE];
             let Some(name) = target else {
                 return op_err("read_state_file 需要 target（文件名）".into());
             };
-            if !ALLOWED.contains(&name) {
+            if !allowed.contains(&name) {
                 return op_err(format!(
                     "不允许读取 {name}（白名单只有 {}）",
-                    ALLOWED.join(", ")
+                    allowed.join(", ")
                 ));
             }
             let p = common::data_dir().join(name);
@@ -1672,6 +1674,49 @@ mod tests {
             resp.error
         );
         assert!(!resp.stdout.contains("should_not_run"));
+    }
+
+    /// read_state_file 的白名单必须指向真实存在的策略文件名。
+    ///
+    /// 白名单曾写死 `policy.json`，而策略文件早已改名为 `policy.toml`，
+    /// 于是该 op 对唯一允许的目标也永远返回「读取失败」，白名单形同失效。
+    #[test]
+    fn e2e_read_state_file_targets_real_policy_file() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+
+        let ok_req = serde_json::json!({
+            "token": token,
+            "op": "read_state_file",
+            "target": config::POLICY_FILE,
+        })
+        .to_string();
+        let ok = e2e_roundtrip("readstate", &ok_req);
+        assert!(ok.ok, "读取策略文件应成功，error={:?}", ok.error);
+        assert!(
+            ok.stdout.contains("version"),
+            "应返回策略正文，实际 stdout={:?}",
+            ok.stdout
+        );
+
+        // 令牌与其它文件都必须在白名单之外，含路径穿越写法
+        let denied = ["token.txt", "sid.txt", "policy.json", "../policy.toml"];
+        for (i, bad) in denied.iter().enumerate() {
+            let req = serde_json::json!({
+                "token": token,
+                "op": "read_state_file",
+                "target": bad,
+            })
+            .to_string();
+            let tag = format!("readstate-deny{i}");
+            let resp = e2e_roundtrip(&tag, &req);
+            assert!(!resp.ok, "读取 {bad} 必须被拒绝");
+            assert!(
+                resp.stdout.is_empty(),
+                "被拒绝时不得返回任何文件内容，实际 {:?}",
+                resp.stdout
+            );
+        }
     }
 
     /// 端到端：退出码透传（`cmd /c exit 7` → exit_code=7，ok=true 表示中继层成功）。

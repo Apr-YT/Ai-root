@@ -3,41 +3,58 @@
 本文件记录 AI-Root 的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [1.4.0] — 2026-10-21
-
-> 主题：**正式版整理**。不新增功能，只清理开发期遗留、统一口径、把质量门槛拉齐。
+## [1.4.0] - 2026-10-21
 
 ### Removed
 
-- **移除 `install-service.ps1`**（破坏性变更）：它已被 `scripts/install.ps1` 完全取代，
-  且缺少幂等判断、签名检查、`-PreflightOnly` 与安装后自检。README 此前仍在推荐旧入口，
-  容易让人用到行为不一致的脚本。
-  迁移：把 `-File install-service.ps1` 换成 `-File scripts\install.ps1`（`-Exe` 参数兼容）。
-- 删除 5 处死代码：`CLIENT_READ_TIMEOUT_MS`、`log_path()`、`read_frame()`、
-  `ACCESS_DENIED_ACE_TYPE`；`is_valid_pe` 改为 `#[cfg(test)]`（仅测试使用）。
+- `install-service.ps1`。破坏性变更，改用 `scripts\install.ps1`。
+  旧脚本缺少幂等判断、签名检查、`-PreflightOnly` 和安装后自检。
+- 死代码：`CLIENT_READ_TIMEOUT_MS`、`log_path()`、`read_frame()`、`ACCESS_DENIED_ACE_TYPE`。
+  `is_valid_pe` 改为 `#[cfg(test)]`。
 
 ### Changed
 
-- **审计报告归档**：`docs/SECURITY_REFACTOR_AUDIT.md` 与 `docs/CONFIG_AUDIT.md`
-  移入 `docs/audit/`，文首标注「历史记录，非当前行为依据」，避免被当作现状阅读。
-- **重写 `docs/项目结构说明.md`**：原文档已失真（声称 `server.rs` 1,247 行、漏掉
-  `config`/`policy`/`consent`/`signature` 四个模块、无 `scripts/`）。改为只描述职责，
-  不再记录会随迭代过时的行数。
-- README 部署章节只介绍 `scripts/install.ps1`，删除旧脚本的 6 步表格。
-- 源码注释去掉开发期叙事（「旧实现…」「改造点…」、bug 编号 B3/V-01、具体日期），
-  保留全部解释「为什么不能这样写」的安全结论。
+- 审计报告移入 `docs/audit/`，文件头标注为历史记录。
+- 重写 `docs/项目结构说明.md`。原文声称 `server.rs` 1,247 行（实际 2,027），
+  漏掉 `config`、`policy`、`consent`、`signature` 四个模块，也没有 `scripts/`。
+  新版只描述职责，不记录行数。
+- README 部署章节只保留 `scripts\install.ps1`，删掉旧脚本的分步说明。
+- 源码注释去掉改造过程叙述和 bug 编号，保留安全相关的设计理由。
 
 ### Fixed
 
-- clippy 警告 **20 → 0**：`io::Error::other`、doc 列表缩进、可折叠 `match`/`if`、
-  多余指针转换、复杂类型抽别名等。
-- 帧上限的两条断言改为编译期 `const _: () = assert!(...)`，不再有运行期开销。
+- clippy 警告从 20 条降到 0。
+- 帧上限的两条断言改为编译期 `const _: () = assert!(...)`。
 
 ### Tests
 
-- 176 passed；`cargo clippy --all-targets` 0 warning；CI msvc + gnu 双 job。
+- 176 passed，clippy 0 warning，CI 的 msvc 与 gnu 两个 job 均通过。
 
-## [1.3.1] — 2026-10-21
+## [1.4.1] - 2026-10-21
+
+### Fixed
+
+- `read_state_file` 的白名单写死为 `policy.json`，而策略文件在 v1.2 已改名
+  `policy.toml`，导致该 op 对唯一允许的目标也返回「读取失败」。
+  改为引用 `config::POLICY_FILE`，并补一条端到端测试，同时断言 `token.txt`、
+  `sid.txt` 和路径穿越写法都被拒绝。
+
+### Changed
+
+- README 纠正若干与实现不符的描述：
+  - 事件流路径与事件名。原文写 `events.jsonl` 在数据目录根部、事件名为 `exec_start`，
+    实际在 `logs\` 下，且没有 `exec_start`，对应的是 `policy_decision`、`exec_done`、
+    `command_audit` 三条，以 `run_id` 关联。
+  - 令牌路径补上 `secrets\` 子目录。
+  - 环境变量表移除 `AIROOT_DEPLOY_DIR`（已无代码读取），补上 `AIROOT_USER_DIR`。
+  - 测试数量与模块分布更新为实测值。
+  - 免责声明原写「持有令牌即等同于拥有 SYSTEM 命令执行权」，与授权策略层矛盾，已更正。
+
+### Tests
+
+- 177 passed。
+
+## [1.3.1] - 2026-10-21
 
 ### Fixed — 安装会直接失败（严重）
 
@@ -95,9 +112,7 @@ DACL，于是 `secrets` 把 3 条 ACE（含 `Users` 可写）**固化**为自己
 
 > v1.3.0 的 Release 产物含此缺陷（安装会失败），请使用 v1.3.1。
 
-## [1.3.0] — 2026-10-21
-
-> 主题：**一键化**。把「翻文档、猜依赖、拼命令」收敛成可重复执行的脚本入口。
+## [1.3.0] - 2026-10-21
 
 ### Added — scripts\
 
@@ -147,12 +162,7 @@ DACL，于是 `secrets` 把 3 条 ACE（含 `Users` 可写）**固化**为自己
 - 未真实执行：服务安装/卸载（会改变主力机的 SYSTEM 服务状态）、UAC 提权路径、
   `-Update` 成功路径（需签名包 + 信任根）。这些需在可恢复虚拟机验证。
 
-## [1.2.0] — 2026-10-21
-
-> 主题：**配置架构**。把「12 个编译期常量 + 3 个环境变量 + 一个 JSON 文件」整理成
-> 三层配置系统，并把磁盘布局拆成 秘密 / 日志 / 状态 / 规则 四类。
-> 审计见 [docs/CONFIG_AUDIT.md](docs/CONFIG_AUDIT.md)，配置参考见
-> [docs/配置说明.md](docs/配置说明.md)。
+## [1.2.0] - 2026-10-21
 
 ### Added — 配置系统
 
@@ -230,11 +240,7 @@ DACL，于是 `secrets` 把 3 条 ACE（含 `Users` 可写）**固化**为自己
 - 迁移后旧版本回滚的完整流程（文档给了手工步骤，未实测）；
 - `%ProgramData%` 被组策略重定向 / 非系统盘 ProgramData 的场景。
 
-## [1.1.0] — 2026-10-21
-
-> 主题：**授权层**。把「一张令牌 = 一个 SYSTEM shell」改为「令牌 + 服务端授权策略」。
-> 完整审计与逐项修复记录见 [docs/SECURITY_REFACTOR_AUDIT.md](docs/SECURITY_REFACTOR_AUDIT.md)，
-> 配置指南见 [docs/授权策略.md](docs/授权策略.md)。
+## [1.1.0] - 2026-10-21
 
 ### Security — 更新与部署（Critical）
 
@@ -304,7 +310,7 @@ DACL，于是 `secrets` 把 3 条 ACE（含 `Users` 可写）**固化**为自己
 
 ## [Unreleased]
 
-## [1.0.0] — 2026-10-04
+## [1.0.0] - 2026-10-04
 
 ### Fixed — 构建与 CI
 
@@ -376,7 +382,7 @@ DACL，于是 `secrets` 把 3 条 ACE（含 `Users` 可写）**固化**为自己
 - 测试数 6 → **57**，全部通过。集成测试使用**真实命名管道**与**真实 `icacls`**，不 mock IO。
 - 关键缺陷均经**变异测试**验证（改坏实现必须精确 FAILED）。
 
-## [0.9.0] — 2026-08-28
+## [0.9.0] - 2026-08-28
 
 > `0.9.0` 为 1.0.0 之前的开发里程碑，**未发布过 Release**，故无 tag 链接。
 
