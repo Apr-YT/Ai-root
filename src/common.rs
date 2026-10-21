@@ -14,6 +14,8 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
+use crate::winapi_raw;
+
 // ============================================================
 // 可调常量：取值来源与可调边界集中管理（安全审计 / 调参统一入口）
 // 所有跨模块的硬编码阈值、超时、上限统一收敛于此，避免散落各文件难以追溯。
@@ -26,6 +28,7 @@ pub const PIPE_READ_TIMEOUT_MS: u64 = 10_000;
 
 /// 客户端读取响应帧空闲超时（毫秒）。`read_frame` 默认超时，与命令执行超时无关。
 /// 来源：经验值；SYSTEM 命令多数较快，兜底 60s。
+#[allow(dead_code)] // 保留给固定预算的调用方；当前客户端按「执行超时 + 余量」动态计算
 pub const CLIENT_READ_TIMEOUT_MS: u64 = 60_000;
 
 /// 命令默认执行超时（毫秒）。`AI-Root run` 未传 `--timeout` 时采用。
@@ -92,30 +95,48 @@ pub fn pipe_name() -> String {
 /// 服务名（需与 service_dispatcher 注册名一致）
 pub const SERVICE_NAME: &str = "AI-Root";
 
-/// 数据目录：默认 C:\ProgramData\AI-Root；可用 AIROOT_DATA_DIR 环境变量覆盖（集成测试隔离用）
+/// 机器级数据目录：默认 `%ProgramData%\AI-Root`
+///
+/// 可用 `AIROOT_DATA_DIR` 覆盖 —— **仅用于集成测试/多实例隔离**，不是给最终用户调的参数
+/// （能改数据目录等于能把令牌指到任意位置）。路径布局见 `config.rs`。
 pub fn data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("AIROOT_DATA_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
-    PathBuf::from(base).join("AI-Root")
+    crate::config::machine_dir()
 }
 
+/// 令牌路径：`<data>/secrets/token.txt`
+///
+/// 为什么单独放 `secrets\`：令牌等同 SYSTEM 凭据。与日志/状态分开后，
+/// 才能对秘密目录单独收紧 ACL，而不必为了"能看日志"而放宽秘密的可见范围。
 pub fn token_path() -> PathBuf {
-    data_dir().join("token.txt")
+    crate::config::Paths::resolve()
+        .secrets()
+        .join("token.txt")
 }
 
+/// 兼容入口：审计日志路径。
+///
+/// 内部已改用 `exec_log_path()`（测试构建下指向 `%TEMP%`），本函数保留给外部调用方。
+#[allow(dead_code)]
 pub fn log_path() -> PathBuf {
-    data_dir().join("exec.log")
+    logs_dir().join("exec.log")
 }
 
 /// GUI 实时事件流文件（JSONL，追加写）。服务端在 exec_start/exec_done/token_rotate 等
 /// 关键节点写入；GUI 按字节偏移增量读取实现「AI 操控实时信息流」。
 /// 与 exec.log（审计，命令+退出码）互补：本文件含执行中状态、时长与输出摘要。
 pub fn events_path() -> PathBuf {
-    data_dir().join("events.jsonl")
+    logs_dir().join("events.jsonl")
+}
+
+/// 受 ACL 保护的私有临时目录（脚本模式落盘用）。
+///
+/// 为什么不复用 `std::env::temp_dir()`：以 SYSTEM 运行时它解析为
+/// `C:\Windows\Temp`，该目录对普通用户可创建文件 —— 把「即将由 SYSTEM 执行」
+/// 的脚本放在用户可写的目录里，等于给本地提权留了一个竞争窗口。
+/// 本目录位于数据目录之下，继承 `SYSTEM:F / Administrators:F / 安装用户:R`，
+/// 普通用户无法写入或替换其中文件。
+pub fn tmp_dir() -> PathBuf {
+    crate::config::Paths::resolve().state().join("tmp")
 }
 
 /// 单个日志文件：持有常驻句柄 + 行缓冲，避免每次写都 Open+Append（高频命令下开销显著）。
@@ -195,11 +216,38 @@ struct Logger {
 
 static LOGGER: OnceLock<Option<Logger>> = OnceLock::new();
 
+/// 日志落盘目录。
+///
+/// ⚠ 测试构建下固定指向 `%TEMP%iroot-test-logs`：
+/// 单元/端到端测试会真实执行命令并记录事件，若直接写 `data_dir()`（默认
+/// `%ProgramData%\AI-Root`），跑一次 `cargo test` 就会在**用户机器**上凭空造出一个
+/// 未加固 ACL 的目录 —— 既污染环境，也会让人误以为「服务装过」。
+fn logs_dir() -> PathBuf {
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join("airoot-test-logs")
+    }
+    #[cfg(not(test))]
+    {
+        crate::config::Paths::resolve().logs()
+    }
+}
+
+/// 事件流日志路径（内部使用；`tail` 命令仍读 `events_path()`）
+fn events_log_path() -> PathBuf {
+    logs_dir().join("events.jsonl")
+}
+
+/// 审计日志路径（内部使用）
+fn exec_log_path() -> PathBuf {
+    logs_dir().join("exec.log")
+}
+
 fn build_logger() -> Option<Logger> {
-    let dir = data_dir();
+    let dir = logs_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let events = LogFile::open(&events_path(), true).ok()?;
-    let exec = LogFile::open(&log_path(), false).ok()?;
+    let events = LogFile::open(&events_log_path(), true).ok()?;
+    let exec = LogFile::open(&exec_log_path(), false).ok()?;
     Some(Logger {
         events: Mutex::new(events),
         exec: Mutex::new(exec),
@@ -236,7 +284,7 @@ pub fn log_event(event: serde_json::Value) {
             return;
         }
     }
-    append_with_rotate(events_path(), line.as_bytes());
+    append_with_rotate(events_log_path(), line.as_bytes());
 }
 
 /// 兜底：逐次打开并追加（仅当常驻句柄不可用 / 锁 poison 时走此路径，保证不丢日志）。
@@ -284,7 +332,7 @@ pub fn read_events_since(offset: u64) -> (Vec<String>, u64) {
 
 /// 启用开关文件：存在即「启用」，删除即「禁用」
 pub fn enabled_flag_path() -> PathBuf {
-    data_dir().join("enabled.flag")
+    crate::config::Paths::resolve().state().join("enabled.flag")
 }
 
 /// 进程内令牌缓存：懒加载 + 每次请求比对 token.txt 的 mtime，文件变化即重读。
@@ -384,7 +432,7 @@ fn select_grant_sid(persisted: Option<&str>, current: Option<&str>) -> Option<St
 /// 该 SID 会被注入管道 SDDL，使智能体进程（无论是否交互登录）都能连上管道，
 /// 从而在无 UAC 的前提下以 SYSTEM 身份执行命令。
 pub fn user_sid_path() -> PathBuf {
-    data_dir().join("sid.txt")
+    crate::config::Paths::resolve().state().join("sid.txt")
 }
 
 /// 持久化安装用户的 SID（仅在 install 阶段、以管理员身份解析，此时 whoami 返回的是真实用户，
@@ -408,6 +456,16 @@ pub fn pipe_sddl() -> String {
     s
 }
 
+/// ACL 操作失败（安全关键路径上不允许静默降级）
+#[derive(Debug)]
+pub struct AclError(pub String);
+impl std::fmt::Display for AclError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for AclError {}
+
 /// 设置目录 ACL：仅 SYSTEM 完全控制 + Administrators 完全控制 + 安装用户只读
 ///
 /// 为什么必须给 Administrators `(F)`（2026-10-04 实测补充）：
@@ -419,15 +477,12 @@ pub fn pipe_sddl() -> String {
 ///   `BUILTIN\Administrators:(F)`。这是 Windows 的行为，不是本函数的输出。
 ///   既然它必然出现，就**显式授予**而非依赖隐式补写，避免「ACL 与设计文档不一致」。
 ///
-/// 失败则退化为「SYSTEM + Administrators + Interactive 只读」，保证至少可用
-///
 /// ⚠ 安全关键：必须先用 `/inheritance:r` **断开并清除继承的 ACE**，再显式授权。
 ///
 /// 2026-10-04 实测发现的缺陷：原实现只用 `/inheritance:e` + `/grant:r`，
 /// 而 `icacls /grant:r` **只替换指定 SID 的那一条 ACE，不会清除其它 SID 的 ACE**。
 /// 于是 `C:\ProgramData` 继承来的 `BUILTIN\Users:(I)(CI)(WD,AD,WEA,WA)` 会**原样保留** ——
 /// 即任意本地用户仍对该目录**有写权限**，可覆写 `token.txt` 并自授权连上 SYSTEM 中继。
-/// 这与本函数「仅 SYSTEM 完全控制 + 用户只读」的声明语义完全背离。
 /// 实测对照（父目录含可继承的 Users 写 ACE）：
 ///   `/inheritance:e` → `BUILTIN\Users:(I)(OI)(CI)(WD,AD)` 残留 ❌
 ///   `/inheritance:r` → 仅 `SYSTEM:(OI)(CI)(F)` + 用户只读 ✅
@@ -440,86 +495,389 @@ pub fn pipe_sddl() -> String {
 /// `icacls /grant` 不会对同一 SID 去重，每次调用都会向 DACL 追加一条 `(OI)(CI)` ACE，
 /// 服务启动 / `ensure_token` / `rotate_token` / `set_enabled` 反复调用会导致 ACE 条目无限膨胀。
 /// `:r` 会先移除该 SID 的全部既有 ACE 再写入唯一一条，既保证幂等，也顺带清理历史累积的重复 ACE。
-pub fn set_dir_acl(dir: &std::path::Path) {
+///
+/// ⚠ 错误处理（2026-10-21 改造）：原实现返回 `()` 并把每条 icacls 的结果 `let _ =` 丢弃，
+/// 属 fail-open —— `/inheritance:r` 成功而后续 grant 全失败时，目录可能落入
+/// 「SYSTEM 无写权限」或「继承已断但显式 ACE 缺失」的状态，而调用方毫不知情。
+/// 现在任何一步失败都返回 `Err`，由调用方决定是否继续（服务启动时选择拒绝启动）。
+pub fn set_dir_acl(dir: &std::path::Path) -> Result<(), AclError> {
     let dir_str = dir.to_string_lossy().to_string();
+
     // 先断开继承（清除全部继承 ACE），再加显式 ACE。
     // 顺序不可颠倒：若先 grant 再 inheritance:r，grant 的结果会被一并清掉。
-    let _ = Command::new("icacls")
+    // 本步失败必须终止：继承未断时，「用户不可写」无法由本函数的显式 ACE 保证。
+    let out = Command::new("icacls")
         .arg(&dir_str)
         .arg("/inheritance:r")
-        .output();
+        .output()
+        .map_err(|e| AclError(format!("无法执行 icacls: {e}")))?;
+    if !out.status.success() {
+        return Err(AclError(format!(
+            "icacls /inheritance:r 失败（exit={:?}）: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim()
+        )));
+    }
+
     // ⚠ 必须用 `granted_user_sid()`（安装用户）而非 `get_user_sid()`（当前进程身份）：
     //   本函数会被以 SYSTEM 运行的服务调用，此时 `get_user_sid()` == S-1-5-18，
     //   会导致「授予当前用户只读」变成「把 SYSTEM 降级为只读」→ 服务无法写数据目录。
     //   详见 `granted_user_sid()` 的文档注释。
+    //
+    // ⚠ `{sid}` 必须带 `*` 前缀！`*` 告知 icacls「这是 SID 字面量，不要去解析账户名」。
+    // 缺 `*` 时 icacls 会把 `S-1-5-21-...` 当**账户名**去查，查不到即报
+    //   "账户名与安全标识间无任何映射完成"
+    // 并**整条命令以非零退出、一条 ACE 都不写**（grant 参数是「全有或全无」）。
+    // 因此这里**逐条独立授予**（而非塞进一条 icacls 命令），单条失败不牵连其它。
     if let Some(sid) = granted_user_sid() {
-        // ⚠ `{sid}` 必须带 `*` 前缀！`*` 告知 icacls「这是 SID 字面量，不要去解析账户名」。
-        // 缺 `*` 时 icacls 会把 `S-1-5-21-...` 当**账户名**去查，查不到即报
-        //   "账户名与安全标识间无任何映射完成"
-        // 并**整条命令以非零退出、一条 ACE 都不写**（grant 参数是「全有或全无」）。
-        // 叠加同函数的 `/inheritance:r` 后后果极严重：继承 ACE 已清除、显式 ACE 又写入失败
-        // → 目录 DACL 变空 → SYSTEM 自己都进不去，服务彻底锁死。
-        // 该缺陷原本被 `/inheritance:e` 掩盖（继承来的 SYSTEM:F 兜住了访问），
-        // 属"两个 bug 互相遮蔽"，2026-10-04 修复继承缺陷时才暴露。
-        //
-        // 因此这里**逐条独立授予**（而非塞进一条 icacls 命令）：icacls 的 grant 参数是
-        // 「全有或全无」，一条坏参数会让同命令内其它正当 ACE 一起丢失。
-        // 逐条执行后，即使某条失败，SYSTEM 的 ACE 也已独立落盘，不会出现空 DACL。
-        grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F"); // LocalSystem 完全控制
-        grant_one(&dir_str, "*S-1-5-32-544:(OI)(CI)F"); // Administrators 完全控制（运维/排障必需）
-        grant_one(&dir_str, &format!("*{sid}:(OI)(CI)R")); // 当前用户只读（注意 * 前缀）
+        grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F")?; // LocalSystem 完全控制
+        grant_one(&dir_str, "*S-1-5-32-544:(OI)(CI)F")?; // Administrators 完全控制（运维/排障必需）
+        grant_one(&dir_str, &format!("*{sid}:(OI)(CI)R"))?; // 安装用户只读（注意 * 前缀）
     } else {
         // 退化方案：Interactive 用户只读（仅本机交互登录者可读取令牌）
-        grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F");
-        grant_one(&dir_str, "*S-1-5-32-544:(OI)(CI)F");
-        grant_one(&dir_str, "*S-1-5-4:(OI)(CI)R"); // Interactive 只读
+        grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F")?;
+        grant_one(&dir_str, "*S-1-5-32-544:(OI)(CI)F")?;
+        grant_one(&dir_str, "*S-1-5-4:(OI)(CI)R")?; // Interactive 只读
     }
-    // 兜底自检：确认 SYSTEM 的完全控制 ACE 确实写入成功。
-    // 本函数先 `/inheritance:r` 清空继承 ACE 再重新授权，若期间授权失败、或（历史缺陷）
-    // 误把 SYSTEM 本身当作「待降级的用户」而授成只读，目录 ACL 就会缺 SYSTEM:F
-    // → 以 SYSTEM 运行的服务无法写 token.txt/events.jsonl/exec.log。
-    // 此处检测到即立刻补回完全控制，把该失败模式从结构上消除。
-    //
-    // 注意：这只是**兜底**，不是主要防线 —— 主要防线是上面用 `granted_user_sid()`
-    // 确保不会把 SYSTEM 当成待授权用户。两者配合，即使出现意料外的降级也能自愈。
-    if !acl_has_system_full(&dir_str) {
-        grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F");
-    }
-}
 
-/// 检查目录 ACL 中是否存在 SYSTEM 的完全控制 ACE（用于硬化后的兜底自检）。
-fn acl_has_system_full(dir_str: &str) -> bool {
-    let Ok(out) = Command::new("icacls").arg(dir_str).output() else {
-        return false;
-    };
-    // 注意 icacls 输出为 OEM/ANSI 编码，但 ACE 权限位字符（如 "(F)"）与 SID 名均为 ASCII，
-    // 足以判断；Windows 下 SYSTEM 显示名恒为 "NT AUTHORITY\\SYSTEM"。
-    let s = String::from_utf8_lossy(&out.stdout);
-    s.lines()
-        .any(|l| l.contains("SYSTEM") && l.contains("(F)"))
+    // 兜底自检：用**二进制 DACL** 确认 SYSTEM 确实有写权限（不依赖本地化显示名）。
+    // 历史缺陷 C 的失败模式正是「SYSTEM 被降为只读」，此处检测到即立刻补回。
+    if !dacl_has_system_write(dir) {
+        grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F")?;
+        if !dacl_has_system_write(dir) {
+            return Err(AclError(
+                "SYSTEM 未能获得目录完全控制（补写后仍失败）".into(),
+            ));
+        }
+    }
+
+    // 最终验收：真实 DACL 必须满足「危险主体无写权限 + SYSTEM 有写 + 无继承 ACE」。
+    // 这一步是 fail-closed 的关键 —— 不再靠 `contains("SYSTEM") && contains("(F)")` 猜。
+    verify_dir_acl(dir)
 }
 
 /// 单条 `icacls /grant:r` 授权。`:r` = replace 语义（幂等，不累积重复 ACE）。
 /// 独立成函数是为了让每条 ACE 各自落盘，避免一条参数非法导致整批丢失。
-fn grant_one(dir_str: &str, ace: &str) {
-    let _ = Command::new("icacls")
+fn grant_one(dir_str: &str, ace: &str) -> Result<(), AclError> {
+    let out = Command::new("icacls")
         .arg(dir_str)
         .arg("/grant:r")
         .arg(ace)
-        .output();
+        .output()
+        .map_err(|e| AclError(format!("无法执行 icacls: {e}")))?;
+    if !out.status.success() {
+        return Err(AclError(format!(
+            "icacls /grant:r {ace} 失败（exit={:?}）: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim()
+        )));
+    }
+    Ok(())
+}
+
+// ============================================================
+// 真实 DACL 校验（基于 GetNamedSecurityInfoW，与系统语言无关）
+// ============================================================
+
+/// 写类访问位（任一置位即「可写」）
+const WRITE_BITS: u32 = 0x0000_0002   // FILE_WRITE_DATA
+    | 0x0000_0004                     // FILE_APPEND_DATA
+    | 0x0000_0010                     // FILE_WRITE_EA
+    | 0x0000_0100                     // FILE_WRITE_ATTRIBUTES
+    | 0x0001_0000                     // DELETE
+    | 0x0004_0000                     // WRITE_DAC
+    | 0x0008_0000                     // WRITE_OWNER
+    | 0x1000_0000                     // GENERIC_ALL
+    | 0x4000_0000; // GENERIC_WRITE
+
+/// 绝不允许对数据目录持有写权限的「宽泛主体」SID。
+///
+/// 用 SID 而不是账户名：`icacls` 输出的是本地化显示名，
+/// 中文/其他语言 Windows 上按名字匹配必然漏检。
+fn dangerous_write_sid(sid: &str) -> Option<&'static str> {
+    Some(match sid {
+        "S-1-1-0" => "Everyone",
+        "S-1-5-32-545" => "BUILTIN\\Users",
+        "S-1-5-11" => "Authenticated Users",
+        "S-1-5-4" => "INTERACTIVE",
+        "S-1-5-7" => "ANONYMOUS LOGON",
+        "S-1-5-32-546" => "Guests",
+        "S-1-5-2" => "NETWORK",
+        _ => return None,
+    })
+}
+
+/// 解析目录的真实 DACL，校验三条不变量：
+///
+/// 1. DACL 不是 `NULL`（`NULL` DACL = 所有人完全控制，是最危险的形态）
+/// 2. 宽泛主体（Everyone / Users / Authenticated Users …）**不得持有任何写权限**
+/// 3. `SYSTEM` 必须持有写权限；且 `DACL` 中**不得残留继承 ACE**（说明 `/inheritance:r` 生效）
+///
+/// 为什么不用 `icacls` 文本：见 `winapi_raw.rs` 中 DACL 解析段的说明。
+pub fn verify_dir_acl(dir: &std::path::Path) -> Result<(), AclError> {
+    use core::ffi::c_void;
+    use winapi_raw as w;
+
+    let wide = to_wide(dir.to_string_lossy().as_ref());
+    let mut dacl: *mut c_void = std::ptr::null_mut();
+    let mut sd: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe {
+        w::GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            w::SE_FILE_OBJECT,
+            w::DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 {
+        return Err(AclError(format!(
+            "GetNamedSecurityInfoW 失败（rc={rc}），无法校验目录权限"
+        )));
+    }
+    // 安全描述符必须释放（无论后续成功失败）
+    struct SdGuard(*mut c_void);
+    impl Drop for SdGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    winapi_raw::LocalFree(self.0);
+                }
+            }
+        }
+    }
+    let _guard = SdGuard(sd);
+
+    if sd.is_null() {
+        return Err(AclError("安全描述符为空".into()));
+    }
+    if dacl.is_null() {
+        return Err(AclError(
+            "DACL 为 NULL：对象完全开放（等同于 Everyone 完全控制）".into(),
+        ));
+    }
+
+    let mut info = w::ACL_SIZE_INFORMATION {
+        AceCount: 0,
+        AclBytesInUse: 0,
+        AclBytesFree: 0,
+    };
+    let ok = unsafe {
+        w::GetAclInformation(
+            dacl,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<w::ACL_SIZE_INFORMATION>() as u32,
+            w::ACL_SIZE_INFORMATION_CLASS,
+        )
+    };
+    if ok == 0 {
+        return Err(AclError("GetAclInformation 失败".into()));
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    let mut system_writable = false;
+    let mut inherited = 0usize;
+
+    for i in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if unsafe { w::GetAce(dacl, i, &mut ace) } == 0 || ace.is_null() {
+            continue;
+        }
+        let p = ace as *const u8;
+        // ACE_HEADER { AceType: u8, AceFlags: u8, AceSize: u16 }
+        let ace_type = unsafe { *p };
+        let ace_flags = unsafe { *p.add(1) };
+        let ace_size = unsafe { *(p.add(2) as *const u16) } as usize;
+        if ace_size < 8 || p.is_null() {
+            continue;
+        }
+        if ace_flags & w::INHERITED_ACE_FLAG != 0 {
+            inherited += 1;
+        }
+        // 只检查「允许」ACE：deny ACE 只会收紧权限
+        if ace_type != w::ACCESS_ALLOWED_ACE_TYPE {
+            continue;
+        }
+        // ACCESS_ALLOWED_ACE: Header(4) + Mask(4) + SidStart...
+        let mask = unsafe { *(p.add(4) as *const u32) };
+        let sid_ptr = unsafe { p.add(8) } as *const c_void;
+        let Some(sid) = sid_to_string(sid_ptr) else {
+            // 解析不出 SID 时保守处理：无法确认就不宣称「已验证」
+            problems.push(format!("第 {i} 条 ACE 的 SID 无法解析"));
+            continue;
+        };
+        let writable = mask & WRITE_BITS != 0;
+        if sid == LOCAL_SYSTEM_SID && writable {
+            system_writable = true;
+        }
+        if writable {
+            if let Some(name) = dangerous_write_sid(&sid) {
+                problems.push(format!("{name} ({sid}) 持有写权限 mask=0x{mask:08X}"));
+            }
+        }
+    }
+
+    if inherited > 0 {
+        problems.push(format!(
+            "残留 {inherited} 条继承 ACE（/inheritance:r 未生效，父目录权限会继续传播）"
+        ));
+    }
+    if !system_writable {
+        problems.push("SYSTEM 缺少写权限（服务将无法写令牌/日志）".into());
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(AclError(problems.join("；")))
+    }
+}
+
+/// PSID → 字符串 SID（"S-1-5-..."）
+fn sid_to_string(psid: *const core::ffi::c_void) -> Option<String> {
+    if psid.is_null() {
+        return None;
+    }
+    let mut psz: *mut u16 = std::ptr::null_mut();
+    if unsafe { winapi_raw::ConvertSidToStringSidW(psid, &mut psz) } == 0 || psz.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *psz.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(psz, len) });
+    unsafe {
+        winapi_raw::LocalFree(psz as *mut core::ffi::c_void);
+    }
+    Some(s)
+}
+
+/// 用二进制 DACL 判断 SYSTEM 是否有写权限（供 set_dir_acl 的兜底自检使用）
+fn dacl_has_system_write(dir: &std::path::Path) -> bool {
+    // 复用 verify 的解析逻辑代价过高（失败即返回 Err），此处单独做一次轻量查询：
+    // 只要能成功调用 verify 的一部分即可。为避免重复实现，这里直接调用 verify
+    // 并检查错误信息里是否**只**缺 SYSTEM（不现实），故改为独立遍历。
+    use core::ffi::c_void;
+    use winapi_raw as w;
+
+    let wide = to_wide(dir.to_string_lossy().as_ref());
+    let mut dacl: *mut c_void = std::ptr::null_mut();
+    let mut sd: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe {
+        w::GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            w::SE_FILE_OBJECT,
+            w::DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 || sd.is_null() || dacl.is_null() {
+        return false;
+    }
+    let mut info = w::ACL_SIZE_INFORMATION {
+        AceCount: 0,
+        AclBytesInUse: 0,
+        AclBytesFree: 0,
+    };
+    let ok = unsafe {
+        w::GetAclInformation(
+            dacl,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<w::ACL_SIZE_INFORMATION>() as u32,
+            w::ACL_SIZE_INFORMATION_CLASS,
+        )
+    };
+    let mut found = false;
+    if ok != 0 {
+        for i in 0..info.AceCount {
+            let mut ace: *mut c_void = std::ptr::null_mut();
+            if unsafe { w::GetAce(dacl, i, &mut ace) } == 0 || ace.is_null() {
+                continue;
+            }
+            let p = ace as *const u8;
+            if unsafe { *p } != w::ACCESS_ALLOWED_ACE_TYPE {
+                continue;
+            }
+            let mask = unsafe { *(p.add(4) as *const u32) };
+            if mask & WRITE_BITS == 0 {
+                continue;
+            }
+            if let Some(sid) = sid_to_string(unsafe { p.add(8) } as *const c_void) {
+                if sid == LOCAL_SYSTEM_SID {
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    unsafe {
+        w::LocalFree(sd);
+    }
+    found
 }
 
 /// 确保令牌存在：不存在则生成并写盘、设置 ACL
+///
+/// ⚠ 改造点（V-16）：令牌**已存在**时不再直接返回。
+/// 旧实现 `if tp.exists() { return Ok(...) }` 导致「ACL 在 install 早期窗口被写坏」
+/// 之后永远不修复 —— 而令牌可读性正是整个中继的边界。现在已存在时也会
+/// 用真实 DACL 复验目录权限，不安全即报错（fail closed）。
 pub fn ensure_token() -> io::Result<String> {
-    let dir = data_dir();
-    std::fs::create_dir_all(&dir).ok();
+    let paths = crate::config::Paths::resolve();
+    let dir = paths.machine.clone();
+    std::fs::create_dir_all(&dir)?;
+
+    // 旧扁平布局（v1.1）→ 分层布局（v1.2）。幂等；失败则拒绝继续（fail closed），
+    // 因为"迁移到一半"会让令牌位置与代码预期不一致。
+    if crate::config::needs_layout_migration(&paths) {
+        crate::config::migrate_layout(&paths).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("磁盘布局迁移失败，拒绝继续：{e}"),
+            )
+        })?;
+    }
+    // 秘密目录单独硬化（父目录已带 (OI)(CI) 传播，这里显式再确认一次）
+    std::fs::create_dir_all(paths.secrets())?;
+
     let tp = token_path();
     if tp.exists() {
+        verify_dir_acl(&dir).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("数据目录权限不安全，拒绝继续：{e}"),
+            )
+        })?;
         return Ok(std::fs::read_to_string(&tp)?.trim().to_string());
     }
+    // ⚠ 顺序：**先硬化目录 ACL，再写令牌**。
+    // 反过来（旧实现）会有一个窗口：token.txt 已经在弱权限目录里存在过，
+    // 期间任何本地用户都能读到这个等同 SYSTEM 凭据的文件。
+    set_dir_acl(&dir).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("设置数据目录 ACL 失败（未写入令牌）：{e}"),
+        )
+    })?;
+    // 秘密目录也必须通过同一套 DACL 校验（它继承父目录，但显式验证更可靠）
+    verify_dir_acl(&paths.secrets()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("secrets 目录权限不安全（未写入令牌）：{e}"),
+        )
+    })?;
     let tok = gen_token();
     std::fs::write(&tp, &tok)?;
-    set_dir_acl(&dir);
     Ok(tok)
 }
 
@@ -580,10 +938,11 @@ pub fn cached_token() -> String {
 /// 需对 token.txt 有写权限（SYSTEM / 管理员 / 安装用户）；调用方应妥善传递新令牌（勿入日志）。
 pub fn rotate_token() -> io::Result<String> {
     let dir = data_dir();
-    std::fs::create_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir)?;
     let tok = gen_token();
     std::fs::write(token_path(), &tok)?;
-    set_dir_acl(&dir);
+    set_dir_acl(&dir)
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
     if let Ok(mut c) = TOKEN_CACHE.lock() {
         *c = None; // 失效缓存，下一次 cached_token() 按新 mtime 重读
     }
@@ -601,15 +960,85 @@ pub fn is_enabled() -> bool {
 }
 
 /// 设置启用状态
-pub fn set_enabled(enabled: bool) {
+///
+/// ⚠ 改造点：ACL 失败必须上报（旧实现 `set_dir_acl` 静默吞错）。
+pub fn set_enabled(enabled: bool) -> Result<(), AclError> {
     let flag = enabled_flag_path();
     if enabled {
-        std::fs::write(&flag, b"1").ok();
+        std::fs::create_dir_all(data_dir())
+            .map_err(|e| AclError(format!("创建数据目录失败: {e}")))?;
+        if let Some(parent) = flag.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AclError(format!("创建状态目录失败: {e}")))?;
+        }
+        std::fs::write(&flag, b"1").map_err(|e| AclError(format!("写启用标志失败: {e}")))?;
     } else {
-        std::fs::remove_file(&flag).ok();
+        match std::fs::remove_file(&flag) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(AclError(format!("删除启用标志失败: {e}"))),
+        }
     }
     // 确保目录 ACL（首次可能产生）
-    set_dir_acl(&data_dir());
+    set_dir_acl(&data_dir())
+}
+
+/// 审计脱敏：遮蔽命令行里常见的凭据参数。
+///
+/// 任务书 §8.2 要求「对可能包含秘密的命令参数进行脱敏」。审计日志是长期保留的，
+/// 一条 `AI-Root run "mysql -u root -p Secret123"` 若不脱敏，等于把密码写进
+/// 永久记录里。这里只做**保守遮蔽**（宁可多遮几个词，也不要漏）：
+/// - `key=value` 形式：键名命中敏感词 → 值替换为 `***`
+/// - 独立敏感开关（`-p` / `--password`）：其后的 token 替换为 `***`
+///
+/// 注意：这不是「检测所有秘密」的完备方案（无法识别未知格式），
+/// 但能覆盖绝大多数常见命令行传参方式，且不改变命令语义（仅用于日志）。
+pub fn redact(s: &str) -> String {
+    const KEYS: &[&str] = &[
+        "password",
+        "passwd",
+        "pwd",
+        "token",
+        "secret",
+        "apikey",
+        "api_key",
+        "api-key",
+        "accesskey",
+        "access_key",
+        "access-key",
+        "credential",
+        "privatekey",
+        "private_key",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    let mut mask_next = false;
+    for tok in s.split_whitespace() {
+        if mask_next {
+            out.push("***".to_string());
+            mask_next = false;
+            continue;
+        }
+        // key=value
+        if let Some(pos) = tok.find('=') {
+            let key = tok[..pos].trim_start_matches('-').to_ascii_lowercase();
+            if KEYS.iter().any(|k| key.contains(k)) {
+                out.push(format!("{}=***", &tok[..pos]));
+                continue;
+            }
+        }
+        // 独立开关：-p / --password / token
+        let bare = tok.trim_start_matches('-').to_ascii_lowercase();
+        let is_switch = tok.starts_with('-')
+            && (bare == "p" || KEYS.iter().any(|k| bare == *k));
+        let is_bare_key = KEYS.iter().any(|k| bare == *k);
+        if is_switch || is_bare_key {
+            out.push(tok.to_string());
+            mask_next = true;
+            continue;
+        }
+        out.push(tok.to_string());
+    }
+    out.join(" ")
 }
 
 /// 当前时间戳字符串（本地时间）
@@ -636,10 +1065,11 @@ pub fn log_exec(caller: &str, pid: u32, command: &str, exit_code: i32) {
             return;
         }
     }
-    append_with_rotate(log_path(), line.as_bytes());
+    append_with_rotate(exec_log_path(), line.as_bytes());
 }
 
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)] // 常量契约断言是有意的（防常量被默默改动）
 mod tests {
     use super::*;
 
@@ -706,7 +1136,7 @@ mod tests {
         );
 
         // 3) 调用真实被测函数
-        set_dir_acl(&child);
+        set_dir_acl(&child).expect("set_dir_acl 应成功");
 
         // 4) 断言：Users 不再持有任何写权限位（WD/AD/WEA/WA/写类权限）
         let after = icacls_show(&child);
@@ -762,9 +1192,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("创建测试目录失败");
 
-        set_dir_acl(&base);
-        set_dir_acl(&base);
-        set_dir_acl(&base);
+        set_dir_acl(&base).expect("set_dir_acl 应成功");
+        set_dir_acl(&base).expect("set_dir_acl 应成功");
+        set_dir_acl(&base).expect("set_dir_acl 应成功");
 
         let acl = icacls_show(&base);
         // 统计 SYSTEM 的 ACE 条数：幂等实现下应恰好 1 条（不受继承干扰，已 /inheritance:r）
@@ -839,7 +1269,8 @@ mod tests {
         let dir_str = base.to_string_lossy().to_string();
 
         // 模拟"旧实现的错误结果"：先人为把 SYSTEM 降为只读
-        grant_one(&dir_str, &format!("*{LOCAL_SYSTEM_SID}:(OI)(CI)R"));
+        grant_one(&dir_str, &format!("*{LOCAL_SYSTEM_SID}:(OI)(CI)R"))
+            .expect("人为降级 SYSTEM 的前提构造失败");
         let poisoned = icacls_show(&base);
         let sys_readonly = poisoned
             .lines()
@@ -850,7 +1281,7 @@ mod tests {
         );
 
         // 调用真实被测函数：它必须用 granted_user_sid()（非 SYSTEM）并守住 SYSTEM:(F)
-        set_dir_acl(&base);
+        set_dir_acl(&base).expect("set_dir_acl 应成功");
 
         let after = icacls_show(&base);
         let sys_full = after.lines().any(|l| l.contains("SYSTEM") && l.contains("(F)"));
@@ -863,5 +1294,180 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ============================================================
+    // redact：审计脱敏 + escape/边界
+    // ============================================================
+
+    #[test]
+    fn redact_masks_equals_form_secrets() {
+        let out = redact("mysql -u root --password=Secret123 db");
+        assert!(!out.contains("Secret123"), "密码必须被遮蔽: {out}");
+        assert!(out.contains("--password=***"), "应保留键名: {out}");
+    }
+
+    #[test]
+    fn redact_masks_switch_value_form() {
+        // `-p` / `--token` 这类独立开关，其后的 token 才是秘密
+        let out = redact("tool --token abcdef123456 run");
+        assert!(!out.contains("abcdef123456"), "应遮蔽开关后的值: {out}");
+        let out2 = redact("mysql -u root -p Hunter2");
+        assert!(!out2.contains("Hunter2"), "应遮蔽 -p 后面的值: {out2}");
+    }
+
+    #[test]
+    fn redact_keeps_harmless_commands_intact() {
+        // 不能把普通命令改得面目全非（否则审计日志失去价值）
+        for cmd in [
+            "git status",
+            "cargo test --release",
+            r"dir C:\Windows",
+            "echo hello world",
+        ] {
+            assert_eq!(redact(cmd), cmd, "普通命令不应被改动: {cmd}");
+        }
+    }
+
+    #[test]
+    fn redact_handles_api_key_variants() {
+        for s in [
+            "x --api-key=AAA111",
+            "x API_KEY=BBB222",
+            "x access_key=CCC333",
+            "x secret=DDD444",
+        ] {
+            let out = redact(s);
+            assert!(
+                !out.contains("AAA111")
+                    && !out.contains("BBB222")
+                    && !out.contains("CCC333")
+                    && !out.contains("DDD444"),
+                "变体均应被遮蔽: {s} -> {out}"
+            );
+        }
+    }
+
+    // ============================================================
+    // verify_dir_acl：真实 DACL 校验（V-04 / V-05 回归）
+    // ============================================================
+
+    /// 正确配置后，校验必须通过 —— 证明校验器不是「一律报错」。
+    #[test]
+    fn verify_dir_acl_accepts_hardened_dir() {
+        let base = std::env::temp_dir().join(format!("airoot-verify-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("创建测试目录失败");
+
+        set_dir_acl(&base).expect("set_dir_acl 应成功");
+        verify_dir_acl(&base).expect("硬化后的目录应通过校验");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 危险主体（Everyone）持有写权限时，校验必须失败。
+    /// 变异验证：把 dangerous_write_sid 里的 S-1-1-0 去掉，本测试会 FAILED。
+    #[test]
+    fn verify_dir_acl_rejects_everyone_write() {
+        let base = std::env::temp_dir().join(format!("airoot-verify-ev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("创建测试目录失败");
+        set_dir_acl(&base).expect("先硬化");
+
+        // 人为放开 Everyone 写权限（模拟「ACL 被改坏」）
+        let g = Command::new("icacls")
+            .arg(base.to_string_lossy().to_string())
+            .arg("/grant:r")
+            .arg("*S-1-1-0:(OI)(CI)W")
+            .output()
+            .expect("icacls 执行失败");
+        assert!(g.status.success(), "前提构造失败：无法授予 Everyone 写权限");
+
+        let err = verify_dir_acl(&base).expect_err("Everyone 可写必须被检出");
+        assert!(
+            err.0.contains("Everyone") || err.0.contains("S-1-1-0"),
+            "错误信息应指出责任主体，实际: {}",
+            err.0
+        );
+
+        let _ = grant_one(&base.to_string_lossy(), "*S-1-1-0:(OI)(CI)R");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 残留继承 ACE 时校验必须失败（说明 /inheritance:r 没生效）。
+    #[test]
+    fn verify_dir_acl_detects_inherited_aces() {
+        let base = std::env::temp_dir().join(format!("airoot-verify-inh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let child = base.join("data");
+        std::fs::create_dir_all(&child).expect("创建测试目录失败");
+
+        // 父目录授予可继承的 Users 写权限 → 子目录带 (I) 继承 ACE
+        let g = Command::new("icacls")
+            .arg(base.to_string_lossy().to_string())
+            .arg("/grant")
+            .arg("Users:(OI)(CI)(WD,AD)")
+            .output()
+            .expect("icacls 执行失败");
+        assert!(g.status.success(), "前提构造失败");
+
+        let err = verify_dir_acl(&child).expect_err("继承 ACE + Users 可写必须被检出");
+        assert!(
+            err.0.contains("继承") || err.0.contains("Users"),
+            "应指出继承 ACE 或 Users 写权限，实际: {}",
+            err.0
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// set_dir_acl 对不存在的目录必须返回 Err（而不是静默「设置成功」）。
+    /// 这正是旧实现 fail-open 的形态：icacls 报错、函数返回 ()。
+    #[test]
+    fn set_dir_acl_errors_on_missing_dir() {
+        let missing = std::env::temp_dir().join(format!(
+            "airoot-missing-{}-{}",
+            std::process::id(),
+            "nope"
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        let r = set_dir_acl(&missing);
+        assert!(r.is_err(), "目录不存在时 icacls 必然失败，必须返回 Err");
+    }
+
+    /// `ensure_token` 在令牌已存在但目录权限不安全时必须报错（V-16 回归）。
+    #[test]
+    fn ensure_token_refuses_when_dir_is_writable_by_everyone() {
+        let dir = std::env::temp_dir().join(format!("airoot-tok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("创建测试目录失败");
+        std::fs::write(dir.join("token.txt"), "a".repeat(64)).expect("写令牌失败");
+        // 放开 Everyone 写权限，模拟被改坏的目录
+        let g = Command::new("icacls")
+            .arg(dir.to_string_lossy().to_string())
+            .arg("/grant:r")
+            .arg("*S-1-1-0:(OI)(CI)W")
+            .output()
+            .expect("icacls 执行失败");
+        assert!(g.status.success());
+
+        // 通过 AIROOT_DATA_DIR 让 data_dir() 指向该目录
+        // ⚠ 进程级环境变量会影响其它并行测试，故用全局锁串行化
+        static TOK_LOCK: Mutex<()> = Mutex::new(());
+        let _g2 = TOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AIROOT_DATA_DIR").ok();
+        std::env::set_var("AIROOT_DATA_DIR", &dir);
+
+        let r = ensure_token();
+        assert!(
+            r.is_err(),
+            "目录可被 Everyone 写入时，ensure_token 必须拒绝（不能沿用旧令牌）"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("AIROOT_DATA_DIR", v),
+            None => std::env::remove_var("AIROOT_DATA_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

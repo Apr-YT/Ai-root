@@ -16,7 +16,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::common;
+use crate::config;
+use crate::consent;
 use crate::exec;
+use crate::policy;
 use crate::protocol::{self, Request, Response};
 use crate::winapi_raw;
 
@@ -499,7 +502,7 @@ fn handle_client(mut file: File) {
         common::log_exec(
             &caller,
             caller_pid,
-            &format!("<auth-fail cmd={}>", req.command),
+            &format!("<auth-fail {}>", summarize_request(&req)),
             -401,
         );
         if sid_blocked {
@@ -558,21 +561,130 @@ fn handle_client(mut file: File) {
         .unwrap_or(common::DEFAULT_COMMAND_TIMEOUT_MS)
         .min(common::MAX_COMMAND_TIMEOUT_MS);
 
-    // GUI 实时信息流：执行开始事件
     let run_id = next_run_id();
+    let data_dir = common::data_dir();
+
+    // ── 授权判定（任务书 §6.1 的判定顺序）──
+    // 1) 身份与结构   —— 前面已完成（管道对端身份 + validate_request）
+    // 2) 令牌         —— 前面已完成
+    // 3) 启用开关     —— 前面已完成
+    // 4) 策略判定     —— 此处；内置保护 → deny 规则 → allow 规则 → confirm → 默认
+    // 5) 确认流程     —— 需要时走文件型确认
+    // 6) 执行 + 审计
+    // 带指纹缓存：配置未变时复用上次结果；任一文件变动立即重新加载（保留热生效）
+    let cfg = config::load_cached(&config::Paths::resolve());
+    let policy = &cfg.policy;
+    let protected = protected_paths();
+    let action = build_action(&req);
+    let verdict = policy.evaluate(&action, &protected);
+
+    let op_str = action.op_kind().as_str().to_string();
+    // 审计里的参数必须脱敏（命令可能带 --password=... / API Key）
+    let params = common::redact(&action.describe());
+
     common::log_event(serde_json::json!({
         "ts": common::now_str(),
-        "type": "exec_start",
-        "run_id": run_id.clone(),
+        "type": "policy_decision",
+        "run_id": run_id,
         "caller": caller,
         "pid": caller_pid,
-        "cmd": req.command,
-        "timeout_ms": timeout_ms,
+        "op": op_str,
+        "params": params,
+        "decision": verdict.decision.as_str(),
+        "rule_id": verdict.rule_id,
+        "reason": verdict.reason,
+        "policy_state": format!("{:?}", policy.state),
     }));
 
-    // 执行
+    let mut confirmed = false;
+    match verdict.decision {
+        policy::Decision::Deny => {
+            common::log_exec(&caller, caller_pid, &format!("<denied {op_str}>"), -403);
+            send_decision_err(
+                &mut file,
+                &format!(
+                    "策略拒绝（规则 {}）：{}\n如需放行，请管理员调整 {}\\policy.json",
+                    verdict.rule_id, verdict.reason, data_dir.display()
+                ),
+                "deny",
+                &verdict.rule_id,
+                None,
+            );
+            return;
+        }
+        policy::Decision::Confirm => {
+            // 已批准？（参数哈希匹配才认，且一次性消费）
+            if let Some(rid) = consent::take_approval(&data_dir, &action) {
+                confirmed = true;
+                common::log_event(serde_json::json!({
+                    "ts": common::now_str(),
+                    "type": "confirm_consumed",
+                    "run_id": run_id,
+                    "rid": rid,
+                    "caller": caller,
+                    "op": op_str,
+                }));
+            } else {
+                let ttl = policy.confirm_timeout_secs();
+                match consent::create(
+                    &data_dir,
+                    &caller,
+                    caller_pid,
+                    &action,
+                    req.target.as_deref(),
+                    ttl,
+                ) {
+                    Ok(pending) => {
+                        let msg = format!(
+                            "需要人工确认：\n  请求 ID : {}\n  操作    : {op_str}\n  参数    : {params}\n  \
+                             风险    : {}\n  有效期  : {ttl}s（过期作废）\n\n\
+                             管理员批准：AI-Root approve {}\n管理员拒绝：AI-Root deny {}\n\
+                             批准后重新执行同一条命令即可（参数必须完全一致）。",
+                            pending.id, pending.risk, pending.id, pending.id
+                        );
+                        common::log_exec(
+                            &caller,
+                            caller_pid,
+                            &format!("<confirm {op_str}>"),
+                            -409,
+                        );
+                        send_decision_err(
+                            &mut file,
+                            &msg,
+                            "confirm",
+                            &verdict.rule_id,
+                            Some(&pending.id),
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        // 无法建立确认通道 → 拒绝执行（任务书 §6.1 第 6 条）
+                        send_decision_err(
+                            &mut file,
+                            &format!("需要确认但确认通道不可用：{e}"),
+                            "deny",
+                            "confirm:unavailable",
+                            None,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        policy::Decision::Allow => {}
+    }
+
+    // ── 执行 ──
     let start = std::time::Instant::now();
-    let r = exec::run_command(&req.command, req.cwd.as_deref(), timeout_ms);
+    let r = match &action {
+        policy::Action::Argv { program, args, cwd } => {
+            exec::run_argv(program, args, *cwd, timeout_ms)
+        }
+        policy::Action::Shell { command, cwd } => {
+            exec::run_command(command, *cwd, timeout_ms)
+        }
+        policy::Action::Op { op, target } => run_structured_op(*op, *target, timeout_ms),
+    };
     let duration_ms = start.elapsed().as_millis() as u64;
 
     // 优化：检查连接时间，防止长时间占用
@@ -586,16 +698,14 @@ fn handle_client(mut file: File) {
         return;
     }
 
-    // GUI 实时信息流：先截取输出预览（必须在下方所有权移动 r.stdout 之前完成，
-    // 否则会触发「移动后借用」编译错误）
+    // GUI 实时信息流：先截取输出预览（必须在下方所有权移动 r.stdout 之前完成）
     let out_preview: String = r.stdout.chars().take(200).collect();
 
-    // 优化：减少不必要的克隆，直接使用所有权
     let resp = Response {
         ok: r.error.is_none() && !r.timed_out,
         exit_code: r.exit_code,
-        stdout: r.stdout, // 直接使用所有权，避免克隆
-        stderr: r.stderr, // 直接使用所有权，避免克隆
+        stdout: r.stdout,
+        stderr: r.stderr,
         error: if r.timed_out {
             Some("执行超时".to_string())
         } else {
@@ -606,16 +716,39 @@ fn handle_client(mut file: File) {
         duration_ms: Some(duration_ms),
         caller: Some(caller.clone()),
         timed_out: r.timed_out,
+        protocol_version: Some(protocol::PROTOCOL_VERSION),
+        // 经人工批准的请求：对调用方报告 allow（并在 reason 里保留原始判定），
+        // 审计日志里仍记录 decision=confirm + confirmed=true，两者不矛盾：
+        // 「协议层看到的结果」与「为什么允许」分开表达。
+        decision: Some(if confirmed {
+            "allow".to_string()
+        } else {
+            verdict.decision.as_str().to_string()
+        }),
+        rule_id: Some(verdict.rule_id.clone()),
+        reason: Some(if confirmed {
+            format!(
+                "经人工批准执行（原判定 {}：{}）",
+                verdict.decision.as_str(),
+                verdict.rule_id
+            )
+        } else {
+            verdict.reason.clone()
+        }),
+        confirmation_id: None,
     };
 
-    // GUI 实时信息流：执行完成事件
     common::log_event(serde_json::json!({
         "ts": common::now_str(),
         "type": "exec_done",
         "run_id": run_id.clone(),
         "caller": caller,
         "pid": caller_pid,
-        "cmd": req.command,
+        "op": op_str,
+        "params": params,
+        "decision": verdict.decision.as_str(),
+        "rule_id": verdict.rule_id,
+        "confirmed": confirmed,
         "exit": r.exit_code,
         "timed_out": r.timed_out,
         "truncated": r.truncated,
@@ -627,29 +760,303 @@ fn handle_client(mut file: File) {
         let _ = protocol::write_frame(&mut file, &bytes);
     }
 
-    // 落盘执行日志
-    common::log_exec(&caller, caller_pid, &req.command, r.exit_code);
+    // 落盘执行日志（含决策与是否经确认）
+    common::log_exec(
+        &caller,
+        caller_pid,
+        &format!("<{} {} confirmed={confirmed}>", verdict.rule_id, op_str),
+        r.exit_code,
+    );
 
-    // 记录详细审计信息
+    // 详细审计（不含令牌/密码：params 已脱敏）
     common::log_event(serde_json::json!({
         "type": "command_audit",
+        "run_id": run_id,
         "caller": caller,
         "pid": caller_pid,
-        "command": req.command,
+        "op": op_str,
+        "params": params,
+        "decision": verdict.decision.as_str(),
+        "rule_id": verdict.rule_id,
+        "confirmed": confirmed,
         "exit_code": r.exit_code,
         "duration_ms": duration_ms,
         "truncated": r.truncated,
         "timed_out": r.timed_out,
-        "cwd": req.cwd,
         "timestamp": chrono::Utc::now().to_rfc3339()
     }));
+}
+
+/// 策略判定的受保护路径：AI-Root 自身的数据目录（含 exe / token / policy / sid / 日志）。
+///
+/// 任何参数指向这里的请求都会被内置保护直接拒绝 —— 这一条**不可由策略文件覆盖**，
+/// 否则「改策略 → 放开自改 → 改 exe」就成了环。
+fn protected_paths() -> Vec<std::path::PathBuf> {
+    vec![common::data_dir()]
+}
+
+/// 请求摘要（用于日志，不展开完整命令）
+fn summarize_request(req: &protocol::Request) -> String {
+    if let Some(argv) = &req.argv {
+        format!(
+            "op=run_argv argv[{}]={}",
+            argv.len(),
+            argv.first().cloned().unwrap_or_default()
+        )
+    } else if let Some(cmd) = &req.command {
+        let preview: String = cmd.chars().take(60).collect();
+        format!("op={} cmd={preview}", req.op.as_deref().unwrap_or("shell"))
+    } else {
+        format!("op={:?}", req.op)
+    }
+}
+
+/// op 字符串 → 枚举（`validate_request` 已保证取值合法）
+fn op_from_str(s: &str) -> policy::OpKind {
+    match s {
+        "query_system_info" => policy::OpKind::QuerySystemInfo,
+        "query_service" => policy::OpKind::QueryService,
+        "restart_service" => policy::OpKind::RestartService,
+        "read_state_file" => policy::OpKind::ReadStateFile,
+        "install_package" => policy::OpKind::InstallPackage,
+        "update_self" => policy::OpKind::UpdateSelf,
+        "run_argv" => policy::OpKind::RunArgv,
+        _ => policy::OpKind::RunShell,
+    }
+}
+
+/// 由请求构造待判定动作（借用 req 的字段，不复制大字符串）
+fn build_action(req: &protocol::Request) -> policy::Action<'_> {
+    if let Some(argv) = req.argv.as_deref() {
+        let program = argv.first().map(|s| s.as_str()).unwrap_or("");
+        return policy::Action::Argv {
+            program,
+            args: &argv[1..],
+            cwd: req.cwd.as_deref(),
+        };
+    }
+    match req.op.as_deref() {
+        Some("run_shell") | None => policy::Action::Shell {
+            command: req.command.as_deref().unwrap_or(""),
+            cwd: req.cwd.as_deref(),
+        },
+        Some(other) => policy::Action::Op {
+            op: op_from_str(other),
+            target: req.target.as_deref(),
+        },
+    }
+}
+
+/// 发送带决策信息的错误响应
+fn send_decision_err(
+    file: &mut File,
+    msg: &str,
+    decision: &str,
+    rule_id: &str,
+    confirmation_id: Option<&str>,
+) {
+    let mut resp = protocol::err_response(msg);
+    resp.decision = Some(decision.to_string());
+    resp.rule_id = Some(rule_id.to_string());
+    resp.reason = Some(msg.to_string());
+    resp.confirmation_id = confirmation_id.map(|s| s.to_string());
+    if let Ok(bytes) = serde_json::to_vec(&resp) {
+        let _ = protocol::write_frame(file, &bytes);
+    }
+}
+
+fn op_ok(text: String) -> exec::ExecResult {
+    exec::ExecResult {
+        exit_code: 0,
+        stdout: text,
+        stderr: String::new(),
+        timed_out: false,
+        error: None,
+        truncated: false,
+    }
+}
+
+fn op_err(msg: String) -> exec::ExecResult {
+    exec::ExecResult {
+        exit_code: -1,
+        stdout: String::new(),
+        stderr: String::new(),
+        timed_out: false,
+        error: Some(msg),
+        truncated: false,
+    }
+}
+
+/// 执行结构化操作。
+///
+/// 这些操作**不走 shell**，参数与目标都由服务端按固定语义处理 ——
+/// 这是「最小权限 + 结构化」的落点：能表达清楚意图的，就不要交给字符串解释器。
+fn run_structured_op(
+    op: policy::OpKind,
+    target: Option<&str>,
+    timeout_ms: u64,
+) -> exec::ExecResult {
+    use policy::OpKind;
+
+    match op {
+        // 只读系统信息：直接用标准库，不起子进程（更快、更省资源、无注入面）
+        OpKind::QuerySystemInfo => {
+            let info = serde_json::json!({
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "family": std::env::consts::FAMILY,
+                "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+                "hostname": std::env::var("COMPUTERNAME").unwrap_or_default(),
+                "user": std::env::var("USERNAME").unwrap_or_default(),
+                "pid": std::process::id(),
+                "exe": std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+            });
+            op_ok(serde_json::to_string_pretty(&info).unwrap_or_default())
+        }
+
+        // 查询服务状态（只读）：target 为服务名
+        OpKind::QueryService => {
+            let Some(name) = target else {
+                return op_err("query_service 需要 target（服务名）".into());
+            };
+            match query_service_state(name) {
+                Ok(s) => op_ok(serde_json::json!({"service": name, "state": s}).to_string()),
+                Err(e) => op_err(format!("查询服务 {name} 失败: {e}")),
+            }
+        }
+
+        // 重启指定服务：名单由策略 approved_services 约束（策略层已判过，此处再兜一层）
+        OpKind::RestartService => {
+            let Some(name) = target else {
+                return op_err("restart_service 需要 target（服务名）".into());
+            };
+            restart_service(name)
+        }
+
+        // 读取状态文件：只允许数据目录下的白名单，绝不返回 token.txt
+        OpKind::ReadStateFile => {
+            const ALLOWED: &[&str] = &["policy.json"];
+            let Some(name) = target else {
+                return op_err("read_state_file 需要 target（文件名）".into());
+            };
+            if !ALLOWED.contains(&name) {
+                return op_err(format!(
+                    "不允许读取 {name}（白名单只有 {}）",
+                    ALLOWED.join(", ")
+                ));
+            }
+            let p = common::data_dir().join(name);
+            match std::fs::read_to_string(&p) {
+                Ok(s) if s.len() <= 64 * 1024 => op_ok(s),
+                Ok(_) => op_err("文件超过 64KB，拒绝返回".into()),
+                Err(e) => op_err(format!("读取失败: {e}")),
+            }
+        }
+
+        // 安装软件：由 run_argv + winget/choco/scoop 白名单承担，此 op 仅作提示
+        OpKind::InstallPackage => op_err(
+            "install_package 请改用结构化 argv（例：AI-Root exec winget install <包名>），\
+             以便策略按程序与参数精确授权"
+                .into(),
+        ),
+
+        // 更新自身：必须走 CLI 的签名门控流程，管道里永远不做
+        OpKind::UpdateSelf => op_err(
+            "update_self 不能经管道执行；请在本地运行 AI-Root update <已签名exe>（需签名与信任根）"
+                .into(),
+        ),
+
+        OpKind::RunArgv | OpKind::RunShell => {
+            // 由 build_action 映射到 Argv/Shell 分支，不会走到这里
+            let _ = timeout_ms;
+            op_err("内部错误：run_* 不应以结构化 op 方式执行".into())
+        }
+    }
+}
+
+/// 查询服务状态（文本）
+fn query_service_state(name: &str) -> Result<String, String> {
+    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    let m = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| e.to_string())?;
+    let svc = m
+        .open_service(name, ServiceAccess::QUERY_STATUS)
+        .map_err(|e| e.to_string())?;
+    let st = svc.query_status().map_err(|e| e.to_string())?;
+    let s = match st.current_state {
+        ServiceState::Running => "running",
+        ServiceState::Stopped => "stopped",
+        ServiceState::StartPending => "start_pending",
+        ServiceState::StopPending => "stop_pending",
+        ServiceState::Paused => "paused",
+        ServiceState::PausePending => "pause_pending",
+        ServiceState::ContinuePending => "continue_pending",
+    };
+    Ok(s.to_string())
+}
+
+/// 重启服务：停 → 等 Stopped（≤15s）→ 起 → 等 Running（≤15s）
+fn restart_service(name: &str) -> exec::ExecResult {
+    use std::ffi::OsString;
+    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let m = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) {
+        Ok(m) => m,
+        Err(e) => return op_err(format!("打开 SCM 失败: {e}")),
+    };
+    let svc = match m.open_service(
+        name,
+        ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+    ) {
+        Ok(s) => s,
+        Err(e) => return op_err(format!("打开服务 {name} 失败: {e}")),
+    };
+
+    if let Ok(st) = svc.query_status() {
+        if st.current_state != ServiceState::Stopped {
+            if let Err(e) = svc.stop() {
+                return op_err(format!("停止 {name} 失败: {e}"));
+            }
+            let mut ok = false;
+            for _ in 0..30 {
+                if let Ok(s) = svc.query_status() {
+                    if s.current_state == ServiceState::Stopped {
+                        ok = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            if !ok {
+                return op_err(format!("{name} 15s 内未停止"));
+            }
+        }
+    }
+
+    if let Err(e) = svc.start::<OsString>(&[]) {
+        return op_err(format!("启动 {name} 失败: {e}"));
+    }
+    for _ in 0..30 {
+        if let Ok(s) = svc.query_status() {
+            if s.current_state == ServiceState::Running {
+                return op_ok(format!("服务 {name} 已重启（running）"));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    op_err(format!("{name} 启动后 15s 内未进入 running"))
 }
 
 /// 前台（测试）模式：持续接受连接，直到进程被终止
 pub fn run_pipe_server_forever() {
     let tok = common::read_or_create_token();
     common::cache_token(tok);
-    common::set_enabled(true); // 前台模式默认启用
+    if let Err(e) = common::set_enabled(true) {
+        // 前台模式：启用标志/ACL 失败也必须显式告警（原先静默吞错）
+        eprintln!("[AI-Root] 警告：启用标志或目录 ACL 设置失败: {e}");
+    }
     println!("[AI-Root] 前台管道服务已启动: {}", common::pipe_name());
     loop {
         match accept_one() {
@@ -692,7 +1099,7 @@ fn dispatch_connection(handle: winapi_raw::HANDLE) {
 /// 注意：HANDLE（*mut c_void）不是 Send，跨线程传递统一以 usize 整数形式，
 /// 使用时再 cast 回 HANDLE。Mutex 取锁统一用 `unwrap_or_else(|e| e.into_inner())`
 /// 防止 poison 导致主循环 panic 拖垮进程。
-pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
+pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) -> Result<(), String> {
     let tok = common::read_or_create_token();
     common::cache_token(tok);
 
@@ -701,9 +1108,23 @@ pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
     // ⚠ 服务以 LocalSystem 运行，此处 set_dir_acl 内部的 granted_user_sid() 会读 sid.txt
     //   取到**安装用户** SID，而不是当前进程的 S-1-5-18 —— 否则会把 SYSTEM 自降为只读
     //   （2026-10-04 线上故障，见 common.rs::select_grant_sid 文档）。
+    // ⚠ fail-closed：ACL 是令牌保密性的唯一边界。设置或校验失败时**不进入主循环**，
+    // 让服务启动失败（SCM 记 7034/1053），而不是带着可疑权限继续监听管道。
     let dir = common::data_dir();
-    std::fs::create_dir_all(&dir).ok();
-    common::set_dir_acl(&dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        let msg = format!("创建数据目录失败 {}: {e}", dir.display());
+        common::log_event(serde_json::json!({
+            "ts": common::now_str(), "type": "acl_setup_failed", "error": msg,
+        }));
+        return Err(msg);
+    }
+    if let Err(e) = common::set_dir_acl(&dir) {
+        let msg = format!("设置数据目录 ACL 失败（拒绝启动）：{e}");
+        common::log_event(serde_json::json!({
+            "ts": common::now_str(), "type": "acl_setup_failed", "error": msg,
+        }));
+        return Err(msg);
+    }
 
     // 服务启动即写一条事件——确保 events.jsonl 按当前（含继承）DACL 被创建
     common::log_event(serde_json::json!({
@@ -783,9 +1204,11 @@ pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) {
     }
 
     let _ = monitor.join();
+    Ok(())
 }
 
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)] // README 记载的数值契约，变更应是有意识决策
 mod tests {
     use super::*;
 
@@ -1094,16 +1517,62 @@ mod tests {
         (srv, cli)
     }
 
-    /// 准备端到端环境：设置 `AIROOT_DATA_DIR`、写测试令牌与 enabled flag。返回令牌。
-    /// 调用方**必须**持有 `E2E_LOCK`。
+    /// 准备端到端环境：设置数据目录、写测试令牌/启用标志/**TOML 测试策略**。
+    /// 返回令牌。调用方**必须**持有 `E2E_LOCK`。
+    ///
+    /// 布局与生产一致（v1.2 分层）：`secrets/token.txt`、`state/enabled.flag`、`policy.toml`。
     fn e2e_setup() -> String {
         let dir = e2e_data_dir();
-        std::fs::create_dir_all(&dir).expect("创建测试数据目录失败");
+        std::fs::create_dir_all(dir.join(config::SECRETS_DIR)).expect("创建 secrets 失败");
+        std::fs::create_dir_all(dir.join(config::STATE_DIR)).expect("创建 state 失败");
         std::env::set_var("AIROOT_DATA_DIR", &dir);
-        let token = "0123456789abcdef".repeat(4); // 64 位 hex，与真实令牌同形
-        std::fs::write(dir.join("token.txt"), &token).expect("写测试令牌失败");
-        std::fs::write(dir.join("enabled.flag"), b"1").expect("写启用标志失败");
+        // 用户配置也隔离，避免读到开发机上的真实 %LOCALAPPDATA%\AI-Root\user.toml
+        let user_dir = std::env::temp_dir().join(format!("airoot-e2e-user-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&user_dir);
+        std::env::set_var("AIROOT_USER_DIR", &user_dir);
+
+        let token = "0123456789abcdef".repeat(4);
+        std::fs::write(dir.join(config::SECRETS_DIR).join("token.txt"), &token)
+            .expect("写测试令牌失败");
+        std::fs::write(
+            dir.join(config::STATE_DIR).join("enabled.flag"),
+            b"1",
+        )
+        .expect("写启用标志失败");
+        write_test_policy(&dir, true);
+        config::invalidate_cache();
         token
+    }
+
+    /// 写测试策略（TOML）。`allow_shell=true` 时额外放行传统 shell。
+    ///
+    /// 用生产默认策略作基线，而不是空规则表 —— 否则 argv 用例会误判成「白名单不放行」。
+    fn write_test_policy(dir: &std::path::Path, allow_shell: bool) {
+        let mut f = policy::PolicyFile::default_autonomy();
+        f.allow_legacy_shell = allow_shell;
+        if allow_shell {
+            f.rules.push(policy::Rule {
+                id: "t-allow-shell".into(),
+                decision: policy::Decision::Allow,
+                op: Some(policy::OpKind::RunShell),
+                program: None,
+                program_path: None,
+                arg_prefix: vec![],
+                arg_forbid: vec![],
+                target: None,
+                cwd_roots: vec![],
+                note: Some("测试专用：放行传统 shell".into()),
+            });
+        }
+        f.validate().expect("测试策略必须合法");
+        let body = toml::to_string_pretty(&f).expect("序列化 TOML 失败");
+        std::fs::write(dir.join(config::POLICY_FILE), body).expect("写测试策略失败");
+        std::fs::write(
+            dir.join(config::STATE_DIR).join(config::POLICY_MARKER),
+            b"1",
+        )
+        .expect("写初始化标记失败");
+        config::invalidate_cache();
     }
 
     /// 一次完整对话：服务端线程跑 `handle_client`，主线程当客户端收发帧。返回响应。
@@ -1181,7 +1650,8 @@ mod tests {
     fn e2e_handle_client_respects_disabled_flag() {
         let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let token = e2e_setup();
-        let flag = e2e_data_dir().join("enabled.flag");
+        // v1.2 布局：启用标志在 state\ 下
+        let flag = e2e_data_dir().join(config::STATE_DIR).join("enabled.flag");
         let _ = std::fs::remove_file(&flag);
 
         let req = serde_json::json!({
@@ -1243,5 +1713,315 @@ mod tests {
         );
         assert!(!resp.stdout.contains("should_not_run"));
     }
-}
 
+    // ============================================================
+    // 授权层端到端（v2 策略 / 确认流程）
+    // ============================================================
+
+    /// 默认策略下，传统 shell 必须变成「需要确认」，且**绝不能执行**。
+    #[test]
+    fn e2e_shell_requires_confirmation_and_does_not_execute() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+        // 换成「不放行 shell」的策略
+        write_test_policy(&e2e_data_dir(), false);
+
+        let mark = format!("AIROOT_CONFIRM_LEAK_{}", std::process::id());
+        let req = serde_json::json!({
+            "token": token,
+            "command": format!("echo {mark}"),
+        })
+        .to_string();
+        let resp = e2e_roundtrip("confirm", &req);
+
+        assert_eq!(resp.decision.as_deref(), Some("confirm"), "应为待确认");
+        assert!(!resp.ok, "待确认不得视为成功");
+        assert!(
+            resp.confirmation_id.is_some(),
+            "必须返回请求 ID，否则用户无法批准"
+        );
+        assert!(
+            !resp.stdout.contains(&mark),
+            "待确认的请求绝不能被执行（stdout 泄露: {:?}）",
+            resp.stdout
+        );
+        // 恢复，避免影响同组其它用例
+        write_test_policy(&e2e_data_dir(), true);
+    }
+
+    /// 结构化 argv 命中默认白名单 → 直接执行，不需要确认。
+    #[test]
+    fn e2e_argv_allowed_by_policy_runs_without_confirmation() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+
+        let req = serde_json::json!({
+            "token": token,
+            "v": 2,
+            "op": "run_argv",
+            "argv": ["whoami"],
+        })
+        .to_string();
+        let resp = e2e_roundtrip("argvok", &req);
+
+        assert!(resp.ok, "argv 白名单应直接允许，error={:?}", resp.error);
+        assert_eq!(resp.decision.as_deref(), Some("allow"));
+        assert_eq!(resp.exit_code, 0);
+        assert!(!resp.stdout.trim().is_empty(), "应拿到 whoami 输出");
+    }
+
+    /// argv 模式下的 shell 宿主被内置保护拒绝（不能靠规则放开）。
+    #[test]
+    fn e2e_argv_shell_host_is_denied() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+
+        let req = serde_json::json!({
+            "token": token,
+            "v": 2,
+            "op": "run_argv",
+            "argv": ["cmd", "/c", "echo should_not_run"],
+        })
+        .to_string();
+        let resp = e2e_roundtrip("shellhost", &req);
+
+        assert_eq!(resp.decision.as_deref(), Some("deny"));
+        assert!(!resp.ok);
+        assert_eq!(resp.rule_id.as_deref(), Some("builtin:shell-host"));
+        assert!(!resp.stdout.contains("should_not_run"));
+    }
+
+    /// 破坏性 shell 命令：Deny（确认也不能放行）。
+    #[test]
+    fn e2e_destructive_shell_is_denied() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+
+        let req = serde_json::json!({
+            "token": token,
+            "command": "format D: /q",
+        })
+        .to_string();
+        let resp = e2e_roundtrip("destructive", &req);
+
+        assert_eq!(resp.decision.as_deref(), Some("deny"));
+        assert_eq!(resp.rule_id.as_deref(), Some("builtin:destructive"));
+    }
+
+    /// 完整确认流程：待确认 → 管理员批准 → 重放同一条命令 → 执行成功。
+    /// 这是任务书 §7 的核心验收：确认与请求绑定，且只有批准后才执行。
+    #[test]
+    fn e2e_confirm_then_replay_executes() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+        write_test_policy(&e2e_data_dir(), false);
+
+        let mark = format!("AIROOT_APPROVED_{}", std::process::id());
+        let req = serde_json::json!({
+            "token": token,
+            "command": format!("echo {mark}"),
+        })
+        .to_string();
+
+        // 第 1 次：得到待确认 + rid
+        let first = e2e_roundtrip("cfm1", &req);
+        assert_eq!(first.decision.as_deref(), Some("confirm"));
+        let rid = first.confirmation_id.clone().expect("应有请求 ID");
+        assert!(!first.stdout.contains(&mark), "批准前不得执行");
+
+        // 管理员批准
+        let dir = e2e_data_dir();
+        consent::approve(&dir, &rid).expect("批准应成功");
+
+        // 第 2 次：同一条命令 → 应执行（复用 token，不重置策略）
+        let req2 = serde_json::json!({
+            "token": token,
+            "command": format!("echo {mark}"),
+        })
+        .to_string();
+        let second = e2e_roundtrip("cfm2", &req2);
+        assert!(second.ok, "批准后应执行，error={:?}", second.error);
+        assert_eq!(
+            second.decision.as_deref(),
+            Some("allow"),
+            "批准后的执行应报告 allow（reason 中注明经人工批准）"
+        );
+        assert!(
+            second.stdout.contains(&mark),
+            "批准后应看到命令输出，实际 {:?}",
+            second.stdout
+        );
+
+        // 第 3 次：批准已被消费 → 回到待确认（不能无限复用）
+        let req3 = serde_json::json!({
+            "token": token,
+            "command": format!("echo {mark}"),
+        })
+        .to_string();
+        let third = e2e_roundtrip("cfm3", &req3);
+        assert_eq!(
+            third.decision.as_deref(),
+            Some("confirm"),
+            "一份批准只能消费一次"
+        );
+        assert!(!third.stdout.contains(&mark));
+
+        write_test_policy(&dir, true);
+    }
+
+    /// 批准 A 命令不能让 B 命令通过（参数绑定）。
+    #[test]
+    fn e2e_approval_is_bound_to_exact_command() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+        write_test_policy(&e2e_data_dir(), false);
+        let dir = e2e_data_dir();
+
+        let a = serde_json::json!({"token": token, "command": "echo AAA" }).to_string();
+        let first = e2e_roundtrip("bind-a", &a);
+        let rid = first.confirmation_id.clone().unwrap();
+        consent::approve(&dir, &rid).unwrap();
+
+        // 换一条命令：必须仍然待确认
+        let b = serde_json::json!({
+            "token": token,
+            "command": "echo BBB",
+        })
+        .to_string();
+        let resp = e2e_roundtrip("bind-b", &b);
+        assert_eq!(
+            resp.decision.as_deref(),
+            Some("confirm"),
+            "批准 A 不能放行 B（参数必须完全一致）"
+        );
+
+        write_test_policy(&dir, true);
+    }
+
+    /// 未知字段的请求必须被拒绝（不能靠多带字段表达状态）。
+    #[test]
+    fn e2e_unknown_field_is_rejected() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+
+        let req = serde_json::json!({
+            "token": token,
+            "command": "echo should_not_run",
+            "confirmed": true,
+        })
+        .to_string();
+        let resp = e2e_roundtrip("unknownfield", &req);
+
+        assert!(!resp.ok);
+        assert!(
+            resp.error.as_deref().unwrap_or("").contains("解析失败"),
+            "未知字段应导致解析失败，实际 {:?}",
+            resp.error
+        );
+    }
+    // ============================================================
+    // 配置分层：接入真实授权流程（v1.2）
+    // ============================================================
+
+    /// 用户配置收紧到 disabled：真实请求必须被拒（验证用户层确实接入了判定流程）。
+    #[test]
+    fn e2e_user_config_can_tighten_effective_mode() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+        let user_dir =
+            std::env::temp_dir().join(format!("airoot-e2e-user-{}", std::process::id()));
+        let user_cfg = user_dir.join(config::USER_CONFIG_FILE);
+        std::fs::write(&user_cfg, "version = 2\nmode = \"disabled\"\n").expect("写用户配置");
+        config::invalidate_cache();
+
+        let req = serde_json::json!({
+            "token": token,
+            "v": 2,
+            "op": "run_argv",
+            "argv": ["whoami"],
+        })
+        .to_string();
+        let resp = e2e_roundtrip("usertight", &req);
+
+        // 清理，避免影响后续用例
+        let _ = std::fs::remove_file(&user_cfg);
+        config::invalidate_cache();
+
+        assert_eq!(
+            resp.decision.as_deref(),
+            Some("deny"),
+            "用户配置把模式收紧为 disabled 后，argv 白名单必须失效（error={:?}）",
+            resp.error
+        );
+        assert_eq!(resp.rule_id.as_deref(), Some("mode:disabled"));
+        assert!(!resp.ok);
+    }
+
+    /// 用户在 user.toml 里写授权规则 → 整个用户层被忽略（管理员策略照旧生效）。
+    ///
+    /// 这条断言的意义：user.toml **不是**绕过点。它既不能放宽，也不能通过
+    /// `deny_unknown_fields` 之外的字段影响判定（写错就整层忽略，不是静默部分生效）。
+    #[test]
+    fn e2e_user_config_cannot_inject_rules() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+        let user_dir =
+            std::env::temp_dir().join(format!("airoot-e2e-user-{}", std::process::id()));
+        let user_cfg = user_dir.join(config::USER_CONFIG_FILE);
+        std::fs::write(
+            &user_cfg,
+            "version = 2\nmode = \"autonomy\"\n\n[[rule]]\nid = \"evil\"\ndecision = \"allow\"\nop = \"run_argv\"\nprogram = \"cmd\"\n",
+        )
+        .expect("写用户配置");
+        config::invalidate_cache();
+
+        let req = serde_json::json!({
+            "token": token,
+            "v": 2,
+            "op": "run_argv",
+            "argv": ["whoami"],
+        })
+        .to_string();
+        let resp = e2e_roundtrip("userinject", &req);
+
+        let _ = std::fs::remove_file(&user_cfg);
+        config::invalidate_cache();
+
+        // 用户层被整层忽略 → 走管理员策略（默认允许 whoami）
+        assert!(
+            resp.ok,
+            "用户层非法不影响管理员策略，whoami 仍应放行（error={:?}）",
+            resp.error
+        );
+        assert_eq!(resp.decision.as_deref(), Some("allow"));
+    }
+
+    /// 管理员策略缺失但曾初始化：真实请求必须被拒（不是回落默认策略）。
+    #[test]
+    fn e2e_missing_policy_after_init_denies_requests() {
+        let _g = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = e2e_setup();
+        let dir = e2e_data_dir();
+        std::fs::remove_file(dir.join(config::POLICY_FILE)).expect("删除策略");
+        config::invalidate_cache();
+
+        let req = serde_json::json!({
+            "token": token,
+            "v": 2,
+            "op": "run_argv",
+            "argv": ["whoami"],
+        })
+        .to_string();
+        let resp = e2e_roundtrip("nopolicy", &req);
+
+        // 恢复策略，避免污染同组用例
+        write_test_policy(&dir, true);
+
+        assert_eq!(
+            resp.decision.as_deref(),
+            Some("deny"),
+            "策略被删除后必须降级（只读查询以外全拒），不能回落默认"
+        );
+        assert_eq!(resp.rule_id.as_deref(), Some("degraded:deny"));
+    }
+}

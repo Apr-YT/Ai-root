@@ -14,6 +14,7 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::common;
+use crate::config;
 use crate::server;
 use crate::winapi_raw;
 
@@ -26,14 +27,9 @@ use crate::winapi_raw;
 /// 之所以不写死在源码里某个盘符路径：部署位置属于**环境相关配置**，
 /// 硬编码会把某台机器的目录习惯带进发布物，也让他人无法按需调整。
 fn deploy_dir() -> std::path::PathBuf {
-    if let Ok(custom) = std::env::var("AIROOT_DEPLOY_DIR") {
-        if !custom.trim().is_empty() {
-            return std::path::PathBuf::from(custom);
-        }
-    }
-    // %ProgramData% 默认即 C:\ProgramData；取不到时退化为 C:\ProgramData。
-    let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
-    std::path::Path::new(&base).join("AI-Root")
+    // 部署位置必须与配置/令牌/日志同目录（都在受 ACL 保护的机器级目录下），
+    // 否则「服务二进制受保护」与「配置受保护」会分裂成两套边界。
+    crate::config::machine_dir()
 }
 
 /// 将自身部署到 [`deploy_dir`] 并在 C:\Windows 写入 AI-Root.cmd 包装器，
@@ -156,13 +152,15 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[warn] 服务 ACL 授权失败: {e}（更新服务二进制将仍需管理员）");
     }
 
-    // 安装时即生成令牌并设置 ACL，确保服务启动后可用
+    // 安装时即生成令牌并设置 ACL，确保服务启动后可用。
+    // 任何一步失败都必须终止安装（fail closed）：宁可不装，也不留一个
+    // 「服务已注册但权限可疑」的中间状态。
     common::ensure_token()?;
     // 持久化安装用户 SID，注入管道 SDDL，使智能体（该用户身份）可无人值守连管道拿 SYSTEM
     if let Some(sid) = common::get_user_sid() {
         common::save_user_sid(&sid);
     }
-    common::set_enabled(true);
+    common::set_enabled(true)?;
 
     println!("✓ 服务已注册: {} (LocalSystem, 自启)", common::SERVICE_NAME);
     println!("启动命令: AI-Root start");
@@ -321,95 +319,253 @@ pub fn grant_acl() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 校验文件是否为有效 PE 可执行文件（MZ 头 + PE 签名 + 机器码段）。
-/// update 前调用，防止把非可执行文件（损坏/纯数据）覆盖成 SYSTEM 服务。
-fn is_valid_pe(path: &std::path::Path) -> bool {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
+/// 读取 PE 的 Machine 字段（0x8664 = x64 / 0x014C = x86 / 0xAA64 = ARM64）。
+/// 非 PE 或头损坏返回 None。
+fn pe_machine(path: &std::path::Path) -> Option<u16> {
+    use std::io::{Read, Seek};
+    let mut f = std::fs::File::open(path).ok()?;
     let mut head = [0u8; 0x40];
-    if f.read_exact(&mut head).is_err() {
-        return false;
-    }
-    // DOS 头 MZ 签名
+    f.read_exact(&mut head).ok()?;
     if &head[0..2] != b"MZ" {
-        return false;
+        return None;
     }
-    // e_lfanew 偏移（0x3C 处 4 字节 LE）→ PE 签名
     let pe_off = u32::from_le_bytes([head[0x3C], head[0x3D], head[0x3E], head[0x3F]]) as usize;
-    if pe_off > 0x1000 {
-        return false; // 异常偏移防御
+    if pe_off == 0 || pe_off > 0x1000 {
+        return None; // 异常偏移防御
     }
     let mut pe = [0u8; 0x18];
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    use std::io::Seek;
-    if f.seek(std::io::SeekFrom::Start(pe_off as u64)).is_err() {
-        return false;
-    }
-    if f.read_exact(&mut pe).is_err() {
-        return false;
-    }
-    // PE\0\0 签名 + Machine（0x8664=x64 / 0x014C=x86）
+    f.seek(std::io::SeekFrom::Start(pe_off as u64)).ok()?;
+    f.read_exact(&mut pe).ok()?;
     if &pe[0..4] != b"PE\0\0" {
-        return false;
+        return None;
     }
-    let machine = u16::from_le_bytes([pe[4], pe[5]]);
-    matches!(machine, 0x8664 | 0x014C)
+    Some(u16::from_le_bytes([pe[4], pe[5]]))
 }
 
-/// 计算文件 SHA-256（certutil -hashfile），返回 hex 字符串；失败返回空。
-/// 供 update 自检输出，便于审计新二进制指纹。
-fn file_sha256(path: &std::path::Path) -> String {
-    let out = match std::process::Command::new("certutil")
-        .args(["-hashfile", &path.to_string_lossy(), "SHA256"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return String::new(),
-    };
+/// 服务二进制的期望架构（必须与当前进程一致）
+fn expected_machine() -> u16 {
+    if cfg!(target_arch = "x86_64") {
+        0x8664
+    } else if cfg!(target_arch = "aarch64") {
+        0xAA64
+    } else {
+        0x014C
+    }
+}
+
+/// 校验文件是有效 PE **且架构与服务一致**。
+///
+/// 注：`update_self` 内部直接比较 `pe_machine` 以获得更精确的错误信息，
+/// 本函数保留给单元测试与将来的调用方使用。
+///
+/// 改造点：旧实现接受 x64/x86 任意一种 —— 用 x86 二进制替换 x64 服务会让服务
+/// 直接起不来（甚至留下无法回滚的坏状态）。架构必须精确匹配。
+#[allow(dead_code)] // 见上方说明：update 内部用 pe_machine 直接比较
+fn is_valid_pe(path: &std::path::Path) -> bool {
+    pe_machine(path) == Some(expected_machine())
+}
+
+/// 探测二进制自报的版本（`<exe> --version` → 取最后一段版本号）。
+///
+/// 仅在**签名验证通过之后**调用：此时该文件已被确认由可信发布者签名，
+/// 执行它取版本不会引入新的信任假设。
+fn probe_version(exe: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new(exe).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let s = String::from_utf8_lossy(&out.stdout);
-    // certutil 输出格式：文件 + 空行 + 64 hex + 空行
-    for line in s.lines() {
-        let t = line.trim();
-        if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
-            return t.to_lowercase();
-        }
-    }
-    String::new()
+    s.lines()
+        .next()?
+        .split_whitespace()
+        .last()
+        .map(|v| v.trim().to_string())
 }
 
-/// 自主更新服务二进制（需 install 时已对当前用户授权 STOP/START）。
+/// 版本号 → 可比较元组（缺失段按 0）
+fn version_tuple(v: &str) -> (u64, u64, u64) {
+    let mut it = v.split('.').map(|p| {
+        p.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .unwrap_or(0)
+    });
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
+}
+
+/// 轮询等待服务进入 Running（秒）
+fn wait_running(svc: &windows_service::service::Service, secs: u64) -> bool {
+    for _ in 0..(secs * 2) {
+        if let Ok(st) = svc.query_status() {
+            if st.current_state == ServiceState::Running {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
+
+/// 自主更新服务二进制。
 ///
-/// ⚠ 安全说明：本命令将任意 exe 替换为 SYSTEM 服务并启动，等效于 SYSTEM 代码执行。
-/// 仅应授予可信进程（如本机智能体）。防护仅为 PE 有效性校验 + SHA256 指纹输出，
-/// 如需强校验请对发布物做 Authenticode 签名并在外部流程中核验。
+/// ## 安全模型（2026-10-21 重做）
 ///
-/// 流程：停止服务（轮询等待 Stopped）→ 覆盖部署副本 → 启动服务 → 自检状态。
+/// 旧实现的防护是「PE 头校验 + 打印 SHA-256」。这在安全上等于零：
+/// 任何能执行 `AI-Root update` 的人都能把任意 PE 变成 LocalSystem 服务，
+/// 而 `install` 又主动给安装用户授予了服务 STOP/START 权限 ——
+/// 于是「非提权用户 → SYSTEM」是一条不需要令牌、不需要读文件的直路。
+///
+/// 现在替换为**三道门控**，任一不满足即拒绝：
+///
+/// 1. **签名**：`WinVerifyTrust` 验证 Authenticode 嵌入签名与证书链完整性；
+/// 2. **发布者绑定**：签名者证书 SHA-256 必须命中策略 `trusted_publishers`
+///    （只验「有签名」不够 —— 任何人都能自签一张证书）；
+/// 3. **目标固定**：写入目标取自 SCM 的实际 `ImagePath`，并强制它位于受 ACL
+///    保护的数据目录内；不再用环境变量 `AIROOT_DEPLOY_DIR` 推算（那既会写错位置，
+///    也是一个「以 SYSTEM 身份向任意目录写文件」的原语）。
+///
+/// 另加：架构必须与当前进程一致；拒绝版本降级；复制后二次校验 SHA-256；
+/// 启动失败自动回滚到 `.old`。
+///
+/// ## 流程
+/// 校验输入 → 加载策略/信任根 → 验签 → 定位 ImagePath → 版本比对 →
+/// 停服务 → 复制到 `.new` → 校验 → 换名（旧文件留 `.old`）→ 启动 → 健康检查
+/// → 成功删 `.old` / 失败回滚。
 pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    // 0) 新 exe 有效性校验（防覆盖成垃圾文件导致服务无法启动）
-    if !is_valid_pe(new_exe) {
+    use crate::policy;
+    use crate::signature;
+
+    // ── 0. 输入基本校验 ──
+    if !new_exe.is_absolute() {
+        return Err(format!("必须提供绝对路径: {}", new_exe.display()).into());
+    }
+    if !new_exe.is_file() {
+        return Err(format!("文件不存在: {}", new_exe.display()).into());
+    }
+    let machine = pe_machine(new_exe)
+        .ok_or_else(|| format!("不是有效的 PE 可执行文件: {}", new_exe.display()))?;
+    if machine != expected_machine() {
         return Err(format!(
-            "拒绝更新：{} 不是有效的 PE 可执行文件（MZ/PE 头校验失败）",
-            new_exe.display()
+            "架构不匹配：目标 Machine=0x{machine:04X}，服务要求 0x{:04X}",
+            expected_machine()
         )
         .into());
     }
-    let sha = file_sha256(new_exe);
-    if !sha.is_empty() {
-        println!("新二进制 SHA256: {sha}");
+
+    // ── 1. 信任根 + 签名验证（不可绕过）──
+    let data_dir = common::data_dir();
+    let pol = config::load(&config::Paths::resolve()).policy;
+    if pol.is_degraded() {
+        return Err("策略文件不可用（降级状态），拒绝更新".into());
+    }
+    if pol.file.trusted_publishers.is_empty() {
+        return Err(
+            "未配置可信发布者，拒绝更新。\n\
+             建立信任根（需管理员，对已发布版本执行一次）：\n\
+              AI-Root trust-publisher <已签名的新版本 AI-Root.exe>\n\
+             注意：只接受 Authenticode **嵌入签名**；catalog 签名（System32 常见）不被接受。"
+                .into(),
+        );
+    }
+    let report = signature::verify_file(new_exe, &pol.file.trusted_publishers);
+    if !report.is_acceptable() {
+        common::log_event(serde_json::json!({
+            "ts": common::now_str(),
+            "type": "update_rejected",
+            "path": new_exe.to_string_lossy(),
+            "chain_trusted": report.chain_trusted,
+            "trust_error": report.trust_error,
+            "signer": report.signer_subject,
+            "thumbprint": report.signer_thumbprint,
+            "publisher_allowed": report.publisher_allowed,
+        }));
+        return Err(format!(
+            "签名验证失败，拒绝更新：\n  信任链: {}\n  失败码: {}\n  签名者: {}\n  证书指纹: {}\n  是否命中信任列表: {}\n\
+             （只接受由 trusted_publishers 中证书签名的二进制）",
+            if report.chain_trusted { "通过" } else { "未通过" },
+            report.trust_error.as_deref().unwrap_or("-"),
+            report.signer_subject.as_deref().unwrap_or("<无签名>"),
+            report.signer_thumbprint.as_deref().unwrap_or("-"),
+            if report.publisher_allowed { "是" } else { "否" },
+        )
+        .into());
+    }
+    // 二次确认：策略侧独立再判一次发布者（纵深防御 ——
+    // 即使 verify_file 内部的比对逻辑被改坏，这里也能拦住）
+    if let Some(thumb) = &report.signer_thumbprint {
+        if !pol.publisher_trusted(thumb) {
+            return Err(format!(
+                "发布者证书 {thumb} 不在 trusted_publishers 中，拒绝更新"
+            )
+            .into());
+        }
+    } else {
+        return Err("无法提取签名者证书指纹，拒绝更新".into());
     }
 
+    println!(
+        "✓ 签名验证通过：{}",
+        report.signer_subject.as_deref().unwrap_or("<未知发布者>")
+    );
+    if let Some(h) = &report.file_sha256 {
+        println!("  新二进制 SHA256: {h}");
+    }
+
+    // ── 2. 目标路径 = 服务实际注册的 ImagePath（不用环境变量推算）──
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(
         common::SERVICE_NAME,
-        ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+        ServiceAccess::QUERY_CONFIG
+            | ServiceAccess::QUERY_STATUS
+            | ServiceAccess::STOP
+            | ServiceAccess::START,
     )?;
+    let cfg = service.query_config()?;
+    let deploy_exe = cfg.executable_path.clone();
+    let deploy_dir = deploy_exe
+        .parent()
+        .ok_or("无法从服务 ImagePath 确定部署目录")?
+        .to_path_buf();
 
-    // 1) 若在运行，先停止（轮询等待，最多 ~15s；服务优雅停止逻辑见 server.rs CancelIoEx）
+    // 目标必须落在受 ACL 保护的数据目录内。否则说明 ImagePath 被改到了
+    // 用户可写位置（或部署方式不是本程序 install 的）—— 此时更新等于把
+    // 一个 SYSTEM 服务指向不可信目录，必须拒绝并提示重新安装。
+    let norm_target = policy::normalize_win_path(&deploy_exe.to_string_lossy());
+    let norm_data = policy::normalize_win_path(&data_dir.to_string_lossy());
+    if !(norm_target == norm_data || norm_target.starts_with(&format!("{norm_data}/"))) {
+        return Err(format!(
+            "服务镜像路径不在受保护数据目录内，拒绝更新：\n  ImagePath: {}\n  期望前缀: {}\n\
+             （可能被篡改，或由旧版本以其它路径安装；请以管理员重新执行 install）",
+            deploy_exe.display(),
+            data_dir.display()
+        )
+        .into());
+    }
+    println!("  目标路径: {}", deploy_exe.display());
+
+    // ── 3. 版本比对（拒绝降级）──
+    let new_ver = probe_version(new_exe);
+    let cur_exe = std::env::current_exe()?;
+    let cur_ver = probe_version(&cur_exe);
+    if let (Some(n), Some(c)) = (&new_ver, &cur_ver) {
+        println!("  版本: {c} → {n}");
+        if version_tuple(n) < version_tuple(c) {
+            return Err(format!(
+                "拒绝版本降级：当前 {c}，目标 {n}。\n\
+                 如需回滚，请在离线环境手动替换 .old 并重启服务。"
+            )
+            .into());
+        }
+    } else {
+        println!("  [warn] 无法探测版本（跳过降级检查，签名已验证）");
+    }
+
+    // ── 4. 停服务（轮询等待，最多 ~15s）──
     let st = service.query_status()?;
     if st.current_state != ServiceState::Stopped {
         println!("[*] 停止服务...");
@@ -421,51 +577,78 @@ pub fn update_self(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::
             std::thread::sleep(Duration::from_millis(500));
         }
         if service.query_status()?.current_state != ServiceState::Stopped {
-            // 超时但二进制尚未覆盖、服务未损坏（不会留下坏服务），状态安全可直接重试。
             return Err(
-                "服务停止超时（15s 内未变为 Stopped）。现有二进制尚未覆盖、服务未损坏，可安全重试：\
-                 请确认服务已停止（AI-Root status / services.msc）后再次执行 update"
-                    .into(),
+                "服务停止超时（15s 内未变为 Stopped）。现有二进制尚未改动，可安全重试。".into(),
             );
         }
     }
 
-    // 2) 覆盖部署副本（与 install 的 deploy_global 同一路径）
-    let dir = deploy_dir();
-    let deploy_dir = dir.as_path();
-    std::fs::create_dir_all(deploy_dir)?;
-    let deploy_exe = deploy_dir.join("AI-Root.exe");
-    // 自锁处理：update 若由部署 exe 自身运行，直接 copy 会因「映像被占用」报 os error 32。
-    // Windows 允许重命名运行中 exe（映像以 FILE_SHARE_DELETE 打开），先改名 .old 腾出路径，
-    // 再复制新文件；失败回滚，启动后清理 .old（残留可被下轮 update 清理）。
-    let old_exe = deploy_dir.join("AI-Root.exe.old");
-    let _ = std::fs::remove_file(&old_exe);
-    match std::fs::rename(&deploy_exe, &old_exe) {
-        Ok(_) => {
-            if let Err(e) = std::fs::copy(new_exe, &deploy_exe) {
-                let _ = std::fs::rename(&old_exe, &deploy_exe); // 回滚旧文件
-                return Err(format!("复制新二进制失败（已回滚旧版本）: {e}").into());
-            }
-            println!("✓ 已覆盖: {}（旧文件保留为 .old）", deploy_exe.display());
-        }
-        Err(_) => {
-            std::fs::copy(new_exe, &deploy_exe)?;
-            println!("✓ 已覆盖: {}", deploy_exe.display());
-        }
+    // ── 5. 分阶段替换：先复制到 .new 并复核，再换名（旧文件留 .old）──
+    let staged = deploy_dir.join("AI-Root.exe.new");
+    let backup = deploy_dir.join("AI-Root.exe.old");
+    let _ = std::fs::remove_file(&staged);
+    if let Err(e) = std::fs::copy(new_exe, &staged) {
+        return Err(format!("复制到暂存文件失败（服务已停止，原文件未动）: {e}").into());
+    }
+    // 二次校验：防止复制被截断或暂存文件在复制后被替换
+    let staged_sha = signature::sha256_file(&staged).ok();
+    if staged_sha != report.file_sha256 {
+        let _ = std::fs::remove_file(&staged);
+        let _ = service.start::<OsString>(&[]);
+        return Err("复制后校验失败：暂存文件 SHA-256 与源文件不一致（已中止并重启旧版本）".into());
     }
 
-    // 3) 启动服务
-    service.start::<OsString>(&[])?;
-    println!("✓ 服务已启动");
+    let _ = std::fs::remove_file(&backup);
+    // 先改名旧文件（Windows 允许重命名运行中的 exe；失败则说明被占用 → 中止且未破坏）
+    if let Err(e) = std::fs::rename(&deploy_exe, &backup) {
+        let _ = std::fs::remove_file(&staged);
+        let _ = service.start::<OsString>(&[]);
+        return Err(format!("无法移开旧二进制（可能被占用），已中止并重启旧版本: {e}").into());
+    }
+    if let Err(e) = std::fs::rename(&staged, &deploy_exe) {
+        // 回滚：把旧文件放回去
+        let _ = std::fs::rename(&backup, &deploy_exe);
+        let _ = service.start::<OsString>(&[]);
+        return Err(format!("替换失败（已回滚到旧版本）: {e}").into());
+    }
+    println!("✓ 已替换: {}", deploy_exe.display());
 
-    // 4) 自检
-    let s = service.query_status()?;
-    println!("服务状态: {:?}", s.current_state);
+    // ── 6. 启动 + 健康检查；失败自动回滚 ──
+    let started = service.start::<OsString>(&[]).is_ok();
+    let healthy = started && wait_running(&service, 20);
+    if !healthy {
+        common::log_event(serde_json::json!({
+            "ts": common::now_str(),
+            "type": "update_rollback",
+            "reason": "新版本启动失败或未通过健康检查",
+            "deploy": deploy_exe.to_string_lossy(),
+        }));
+        let _ = service.stop();
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = std::fs::remove_file(&deploy_exe);
+        let _ = std::fs::rename(&backup, &deploy_exe);
+        let _ = service.start::<OsString>(&[]);
+        return Err(
+            "新版本未能在 20s 内进入 Running，已回滚到上一版本并重启。请检查事件日志。".into(),
+        );
+    }
+    println!("✓ 服务已启动并通过健康检查");
 
-    // 5) 清理 .old（映像句柄允许删除；失败留待下轮 update 清理）
-    let _ = std::fs::remove_file(&old_exe);
+    // ── 7. 清理备份（失败仅提示，可被下轮更新覆盖）──
+    if let Err(e) = std::fs::remove_file(&backup) {
+        println!("  [note] 旧版本备份未能删除（下轮更新会覆盖）: {e}");
+    }
+    common::log_event(serde_json::json!({
+        "ts": common::now_str(),
+        "type": "update_done",
+        "from": cur_ver,
+        "to": new_ver,
+        "sha256": report.file_sha256,
+        "signer": report.signer_subject,
+    }));
     Ok(())
 }
+
 
 pub fn stop_svc() -> Result<(), Box<dyn std::error::Error>> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
@@ -535,11 +718,14 @@ fn service_run() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // 确保令牌与默认启用
-    common::ensure_token().ok();
-    common::set_enabled(true);
+    // 服务启动：令牌与 ACL 不可用时**拒绝启动**（fail closed）。
+    // 旧实现用 `.ok()` 吞掉错误，等于「权限异常也照常提供 SYSTEM 中继」。
+    common::ensure_token()
+        .map_err(|e| format!("令牌/ACL 初始化失败，拒绝启动：{e}"))?;
+    common::set_enabled(true).map_err(|e| format!("启用标志/ACL 初始化失败，拒绝启动：{e}"))?;
 
     // 运行管道服务，直到收到 stop 事件（监控线程会中断阻塞的 ConnectNamedPipe）
-    server::run_pipe_server(stop_event);
+    server::run_pipe_server(stop_event).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // 服务停止前强制落盘缓冲日志（events.jsonl 实时 flush；exec.log 审计可能仍在缓冲），
     // 防止常驻句柄上的审计条目因进程退出未 flush 而丢失。
@@ -560,4 +746,49 @@ fn service_run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expected_machine, is_valid_pe, pe_machine, version_tuple};
+
+    #[test]
+    fn pe_machine_reads_current_exe() {
+        // 当前进程自身必然是可执行文件，且架构与 expected_machine 一致
+        let exe = std::env::current_exe().expect("取当前 exe 失败");
+        assert_eq!(
+            pe_machine(&exe),
+            Some(expected_machine()),
+            "当前 exe 的 Machine 必须与编译目标架构一致"
+        );
+        assert!(is_valid_pe(&exe));
+    }
+
+    #[test]
+    fn pe_machine_rejects_non_pe() {
+        let p = std::env::temp_dir().join(format!("airoot-nonpe-{}", std::process::id()));
+        std::fs::write(&p, b"#!/bin/sh
+echo not a pe
+").unwrap();
+        assert_eq!(pe_machine(&p), None);
+        assert!(!is_valid_pe(&p));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn pe_machine_rejects_truncated_file() {
+        let p = std::env::temp_dir().join(format!("airoot-trunc-{}", std::process::id()));
+        std::fs::write(&p, b"MZ").unwrap();
+        assert_eq!(pe_machine(&p), None, "只有 MZ 的短文件必须被拒");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn version_tuple_parses_and_orders() {
+        assert_eq!(version_tuple("1.0.0"), (1, 0, 0));
+        assert_eq!(version_tuple("1.2"), (1, 2, 0));
+        assert_eq!(version_tuple("2.0.0-beta"), (2, 0, 0));
+        assert!(version_tuple("1.10.0") > version_tuple("1.9.9"));
+        assert!(version_tuple("1.0.0") == version_tuple("1.0.0"));
+    }
 }

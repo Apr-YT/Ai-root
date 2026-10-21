@@ -1,0 +1,82 @@
+# AI-Root 管理员授权策略（示例）
+#
+# 用法：
+#   1. 以管理员身份复制到 %ProgramData%\AI-Root\policy.toml
+#      （或直接 `AI-Root config init` 生成默认策略后再按需修改）
+#   2. 运行 `AI-Root config check` 校验
+#   3. 无需重启服务：下次请求即按新策略判定
+#
+# 本文件是**可校验的完整示例**，不是默认策略的全文。
+# 默认策略（67 条规则）请用 `AI-Root config init` 生成后查看。
+#
+# 权限要求：该文件必须仅 SYSTEM / Administrators 可写。
+# 安装后由 `install` 自动设置 ACL；手工放置时请自行确认。
+
+version = 2
+
+# 运行模式：
+#   autonomy  —— 个人高自主性（默认）：开发工具 argv 自动执行
+#   balanced  —— 同 autonomy，但 argv 的 cwd 必须在 workspace_roots 内
+#   strict    —— 未显式允许的一律拒绝（只读查询仍可用）
+#   disabled  —— 停用：除只读查询外全部拒绝
+mode = "autonomy"
+
+# 未匹配任何规则时的归宿：allow | confirm | deny
+# ⚠ 不建议设成 allow：等于「没写规则的操作都放行」
+default_decision = "confirm"
+
+# balanced 模式下的 argv 工作目录白名单（绝对路径）
+workspace_roots = [
+    "D:\\project",
+    "C:\\Users\\example\\source",
+]
+
+# 允许 restart_service 直接执行的服务名（大小写不敏感）
+# 不在列表内的服务重启会进入人工确认流程
+approved_services = ["Spooler", "Dnscache"]
+
+# update 的信任根：发布者证书 SHA-256（64 位 hex）
+# 用 `AI-Root trust-publisher <已签名exe>` 写入，不要手抄
+trusted_publishers = []
+
+# true 时传统 shell（AI-Root run "..."）不再逐次确认
+# ⚠ 只有在你完全信任所有能拿到令牌的进程时才设 true
+allow_legacy_shell = false
+
+# 确认请求有效期（秒），钳制到 30..3600
+confirm_timeout_secs = 300
+
+# ---------------------------------------------------------------------------
+# 内联规则（少量、紧急用）。长期维护建议放 rules.d\*.toml
+#
+# 匹配语义：所有填写的字段都必须满足（AND）。
+#   op          操作类型：run_argv / run_shell / query_service / restart_service …
+#   program     程序 basename（大小写不敏感，可省 .exe）
+#   program_path 程序绝对路径（优先于 program）
+#   arg_prefix  参数前缀必须逐项相等（大小写敏感）
+#   arg_forbid  参数中任意位置出现即「不匹配」
+#   target      op 的目标（精确，或 "prefix:*"）
+#   cwd_roots   工作目录必须落在这些根内
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "example-allow-ruff"
+decision = "allow"
+op = "run_argv"
+program = "ruff"
+note = "Python linter：只读检查，自动允许"
+
+[[rule]]
+id = "example-allow-git-status-only"
+decision = "allow"
+op = "run_argv"
+program = "git"
+arg_prefix = ["status"]
+note = "只允许 git status（不含 push/pull）"
+
+[[rule]]
+id = "example-confirm-icacls"
+decision = "confirm"
+op = "run_argv"
+program = "icacls"
+note = "修改文件 ACL：每次确认"

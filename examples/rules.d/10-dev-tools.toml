@@ -1,0 +1,54 @@
+# 开发工具链自动允许（示例）
+#
+# 位置：%ProgramData%\AI-Root\rules.d\10-dev-tools.toml
+# 加载顺序：按文件名字典序（10-… → 20-… → 90-…），便于人为控制优先级语义
+# 规则 id 全局唯一（跨文件重复 → 整个策略降级为「只读」）
+#
+# 每条规则都是「程序 + 参数约束」的结构化授权，不是命令字符串匹配。
+# 说明字段 note 会写进审计日志，方便回溯「为什么这条被允许」。
+
+[[rule]]
+id = "dev-git"
+decision = "allow"
+op = "run_argv"
+program = "git"
+note = "Git：状态/提交/拉取等日常操作"
+
+[[rule]]
+id = "dev-cargo"
+decision = "allow"
+op = "run_argv"
+program = "cargo"
+note = "Rust 构建与测试"
+
+[[rule]]
+id = "dev-node"
+decision = "allow"
+op = "run_argv"
+program = "node"
+arg_forbid = ["-e", "--eval", "-p", "--print"]
+note = "Node 运行时；禁内联执行（-e 等价任意代码）"
+
+[[rule]]
+id = "dev-python"
+decision = "allow"
+op = "run_argv"
+program = "python"
+arg_forbid = ["-c"]
+note = "Python；禁 -c 内联（等价任意代码）"
+
+[[rule]]
+id = "dev-cmake"
+decision = "allow"
+op = "run_argv"
+program = "cmake"
+note = "CMake 配置与构建"
+
+# 只在项目目录内构建（更严格的一种写法：cwd 硬约束）
+[[rule]]
+id = "dev-cargo-in-workspace"
+decision = "allow"
+op = "run_argv"
+program = "cargo"
+cwd_roots = ["D:\\project", "C:\\Users\\example\\source"]
+note = "cargo 仅允许在项目目录内执行"

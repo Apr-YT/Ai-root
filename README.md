@@ -118,12 +118,18 @@ powershell -ExecutionPolicy Bypass -File install-service.ps1
 
 | 项 | 路径 |
 |---|---|
-| 服务二进制 | `%ProgramData%\AI-Root\AI-Root.exe`（可用 `AIROOT_DEPLOY_DIR` 覆盖） |
+| 服务二进制 | `%ProgramData%\AI-Root\AI-Root.exe` |
 | 全局包装器 | `C:\Windows\AI-Root.cmd` |
-| 数据/令牌目录 | `%ProgramData%\AI-Root\` |
-| 令牌文件 | `%ProgramData%\AI-Root\token.txt` |
-| 审计日志 | `%ProgramData%\AI-Root\exec.log` |
-| 实时事件流 | `%ProgramData%\AI-Root\events.jsonl`（`AI-Root tail` 实时跟随） |
+| 管理员授权策略 | `%ProgramData%\AI-Root\policy.toml` |
+| 自动化规则目录 | `%ProgramData%\AI-Root\rules.d\*.toml` |
+| 秘密（令牌） | `%ProgramData%\AI-Root\secrets\token.txt` |
+| 审计日志 | `%ProgramData%\AI-Root\logs\exec.log` |
+| 实时事件流 | `%ProgramData%\AI-Root\logs\events.jsonl`（`AI-Root tail` 跟随） |
+| 运行状态 | `%ProgramData%\AI-Root\state\`（启用标志 / SID / 待确认请求 / 临时脚本） |
+| 用户偏好 | `%LOCALAPPDATA%\AI-Root\user.toml`（**只能收紧**，见 [docs/配置说明.md](docs/配置说明.md)） |
+
+> v1.2 起秘密、日志、状态分目录存放；旧版扁平布局在 `install`/服务启动时自动迁移
+> （`AI-Root config migrate` 可手动执行）。迁移不可自动回滚，升级前请备份整个目录。
 
 ### 命令一览
 
@@ -134,16 +140,35 @@ AI-Root rotate-token       轮换共享令牌（写盘后服务端自动热加�
 AI-Root start              启动服务（install 授权后非提权即可）
 AI-Root stop               停止服务（install 授权后非提权即可）
 AI-Root status             查询服务状态
-AI-Root update <新exe路径>  自主更新服务二进制：PE 校验→停服务→覆盖→启服务（无需管理员）
-AI-Root run [选项] <命令>   以 SYSTEM 权限执行（智能体主入口）
+AI-Root update <新exe路径>  自主更新（需 Authenticode 签名 + 信任根，失败自动回滚）
+AI-Root exec <程序> [参数]  结构化执行，不经 shell（策略可精确授权，推荐主入口）
+AI-Root op <操作> [--target X]  结构化操作（query_system_info / query_service /
+                           restart_service / read_state_file）
+AI-Root run [选项] <命令>   传统 shell 执行（默认需人工确认）
+AI-Root pending            查看待确认请求
+AI-Root approve <id>       批准一条待确认请求（管理员）
+AI-Root deny <id>          拒绝一条待确认请求（管理员）
+AI-Root policy             查看当前授权策略与自动允许范围
+AI-Root config check       校验所有配置层（只读；有错退出码 1）
+AI-Root config show        显示合并后的生效配置（--json 供程序消费）
+AI-Root config path        打印各配置文件路径
+AI-Root config init        生成默认管理员策略（管理员，已存在则不覆盖）
+AI-Root config migrate     执行旧布局/旧格式迁移（管理员）
+AI-Root signature <exe>    查看 Authenticode 签名与信任状态
+AI-Root trust-publisher <exe>  把该证书加入 update 信任根（管理员）
 AI-Root server             前台运行管道服务（调试/隔离演练用）
 AI-Root tail [选项]        实时跟随 events.jsonl
+AI-Root --version          打印版本
 AI-Root -h                 命令行帮助
 ```
 
 > **一次性管理员，之后零介入**：`install` 除注册服务外，还会给**当前用户 SID** 追加服务的 `GRGX`
 > 权限（`GENERIC_READ|GENERIC_EXECUTE`，含 `QUERY_STATUS`/`START`/`STOP`）。
-> 此后智能体（用户身份、非提权）可自主执行 `status`/`stop`/`start`/`update`，**更新服务二进制不再需要管理员**。
+> 此后智能体（用户身份、非提权）可自主执行 `status`/`stop`/`start`/`update`。
+>
+> ⚠ **更新不再是「任意 PE 都能装」**：v1.1 起 `update` 强制验证 Authenticode 嵌入签名 +
+> 发布者证书指纹白名单，且目标路径取自 SCM 实际 `ImagePath`。未配置信任根时一律拒绝。
+> 详见 [docs/授权策略.md](docs/授权策略.md)。
 >
 > **失败自动重启**：`install` 配置 SCM Recovery Actions（异常终止后 60s/300s/600s 依次重启），
 > 进程被意外杀死（7034）也会在 1 分钟内自愈，无人值守不受影响。
@@ -156,35 +181,51 @@ AI-Root -h                 命令行帮助
 
 - 读取令牌：`%ProgramData%\AI-Root\token.txt`（**当前用户只读**，AI 进程以安装用户身份运行即可读取）。
 - 每次请求须在 `Request.token` 字段携带正确令牌；不符则服务端拒绝执行。
-- **持有令牌即等价于拥有 SYSTEM 命令执行权** —— 令牌等同于高权限凭据，须妥善保管，
-  **不得写入日志、提交仓库或泄露**。
+- ⚠ **令牌不等于「任意 SYSTEM 命令」**（v1.1 起）：令牌只决定「能否发起请求」，
+  每个请求还要过一遍[授权策略](docs/授权策略.md)：`Allow` 执行 / `Confirm` 等管理员批准 / `Deny` 拒绝。
+  内置保护（改 AI-Root 自身、间接执行宿主、不可逆磁盘操作、关闭安全控制、建管理员账户…）
+  **任何令牌都放不开**。
+- 令牌仍是高权限凭据，须妥善保管，**不得写入日志、提交仓库或泄露**。
 
 ### 调用形态
 
-`AI-Root run` 是智能体主入口：
+**主入口是 `AI-Root exec`（结构化 argv，不经 shell）**，`AI-Root run` 用于必须使用
+cmd 语义的排障场景（默认需人工确认）。
 
 ```text
-# 单行命令（默认超时 60s，非提权即可）
-AI-Root run "whoami"
+# 结构化执行（推荐）：程序 + 参数以数组传给 CreateProcess
+AI-Root exec git status
+AI-Root exec --json cargo test --release
+AI-Root exec --cwd D:\project\app --timeout 300000 -- cargo build
+AI-Root exec -- ruff check .
 
-# 覆盖超时（超时后整棵进程树被杀）
-AI-Root run --timeout 5000 "ping -n 10 127.0.0.1"
+# 结构化操作（不涉及命令字符串）
+AI-Root op query_system_info
+AI-Root op query_service --target Spooler
+AI-Root op restart_service --target Spooler     # 需在 approved_services 内，否则确认
+AI-Root op read_state_file --target policy.json
 
-# 多行脚本（文件）：&/&&/|/() 全部正常，推荐用于批量自治
-AI-Root run --file C:\tmp\batch.cmd
-
-# 从标准输入喂入脚本
-type C:\tmp\batch.cmd | AI-Root run --stdin
-
-# 结构化输出（AI 消费推荐）：{ok,exit_code,stdout,stderr,error,truncated}
+# 传统 shell（`&`/`&&`/`|`/`()` 可用；默认需人工确认）
+AI-Root run "dir C:\Windows"
+AI-Root run --file C:\tmp\batch.cmd        # 多行脚本
 AI-Root run --json "whoami"
 
-# 指定工作目录
-AI-Root run --cwd C:\Windows --json "cd"
-
-# 分隔符之后全部按字面量（不经任何解析）
-AI-Root run -- <原始命令>
+# 确认流程
+AI-Root pending                    # 查看待确认
+AI-Root approve <id>               # 管理员批准（在提权终端）
+AI-Root deny <id>
 ```
+
+`exec` / `op` / `run` 的退出码：
+
+| 退出码 | 含义 |
+|---|---|
+| `0..` | 被执命令自身的退出码 |
+| `3` | **需要人工确认**（响应含 `confirmation_id`，批准后重放同一条命令） |
+| `1` | 客户端/中继层错误（未安装、策略拒绝、连接失败…） |
+
+> **直接拼参数的约定**：通过 `subprocess` 把含换行符的命令字符串传给 `AI-Root run` 时，
+> 服务端按「命令含 `\n`」**自动判定为脚本模式**，无需显式 `--file`/`--stdin`。
 
 > **直接拼参数的约定**：通过 `subprocess` 等机制把含换行符的命令字符串传给 `AI-Root run` 时，
 > 服务端按「命令含 `\n`」**自动判定为脚本模式**，无需显式 `--file`/`--stdin`。
@@ -276,51 +317,140 @@ AI-Root run -- <原始命令>
 
 ---
 
+## 配置
+
+配置分三层，**后者覆盖前者，但用户层只能收紧**：
+
+| 层 | 位置 | 谁能写 | 能做什么 |
+|---|---|---|---|
+| 代码默认 | 编译进 exe | —— | 67 条规则：只读查询 + 开发工具链 argv |
+| 用户偏好 | `%LOCALAPPDATA%\AI-Root\user.toml` | 当前用户（含 Agent） | 只能收紧 `mode`、缩短确认有效期、设默认超时 |
+| 管理员策略 | `%ProgramData%\AI-Root\policy.toml` + `rules.d\*.toml` | 仅管理员 | 规则、服务白名单、update 信任根、模式 |
+
+为什么用户层不能放宽：Agent 以安装用户身份运行、能写 `user.toml`，
+一旦它能加规则或把 `strict` 改回 `autonomy`，整套授权就是想绕就绕。
+所以 `UserConfig` **结构体里没有** `rules` / `approved_services` / `trusted_publishers`
+这些字段 —— 写了会报错（不是被忽略），且整层不生效。
+
+**失败即收紧**：
+
+- 策略/规则文件解析失败、规则 ID 重复 → `locked_down`（只读查询以外全拒）
+- 策略文件**曾被初始化但被删除** → `locked_down`，不重建默认（否则删配置=放宽）
+- 用户配置损坏 → 忽略用户层（只会更严）
+
+```powershell
+AI-Root config check      # 逐层校验；有错退出码 1
+AI-Root config show       # 合并后的生效值 + 每层来源说明
+AI-Root config path       # 各文件位置
+```
+
+格式为 **TOML**（可注释、可拆文件）：策略 `policy.toml`，规则 `rules.d\*.toml`（按文件名字典序合并）。
+示例见 [`examples/`](examples/)，完整字段与迁移/回滚见 **[docs/配置说明.md](docs/配置说明.md)**。
+
+---
+
 ## 安全模型
 
-- **令牌仅在安装时生成一次**；目录 ACL 为 `SYSTEM(F) + Administrators(F) + 安装用户(R)`，
-  其余账户不可访问。⚠ 该隔离**曾长期未真正生效**（缺陷 A/B）且曾出现服务自降只读（缺陷 C），
-  成因、验证与回归测试见 [docs/安全模型.md](docs/安全模型.md)。
-- **令牌轮换**：`AI-Root rotate-token` 生成新令牌写盘，服务端按文件 mtime 变化**自动热加载**（无需重启），
-  旧令牌立即失效。泄露后的标准处置：`rotate-token` → 更新 AI 侧令牌引用。
-- **审计日志**：`exec.log` 逐行记录 `[时间] caller=DOMAIN\user pid=xxx exit=code cmd=...`。
-  `caller` 来自服务端 `GetNamedPipeClientProcessId` 解析的**管道对端进程身份**（非服务自身环境变量），
-  可精确追溯「谁在什么进程里执行了什么」。
-- **管道 SDDL** 追加安装用户 SID，使以该用户身份运行的智能体（**可能非交互登录**）也能稳定连接。
-- **服务 DACL** 在 `install` 时追加安装用户 SID 的 `GRGX` —— 仅授权 `status`/`stop`/`start`/`update`
-  自身服务，**不授予** `CHANGE_CONFIG`/`WRITE_DAC` 等管理权限，不涉及其他服务或系统级权限。
-- **启用开关**：`enabled.flag` 存在即启用；删除即禁用（服务端拒绝一切命令，`ok=false`）。
-  开关是**运行期语义** —— 禁用后无法经中继自身恢复，需本地/管理员重建 flag，
-  或非提权 `AI-Root stop` + `start`（服务启动时自动重建，已实测）。
-- **SYSTEM 身份下重固化 ACL 时绝不会把自己当"待授权用户"** —— `granted_user_sid()`
-  从 `sid.txt` 取安装用户 SID 并硬性排除 `S-1-5-18`。
+> v1.1 起，安全模型从「令牌 = 一个 SYSTEM shell」改为「**令牌 + 服务端授权策略**」。
+> 完整机制见 [docs/授权策略.md](docs/授权策略.md)；原始审计见
+> [docs/SECURITY_REFACTOR_AUDIT.md](docs/SECURITY_REFACTOR_AUDIT.md)。
+
+### 两层边界
+
+| 层 | 作用 | 失效后果 |
+|---|---|---|
+| **文件 ACL**（`%ProgramData%\AI-Root\`） | 谁能读令牌、谁能改策略/二进制 | 令牌泄漏 → 可发起任意请求 |
+| **授权策略**（`policy.json` + 内置保护） | 每个请求能做什么 | 只能放行策略允许范围内的事 |
+
+ACL 是「谁能进门」，策略是「进门后能做什么」。
+历史缺陷 A/B/C（ACL 未真正生效、服务自降只读）的成因与回归测试见
+[docs/安全模型.md](docs/安全模型.md)。
+
+### 令牌与 ACL
+
+- **令牌仅在安装时生成一次**；目录 ACL 为 `SYSTEM(F) + Administrators(F) + 安装用户(R)`。
+- **令牌轮换**：`AI-Root rotate-token` 写盘后服务端按 mtime 自动热加载，旧令牌立即失效。
+- **目录 ACL 失败即拒绝启动**（fail closed）：服务启动时用 `GetNamedSecurityInfoW` 解析
+  **二进制 DACL**，校验「危险主体（Everyone/Users/Authenticated Users/INTERACTIVE…）
+  无写权限 + SYSTEM 有写权限 + 无残留继承 ACE」。任一条不满足 → 服务不进入主循环，
+  并写 `acl_setup_failed` 事件。不再依赖 `icacls` 文本匹配本地化账户名。
+- **令牌写入顺序**：先硬化目录 ACL，再写 `token.txt`（避免令牌在弱权限目录中短暂存在）。
+
+### 授权判定
+
+```text
+内置保护(硬编码) → deny 规则 → approved_services → allow 规则 → confirm 规则 → 默认(confirm)
+```
+
+- **内置保护不可覆盖**：改 AI-Root 自身、间接执行宿主（`cmd`/`powershell`/`mshta`…）、
+  下载器、不可逆磁盘/引导操作、关闭安全控制、建管理员账户、服务/计划任务持久化。
+- **deny 优先于 allow**：即使同时写了 allow 规则，deny 也先命中。
+- **未知操作/未知字段一律拒绝**：协议 `deny_unknown_fields`；op 取值是白名单枚举。
+- **策略文件损坏即降级**：除只读查询外全部拒绝（不让「破坏策略文件」变成「放开所有工具」）。
+
+### 执行形态
+
+- **`exec`（结构化 argv）**：程序解析成绝对路径（只在 PATH 查找，**不查当前目录**），
+  参数是数组，不经 shell。策略可按「程序 + 参数前缀 + 目录」精确授权。**推荐主入口**。
+- **`run`（传统 shell）**：`cmd /C <字符串>`，默认**需人工确认**。字符串无法结构化校验，
+  所以 `exec.rs` 里的危险模式黑名单只是纵深防御，**不是边界**。
+
+### 人工确认
+
+服务在 session 0 没有桌面，因此确认走「文件 + 管理员命令」：
+
+```text
+请求 → decision=confirm → 返回 request_id（退出码 3，不执行）
+管理员 → AI-Root approve <id>  （写 pending\<id>.approved，内容 = 参数哈希）
+请求重放 → 哈希匹配 → 一次性消费 → 执行
+```
+
+批准与**完整参数**绑定（改一个字符即失效）、一次性、带 TTL；
+普通用户无法写 `pending\`（ACL），所以「自己批准自己」不成立。
+协议里没有 `confirmed` 字段 —— 发它会导致解析失败。
+
+### 更新
+
+`update` 三道门控：Authenticode **嵌入**签名（`WinVerifyTrust`）→ 发布者证书 SHA-256
+命中 `trusted_publishers` → 目标路径取自 SCM 实际 `ImagePath` 且位于受保护目录。
+另校验架构一致、拒绝降级、复制后二次比对 SHA-256、启动 20s 不健康则自动回滚。
+未配置信任根时**一律拒绝**。
 
 ### 运行时加固
 
 | 机制 | 参数 |
 |---|---|
-| **全局熔断** | 30s 窗口内累计失败 **20** 次 → 全局锁定 **120s**（期间拒绝一切请求） |
-| **按调用方定向封禁** | 同一 SID 在 60s 内失败 **5** 次 → 单独拒绝该 SID **300s**，不影响其他调用方 |
-| **恒定时间令牌比较** | 逐字节 XOR 累加判 0，防时序侧信道逐位猜令牌 |
-| **超时钳制** | 请求 `timeout_ms` 上限 10 分钟（`min(600_000)`） |
-| **并发信号量** | 同时处理连接上限 **8**（`AtomicU32` + RAII 释放），超出立即返回「服务繁忙」 |
-| **连接读超时** | 帧头/帧体读取带超时（`PeekNamedPipe` 轮询），防「连上不发数据」的线程泄漏 |
-| **输出截断** | `stdout`/`stderr` 各 **1MB** 上限，超出置 `truncated=true` |
-| **update 输入校验** | 先校验目标为有效 PE（MZ + PE 头 + x64/x86 Machine）并打印 SHA256，非 PE 拒绝 |
-
-> 两层节流互补：定向封禁防「同一身份反复试探」，全局熔断兜底「无差别暴力尝试」。
+| **全局熔断** | 30s 窗口内累计失败 **20** 次 → 全局锁定 **120s** |
+| **按调用方定向封禁** | 同一 SID 在 60s 内失败 **5** 次 → 单独拒绝该 SID **300s** |
+| **恒定时间令牌比较** | 逐字节 XOR 累加判 0，防时序侧信道 |
+| **超时钳制** | 请求 `timeout_ms` 上限 10 分钟 |
+| **并发信号量** | 同时处理连接上限 **8**，超出立即返回「服务繁忙」 |
+| **连接读超时** | 帧头/帧体分离计时 + 按 payload 放宽的绝对上限（防 slow-loris） |
+| **输出截断** | `stdout`/`stderr` 各 **1MB**，超出置 `truncated=true` |
+| **UTF-8 安全截断** | 审计预览用 `truncate_utf8`，绝不在字符中间切字节（旧实现会 panic） |
+| **私有临时目录** | 脚本模式写 `%ProgramData%\AI-Root\tmp\`（ACL 保护）+ 加密随机名 + `create_new` |
+| **审计脱敏** | `--password=` / `-p` / `API_KEY=` 等参数在日志中替换为 `***` |
 
 ---
 
 ## 限制
 
 - **仅 Windows**（命名管道 + LocalSystem 服务 + `cmd.exe`）。
-- 服务必须预先以管理员 `install` **一次**；之后智能体侧完全无需提权（含二进制更新）。
-- **令牌等同于高权限凭据**，泄露即等同于获得 SYSTEM 命令执行权。
-- **单行命令内 `&`/`&&` 串联失效**（设计使然，见 [命令语义](#命令语义关键)）；批量场景用多行脚本。
-- 单命令输出 **1MB 截断**（`truncated` 标记）。
-- 默认超时 **60s**（上限 10 分钟）；并发上限 **8**（超出返回「服务繁忙」，重试即可）。
-- 鉴权失败节流见 [运行时加固](#运行时加固)。
+- 服务必须预先以管理员 `install` **一次**；之后智能体侧无需提权。
+- **令牌仍是高权限凭据**：泄漏后可发起任意请求，但仍受授权策略约束（内置保护不可放开）。
+- **允许解释器即允许代码执行**：`python`/`cargo`/`node` 在 SYSTEM 下等价于任意代码 ——
+  这是高自主性模式的既定取舍，边界是「不可逆破坏 / 改自身 / 间接执行」，
+  详见 [docs/授权策略.md §2](docs/授权策略.md)。
+- **传统 shell 只能整条确认**（字符串无法结构化匹配），能用 `exec` 就别用 `run`。
+- **确认需要管理员在场**：`pending\` 只有 SYSTEM/Administrators 可写。
+- **用户配置不能放宽权限**：设计如此（Agent 可写该文件）。想放宽只能改管理员策略。
+- **布局迁移不可自动回滚**：升级到 v1.2 后旧版本读不到新路径，回滚需手工移动文件
+  （见 [docs/配置说明.md §6.3](docs/配置说明.md)）。
+- **update 只接受嵌入签名**：catalog 签名（System32 常见）不被接受；且不检查证书吊销
+  （服务可能在无网环境启动）。
+- **安装用户可停服务**（`GRGX` 含 STOP/START，为零 UAC 更新保留）→ DoS 面（V-14）。
+- 单行命令内 `&`/`&&` 串联失效（设计使然）；批量场景用多行脚本或 `exec`。
+- 单命令输出 **1MB 截断**；默认超时 **60s**（上限 10 分钟）；并发上限 **8**。
 - 构建产物**不保证逐字节可复现**（上游 `dlltool` 时间戳，见 [docs/构建说明.md](docs/构建说明.md)）。
 
 ---
@@ -456,11 +586,15 @@ AI-Root.exe run "whoami"
 AI-Root/
 ├── src/
 │   ├── main.rs          # CLI 入口与子命令分发
-│   ├── server.rs        # 命名管道服务端（鉴权/节流/并发/审计）
-│   ├── protocol.rs      # 帧协议、请求校验、管道连接
-│   ├── exec.rs          # 命令执行引擎（转义/超时/输出解码）
-│   ├── common.rs        # 令牌管理、路径、ACL、日志
-│   ├── service.rs       # Windows 服务注册与生命周期
+│   ├── config.rs        # 配置三层加载/合并/迁移/校验
+│   ├── server.rs        # 管道服务端（鉴权/策略判定/确认/并发/审计）
+│   ├── policy.rs        # 授权策略引擎（Allow/Confirm/Deny + 内置保护）
+│   ├── consent.rs       # 文件型确认通道（pending/ + approve/deny）
+│   ├── signature.rs     # Authenticode 验证（WinVerifyTrust + 证书指纹）
+│   ├── protocol.rs      # 帧协议 v2、严格字段校验、管道连接
+│   ├── exec.rs          # 执行引擎（argv 直调 + shell + 安全截断）
+│   ├── common.rs        # 令牌管理、路径、DACL 校验、脱敏、日志
+│   ├── service.rs       # Windows 服务注册、更新（签名门控）、生命周期
 │   └── winapi_raw.rs    # Win32 API 原始绑定
 ├── docs/                # 设计与参考文档
 ├── assets/              # 图标与资源脚本
@@ -470,17 +604,21 @@ AI-Root/
 └── .github/workflows/ci.yml
 ```
 
-| 文件 | 行数 | 职责 |
-|---|---|---|
-| `src/server.rs` | 1247 | 管道监听、鉴权、节流、并发、审计 |
-| `src/common.rs` | 867 | 令牌、路径、ACL、日志 |
-| `src/protocol.rs` | 764 | 帧协议与校验 |
-| `src/main.rs` | 729 | CLI 与子命令 |
-| `src/service.rs` | 563 | 服务生命周期 |
-| `src/exec.rs` | 523 | 命令执行 |
-| `src/winapi_raw.rs` | 257 | Win32 绑定 |
+| 文件 | 职责 |
+|---|---|
+| `src/server.rs` | 管道监听、鉴权、策略判定、确认、并发、审计 |
+| `src/policy.rs` | 授权策略引擎：三级判定、内置保护、路径/参数约束 |
+| `src/consent.rs` | 确认请求落盘、批准消费（参数哈希绑定、一次性、TTL） |
+| `src/signature.rs` | Authenticode 嵌入签名验证 + 发布者指纹 |
+| `src/common.rs` | 令牌、路径、二进制 DACL 校验、审计脱敏、日志 |
+| `src/protocol.rs` | 协议 v2（op/argv/target/版本、`deny_unknown_fields`） |
+| `src/config.rs` | 三层配置加载、合并（只能收紧）、版本/布局迁移 |
+| `src/main.rs` | CLI 与子命令 |
+| `src/service.rs` | 服务生命周期、更新门控与回滚 |
+| `src/exec.rs` | argv 直调 / shell 执行、UTF-8 安全截断、超时清理 |
+| `src/winapi_raw.rs` | Win32 绑定（含 crypt32/wintrust/advapi32） |
 
-**运行时依赖**：`windows-service` / `serde` + `serde_json` / `rand` / `chrono`
+**运行时依赖**：`windows-service` / `serde` + `serde_json` / `rand` / `chrono` / `sha2`
 （纯终端实现，**无 GUI / egui / tray-icon 依赖**）。
 
 ---
@@ -489,6 +627,10 @@ AI-Root/
 
 | 文档 | 内容 |
 |---|---|
+| [docs/配置说明.md](docs/配置说明.md) | **三层配置优先级、TOML 字段、rules.d、版本/布局迁移与回滚** |
+| [docs/CONFIG_AUDIT.md](docs/CONFIG_AUDIT.md) | 配置架构审计：10 项问题与目标架构 |
+| [docs/授权策略.md](docs/授权策略.md) | 授权模型、判定顺序、默认白名单、确认流程、更新与回滚 |
+| [docs/SECURITY_REFACTOR_AUDIT.md](docs/SECURITY_REFACTOR_AUDIT.md) | v1.1 安全审计：16 项确认问题、修复方案、验证状态 |
 | [docs/安全模型.md](docs/安全模型.md) | ACL 隔离缺陷 A/B/C 的成因、验证与回归测试 |
 | [docs/构建说明.md](docs/构建说明.md) | 工具链自省、host≠target、资源嵌入、可复现性结论 |
 | [docs/测试说明.md](docs/测试说明.md) | 测试矩阵、变异验证记录、已知缺口 |

@@ -1,0 +1,45 @@
+# 系统维护类规则（示例）
+#
+# 位置：%ProgramData%\AI-Root\rules.d\20-services.toml
+#
+# 这一组刻意写成「确认」而不是「允许」：服务/网络/注册表类操作影响面大，
+# 即使日常高频，也不建议默认自动执行 —— 想要免确认就明确写在这里，
+# 并清楚自己接受了什么。
+
+[[rule]]
+id = "svc-query"
+decision = "allow"
+op = "run_argv"
+program = "sc"
+arg_prefix = ["query"]
+note = "只读查询服务状态"
+
+[[rule]]
+id = "svc-control"
+decision = "confirm"
+op = "run_argv"
+program = "sc"
+note = "服务启停/配置修改：逐次确认"
+
+[[rule]]
+id = "net-view"
+decision = "allow"
+op = "run_argv"
+program = "netsh"
+arg_prefix = ["interface", "show"]
+note = "只读查看网络接口"
+
+[[rule]]
+id = "net-change"
+decision = "confirm"
+op = "run_argv"
+program = "netsh"
+note = "网络配置修改：逐次确认"
+
+# 明确禁止：把任意 shell 当跳板（内置保护也会拦，这里显式写出来是为了文档化）
+[[rule]]
+id = "deny-cmd-relay"
+decision = "deny"
+op = "run_argv"
+program = "cmd"
+note = "禁止经由 cmd 间接执行（内置保护同样会拒绝）"

@@ -11,12 +11,35 @@ use std::io::{self, Read, Write};
 use crate::common;
 use crate::winapi_raw;
 
+/// 当前协议版本
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// 单条 argv 的最大长度（字符数）
+pub const MAX_ARG_LEN: usize = 4096;
+/// argv 数组最大项数
+pub const MAX_ARGV_ITEMS: usize = 256;
+
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     /// 共享令牌，与服务端比对
     pub token: String,
-    /// 待执行命令（由服务端以 `cmd /C <command>` 运行，故获得 SYSTEM 权限）
-    pub command: String,
+    /// 协议版本（缺省视为 1；v1 客户端只允许 legacy shell 语义）
+    #[serde(default)]
+    pub v: Option<u32>,
+    /// 结构化操作名：query_system_info / query_service / restart_service /
+    /// read_state_file / install_package / update_self / run_argv / run_shell
+    #[serde(default)]
+    pub op: Option<String>,
+    /// argv 模式：[程序, 参数...]（op = run_argv 时必填）
+    #[serde(default)]
+    pub argv: Option<Vec<String>>,
+    /// legacy shell 模式（op = run_shell 或缺省 op 时使用）
+    #[serde(default)]
+    pub command: Option<String>,
+    /// 结构化操作的目标（如 restart_service 的服务名、read_state_file 的文件名）
+    #[serde(default)]
+    pub target: Option<String>,
     /// 可选工作目录
     #[serde(default)]
     pub cwd: Option<String>,
@@ -33,26 +56,46 @@ pub struct Response {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    /// 中继层错误信息（鉴权失败 / 超时 / spawn 失败）
+    /// 中继层错误信息（鉴权失败 / 超时 / spawn 失败 / 策略拒绝）
     pub error: Option<String>,
     /// 输出是否因超过 1MB 上限被截断（默认 false，兼容旧客户端）
     #[serde(default)]
     pub truncated: bool,
-    /// 本次执行的唯一标识，与 events.jsonl 的 exec_start/exec_done 配对（默认 None，兼容旧服务端）
+    /// 本次执行的唯一标识，与 events.jsonl 的 exec_start/exec_done 配对
     #[serde(default)]
     pub run_id: Option<String>,
-    /// 命令执行耗时（毫秒，含超时），便于 AI 消费方判断命令快慢（默认 None）
+    /// 命令执行耗时（毫秒，含超时）
     #[serde(default)]
     pub duration_ms: Option<u64>,
-    /// 执行者身份（domain\user 或 SID），便于多 AI 场景下区分来源（默认 None）
+    /// 执行者身份（domain\user 或 SID）
     #[serde(default)]
     pub caller: Option<String>,
-    /// 是否因超时终止（显式布尔，替代从 error 文字猜），默认 false
+    /// 是否因超时终止
     #[serde(default)]
     pub timed_out: bool,
+
+    // ---- v2 新增：让调用方看见「为什么允许/拒绝」----
+    /// 协议版本（服务端回显）
+    #[serde(default)]
+    pub protocol_version: Option<u32>,
+    /// 策略判定结果：allow / confirm / deny
+    #[serde(default)]
+    pub decision: Option<String>,
+    /// 命中的规则标识（builtin:* / rule:<id> / default / mode:*）
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    /// 判定原因（人可读）
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// 若走了确认流程，返回请求 ID（供 `AI-Root approve <rid>` 使用）
+    #[serde(default)]
+    pub confirmation_id: Option<String>,
 }
 
 /// 验证请求数据的完整性（服务端 handle_client 调用，故为 pub）
+///
+/// 顺序刻意保持「令牌 → 版本 → 结构」：未鉴权者不应通过错误信息
+/// 推断服务端后续的校验逻辑。
 pub fn validate_request(req: &Request) -> Result<(), String> {
     // 验证令牌格式
     if req.token.is_empty() {
@@ -63,13 +106,83 @@ pub fn validate_request(req: &Request) -> Result<(), String> {
         return Err("令牌格式无效".to_string());
     }
 
-    // 验证命令
-    if req.command.is_empty() {
-        return Err("命令不能为空".to_string());
+    // 协议版本：只接受 1（legacy）与当前版本
+    if let Some(v) = req.v {
+        if v != PROTOCOL_VERSION && v != 1 {
+            return Err(format!(
+                "不支持的协议版本 {v}（本服务端支持 1..={PROTOCOL_VERSION}）"
+            ));
+        }
     }
-    if req.command.len() > 8191 {
-        // Windows 命令行长度限制
-        return Err("命令过长".to_string());
+
+    // 必须表达出一种操作
+    if req.op.is_none() && req.argv.is_none() && req.command.is_none() {
+        return Err("请求缺少操作：需要 op、argv 或 command".to_string());
+    }
+
+    // 验证 argv（结构化路径）
+    if let Some(argv) = &req.argv {
+        if argv.is_empty() {
+            return Err("argv 不能为空数组".into());
+        }
+        if argv.len() > MAX_ARGV_ITEMS {
+            return Err(format!("argv 项数超过上限 {MAX_ARGV_ITEMS}"));
+        }
+        for (i, a) in argv.iter().enumerate() {
+            if a.len() > MAX_ARG_LEN {
+                return Err(format!("argv[{i}] 长度超过上限 {MAX_ARG_LEN}"));
+            }
+            if a.contains('\0') {
+                return Err(format!("argv[{i}] 含 NUL 字符"));
+            }
+        }
+    }
+
+    // 验证命令（legacy shell）
+    if let Some(cmd) = &req.command {
+        if cmd.trim().is_empty() {
+            return Err("命令不能为空".to_string());
+        }
+        if cmd.len() > 8191 {
+            // Windows 命令行长度限制
+            return Err("命令过长".to_string());
+        }
+        if cmd.contains('\0') {
+            return Err("命令含 NUL 字符".to_string());
+        }
+    }
+
+    // 验证 op 取值（枚举化，未知即拒绝）
+    if let Some(op) = &req.op {
+        let known = [
+            "query_system_info",
+            "query_service",
+            "restart_service",
+            "read_state_file",
+            "install_package",
+            "update_self",
+            "run_argv",
+            "run_shell",
+        ];
+        if !known.contains(&op.as_str()) {
+            return Err(format!("未知操作类型: {op}"));
+        }
+        if op == "run_argv" && req.argv.is_none() {
+            return Err("op=run_argv 时必须提供 argv".into());
+        }
+    }
+
+    // 验证 target（结构化操作的目标）
+    if let Some(t) = &req.target {
+        if t.is_empty() {
+            return Err("target 不能为空字符串".into());
+        }
+        if t.len() > 512 {
+            return Err("target 过长（上限 512）".into());
+        }
+        if t.contains('\0') {
+            return Err("target 含 NUL 字符".into());
+        }
     }
 
     // 验证工作目录
@@ -98,6 +211,7 @@ pub fn validate_request(req: &Request) -> Result<(), String> {
 
     Ok(())
 }
+
 
 /// 从文件（包装的管道句柄）读取一帧，采用「空闲超时」计时（毫秒）
 ///
@@ -206,6 +320,9 @@ pub fn read_frame_timeout(file: &mut File, idle_ms: u64) -> io::Result<Vec<u8>> 
 }
 
 /// 兼容旧调用：默认 60s 空闲读超时
+///
+/// 注：主路径已改为按「执行超时 + 余量」动态计算，本函数保留供固定预算场景使用。
+#[allow(dead_code)]
 pub fn read_frame(file: &mut File) -> io::Result<Vec<u8>> {
     read_frame_timeout(file, common::CLIENT_READ_TIMEOUT_MS)
 }
@@ -319,6 +436,11 @@ pub fn err_response(msg: &str) -> Response {
         duration_ms: None,
         caller: None,
         timed_out: false,
+        protocol_version: Some(PROTOCOL_VERSION),
+        decision: None,
+        rule_id: None,
+        reason: None,
+        confirmation_id: None,
     }
 }
 
@@ -326,11 +448,29 @@ pub fn err_response(msg: &str) -> Response {
 mod tests {
     use super::*;
 
-    /// 构造一个「合法」请求，仅覆盖被测字段，避免每个用例重复样板。
+    /// 构造一个「合法」的 legacy shell 请求，仅覆盖被测字段，避免每个用例重复样板。
     fn req(token: &str, command: &str) -> Request {
         Request {
             token: token.to_string(),
-            command: command.to_string(),
+            v: Some(PROTOCOL_VERSION),
+            op: None,
+            argv: None,
+            command: Some(command.to_string()),
+            target: None,
+            cwd: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// 构造结构化 argv 请求
+    fn req_argv(token: &str, argv: &[&str]) -> Request {
+        Request {
+            token: token.to_string(),
+            v: Some(PROTOCOL_VERSION),
+            op: Some("run_argv".into()),
+            argv: Some(argv.iter().map(|s| s.to_string()).collect()),
+            command: None,
+            target: None,
             cwd: None,
             timeout_ms: None,
         }
@@ -460,6 +600,107 @@ mod tests {
         assert_eq!(err, "令牌不能为空");
     }
 
+    // ---------- 协议 v2：严格字段与操作类型 ----------
+
+    #[test]
+    fn rejects_unknown_fields() {
+        // 关键安全属性：客户端不能靠「多带一个字段」表达某种状态。
+        // 例如伪造 `"confirmed": true` 必须直接解析失败，而不是被静默丢弃。
+        let json = format!(
+            r#"{{"token":"{}","command":"whoami","confirmed":true}}"#,
+            valid_token()
+        );
+        let err = serde_json::from_str::<Request>(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field") || err.to_string().contains("unknown"),
+            "未知字段必须导致解析失败，实际: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_known_v2_fields() {
+        let r = req_argv(&valid_token(), &["git", "status"]);
+        assert!(validate_request(&r).is_ok());
+        assert_eq!(r.op.as_deref(), Some("run_argv"));
+    }
+
+    #[test]
+    fn rejects_unknown_op() {
+        let mut r = req_argv(&valid_token(), &["git", "status"]);
+        r.op = Some("delete_everything".into());
+        let err = validate_request(&r).unwrap_err();
+        assert!(err.contains("未知操作类型"), "实际: {err}");
+    }
+
+    #[test]
+    fn rejects_future_protocol_version() {
+        let mut r = req(&valid_token(), "whoami");
+        r.v = Some(PROTOCOL_VERSION + 1);
+        assert!(validate_request(&r).unwrap_err().contains("不支持的协议版本"));
+    }
+
+    #[test]
+    fn accepts_legacy_v1_requests() {
+        // 旧客户端不带 v 字段 → 视为 v1，仍可用（走 legacy shell 语义）
+        let mut r = req(&valid_token(), "whoami");
+        r.v = None;
+        assert!(validate_request(&r).is_ok());
+    }
+
+    #[test]
+    fn rejects_run_argv_without_argv() {
+        let mut r = req_argv(&valid_token(), &["git"]);
+        r.argv = None;
+        assert!(validate_request(&r).unwrap_err().contains("必须提供 argv"));
+    }
+
+    #[test]
+    fn rejects_empty_argv() {
+        let mut r = req_argv(&valid_token(), &[]);
+        r.argv = Some(vec![]);
+        assert!(validate_request(&r).unwrap_err().contains("不能为空数组"));
+    }
+
+    #[test]
+    fn rejects_oversized_argv_item() {
+        let big = "a".repeat(MAX_ARG_LEN + 1);
+        let mut r = req_argv(&valid_token(), &["git"]);
+        r.argv = Some(vec!["git".into(), big]);
+        assert!(validate_request(&r).unwrap_err().contains("长度超过上限"));
+    }
+
+    #[test]
+    fn rejects_too_many_argv_items() {
+        let mut r = req_argv(&valid_token(), &["git"]);
+        r.argv = Some((0..MAX_ARGV_ITEMS + 1).map(|i| i.to_string()).collect());
+        assert!(validate_request(&r).unwrap_err().contains("项数超过上限"));
+    }
+
+    #[test]
+    fn rejects_nul_in_command_and_argv() {
+        let mut r = req(&valid_token(), "whoami");
+        r.command = Some("whoami\0rm -rf".into());
+        assert!(validate_request(&r).unwrap_err().contains("NUL"));
+
+        let mut r2 = req_argv(&valid_token(), &["git"]);
+        r2.argv = Some(vec!["git".into(), "a\0b".into()]);
+        assert!(validate_request(&r2).unwrap_err().contains("NUL"));
+    }
+
+    #[test]
+    fn rejects_request_without_any_operation() {
+        let mut r = req(&valid_token(), "whoami");
+        r.command = None;
+        assert!(validate_request(&r).unwrap_err().contains("缺少操作"));
+    }
+
+    #[test]
+    fn err_response_carries_protocol_version() {
+        let r = err_response("x");
+        assert_eq!(r.protocol_version, Some(PROTOCOL_VERSION));
+        assert!(r.decision.is_none());
+    }
+
     // ---------- err_response ----------
 
     #[test]
@@ -491,7 +732,7 @@ mod tests {
         // 只给 token + command 也应能解析（cwd/timeout_ms 有 default）
         let json = format!(r#"{{"token":"{}","command":"whoami"}}"#, valid_token());
         let r: Request = serde_json::from_str(&json).unwrap();
-        assert_eq!(r.command, "whoami");
+        assert_eq!(r.command.as_deref(), Some("whoami"));
         assert!(r.cwd.is_none());
         assert!(r.timeout_ms.is_none());
     }

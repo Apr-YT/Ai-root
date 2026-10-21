@@ -5,6 +5,8 @@
 //! 参考：https://learn.microsoft.com/windows/win32/api/ 各 API 文档
 
 #![allow(non_snake_case, non_camel_case_types)]
+// Win32 类型名（BOOL/HANDLE/PCWSTR）保持与官方头文件一致，便于对照文档
+#![allow(clippy::upper_case_acronyms)]
 
 use core::ffi::c_void;
 
@@ -254,4 +256,128 @@ extern "system" {
     /// 配置服务失败恢复策略（SCM Recovery Actions，防异常终止后不重启）
     pub fn ChangeServiceConfig2W(hService: HANDLE, dwInfoLevel: u32, lpInfo: *const c_void)
         -> BOOL;
+}
+
+// ---- 目录 DACL 解析（advapi32）----
+//
+// 为什么不能只靠解析 icacls 文本：
+//   icacls 输出的是**本地化账户名**，中文/其他语言 Windows 上 "NT AUTHORITY\SYSTEM"
+//   的显示名可能不同；用 `contains("SYSTEM")` 判断既会漏检危险主体，
+//   也会在非英文系统上误判「SYSTEM 缺失」并反复补写 ACE。
+//   GetNamedSecurityInfoW 拿到的是**二进制 DACL + SID**，比较基准是 SID 而非名字，
+//   本地化无关，判定结果稳定。
+
+pub const SE_FILE_OBJECT: u32 = 1;
+/// AclSizeInformation
+pub const ACL_SIZE_INFORMATION_CLASS: u32 = 2;
+/// ACCESS_ALLOWED_ACE_TYPE
+pub const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+/// ACCESS_DENIED_ACE_TYPE（deny ACE 只会收紧权限，校验时直接跳过）
+#[allow(dead_code)]
+pub const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+/// ACE_HEADER.AceFlags 中的「继承来的」标记
+pub const INHERITED_ACE_FLAG: u8 = 0x10;
+
+/// ACL 规模信息（ACL_SIZE_INFORMATION）
+#[repr(C)]
+pub struct ACL_SIZE_INFORMATION {
+    pub AceCount: u32,
+    pub AclBytesInUse: u32,
+    pub AclBytesFree: u32,
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    /// 取命名对象（此处为文件/目录）的安全描述符。成功后 `ppSecurityDescriptor`
+    /// 由系统分配，必须用 `LocalFree` 释放。
+    pub fn GetNamedSecurityInfoW(
+        pObjectName: *const u16,
+        ObjectType: u32,
+        SecurityInfo: u32,
+        ppsidOwner: *mut *mut c_void,
+        ppsidGroup: *mut *mut c_void,
+        ppDacl: *mut *mut c_void,
+        ppSacl: *mut *mut c_void,
+        ppSecurityDescriptor: *mut *mut c_void,
+    ) -> u32;
+
+    pub fn GetAclInformation(
+        pAcl: *mut c_void,
+        pAclInformation: *mut c_void,
+        nAclInformationLength: u32,
+        dwAclInformationClass: u32,
+    ) -> BOOL;
+
+    pub fn GetAce(pAcl: *mut c_void, dwAceIndex: u32, pAce: *mut *mut c_void) -> BOOL;
+}
+
+// ---- Authenticode 签名验证（wintrust / crypt32）----
+//
+// 用于 update 的发布物校验：WinVerifyTrust 判签名完整性与信任链，
+// crypt32 取签名者证书 DER 后用 sha2 算指纹，绑定可信发布者白名单。
+// 单独一个 extern 块以便 #[link] 只影响这些符号。
+
+#[link(name = "wintrust")]
+extern "system" {
+    /// 通用签名验证入口。返回 0 表示「签名有效且信任链通过」；
+    /// 非 0 为 HRESULT（如 0x800B0100 = TRUST_E_NOSIGNATURE）。
+    /// pWVTData 指向 WINTRUST_DATA（布局定义在 signature.rs，与原生一致）。
+    pub fn WinVerifyTrust(
+        hwnd: HANDLE,
+        pgActionID: *mut c_void,
+        pWVTData: *mut c_void,
+    ) -> i32;
+}
+
+#[link(name = "crypt32")]
+extern "system" {
+    /// 从文件提取 PKCS#7 签名消息与证书库（只读）
+    pub fn CryptQueryObject(
+        dwObjectType: u32,
+        pvObject: *const c_void,
+        dwExpectedContentTypeFlags: u32,
+        dwExpectedFormatTypeFlags: u32,
+        dwFlags: u32,
+        pdwMsgAndCertEncodingType: *mut u32,
+        pdwContentType: *mut u32,
+        pdwFormatType: *mut u32,
+        phCertStore: *mut HANDLE,
+        phMsg: *mut HANDLE,
+        ppvContext: *mut *const c_void,
+    ) -> BOOL;
+
+    /// 取签名消息参数（此处用 CMSG_SIGNER_CERT_INFO_PARAM 拿签名者 CERT_INFO）
+    pub fn CryptMsgGetParam(
+        hCryptMsg: HANDLE,
+        dwParamType: u32,
+        dwIndex: u32,
+        pvData: *mut c_void,
+        pcbData: *mut u32,
+    ) -> BOOL;
+
+    pub fn CryptMsgClose(hCryptMsg: HANDLE) -> BOOL;
+
+    /// 在证书库中按 CERT_INFO 查找签名者证书（CERT_FIND_SUBJECT_CERT）
+    pub fn CertFindCertificateInStore(
+        hCertStore: HANDLE,
+        dwCertEncodingType: u32,
+        dwFlags: u32,
+        dwFindType: u32,
+        pvFindPara: *const c_void,
+        pPrevCertContext: *const c_void,
+    ) -> *const c_void;
+
+    /// 证书显示名（CERT_NAME_SIMPLE_DISPLAY_TYPE），返回含 NUL 的宽字符数
+    pub fn CertGetNameStringW(
+        pCertContext: *const c_void,
+        dwType: u32,
+        dwFlags: u32,
+        pvTypePara: *mut c_void,
+        pszNameString: *mut u16,
+        cchNameString: u32,
+    ) -> u32;
+
+    pub fn CertFreeCertificateContext(pCertContext: *const c_void) -> BOOL;
+
+    pub fn CertCloseStore(hCertStore: HANDLE, dwFlags: u32) -> BOOL;
 }

@@ -1,0 +1,27 @@
+# AI-Root 用户偏好（示例）
+#
+# 位置：%LOCALAPPDATA%\AI-Root\user.toml
+# 权限：当前用户完全控制（不需要管理员）
+#
+# ⚠ 这一层**只能收紧**，不能放宽。原因：Agent 以当前用户身份运行，
+#   如果能靠改这个文件给自己加权限，整套授权策略就没有意义了。
+#   因此这里没有 rules / approved_services / trusted_publishers 等字段 ——
+#   写了会直接报错（不是忽略），且整层不生效（结果只会更严）。
+#
+# 校验：AI-Root config check
+
+version = 2
+
+# 运行模式：只能比管理员策略更严
+#   autonomy(0) < balanced(1) < strict(2) < disabled(3)
+# 管理员是 autonomy 时，这里写 strict 生效；写 autonomy 无意义；
+# 管理员已是 strict 时，这里写 autonomy **不会**放宽。
+mode = "strict"
+
+# 命令默认超时（毫秒）。钳制到 [1000, 600000]
+# 只影响「调用方没显式传 --timeout 时」的默认值
+default_timeout_ms = 120000
+
+# 确认请求有效期（秒）：只能比管理员策略更短，钳制到 [30, 3600]
+# 短一点能减少"忘了有请求挂着"的情况
+confirm_timeout_secs = 60

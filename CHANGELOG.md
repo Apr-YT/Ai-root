@@ -3,6 +3,161 @@
 本文件记录 AI-Root 的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.2.0] — 2026-10-21
+
+> 主题：**配置架构**。把「12 个编译期常量 + 3 个环境变量 + 一个 JSON 文件」整理成
+> 三层配置系统，并把磁盘布局拆成 秘密 / 日志 / 状态 / 规则 四类。
+> 审计见 [docs/CONFIG_AUDIT.md](docs/CONFIG_AUDIT.md)，配置参考见
+> [docs/配置说明.md](docs/配置说明.md)。
+
+### Added — 配置系统
+
+- **`src/config.rs`**：三层加载与合并（默认值 → 用户偏好 → 管理员策略），
+  提供层状态报告、合并说明（`notes`）与带指纹的缓存（保留"改配置即生效"）。
+- **TOML 配置**（替代 JSON）：`policy.toml` 支持注释；规则可拆到 `rules.d\*.toml`，
+  按文件名字典序合并，按主题维护。
+- **用户偏好层** `%LOCALAPPDATA%\AI-Root\user.toml`：可调 `mode`（只能收紧）、
+  `confirm_timeout_secs`（只能缩短）、`default_timeout_ms`（钳制到 1s..600s）。
+- **新命令**：`AI-Root config check|show|path|init|migrate`。
+  `check` 逐层校验并给出可定位的 TOML 行号错误，有错退出码 1。
+- **示例配置** `examples/`：`policy.toml` + `rules.d/10-dev-tools.toml` +
+  `rules.d/20-services.toml` + `user.toml`，已用 `config check` 实测通过，不含真实秘密。
+
+### Changed — 磁盘布局（v2）
+
+```text
+%ProgramData%\AI-Root\
+├── policy.toml          管理员策略（TOML）
+├── rules.d\            自动化规则
+├── secrets\            令牌（更严的独立目录）
+├── logs\               events.jsonl / exec.log
+└── state\              enabled.flag / sid.txt / policy.initialized / pending\ / tmp\
+```
+
+- 秘密、日志、状态、临时脚本**分目录**存放（原实现全在根目录，ACL 只能一刀切）。
+- **自动迁移**旧扁平布局：`install` / 服务启动 / `config migrate` 时执行，幂等；
+  不覆盖已存在的目标文件，迁移前备份旧策略到 `state\legacy\`。
+- `token_path` / `log_path` / `events_path` / `enabled_flag_path` / `user_sid_path` /
+  `tmp_dir` 全部指向新位置。
+
+### Security — 配置错误不再放宽权限
+
+- **修复 C-01**：`PolicyFile` / `Rule` / `UserConfig` 全部加 `#[serde(deny_unknown_fields)]`。
+  拼错字段（如 `trusted_publisher`）现在**解析即报错并指出期望字段名**，不再静默忽略。
+- **修复 C-02**：新增 `state\policy.initialized` 标记。策略文件**曾初始化后被删除**时
+  降级为 `locked_down`（只读查询以外全拒），**不再自动重建宽松默认策略**。
+  旧行为等于"删掉配置文件 = 权限回到出厂状态"。
+- **修复 C-03**：版本迁移链。v1 JSON 自动迁移为 v2 TOML（备份原文件）；
+  v1 TOML 按 v2 语义解释（字段超集）；高于当前版本一律拒绝。
+- **规则文件 fail-closed**：任一 `rules.d\*.toml` 解析失败或规则 ID 跨文件重复 →
+  **整体降级**。跳过坏文件会丢失 deny 规则，等于放宽。
+- **用户层只能收紧**：`UserConfig` 里没有 `rules` / `approved_services` /
+  `trusted_publishers` / `allow_legacy_shell` 字段；写了报错且整层忽略。
+  `mode` 按 `strictness` 取 max，`confirm_timeout_secs` 取 min。
+- **用户配置损坏不影响管理员策略**：忽略用户层（结果只会更严），并在 `config check` 提示。
+- **原子写**：策略写入改为 `.tmp` + `rename`，避免保存过程中被读到半截文件。
+
+### Fixed — 一致性与可用性
+
+- **C-06** `secrets\` 在 `ensure_token` 里单独复验 DACL（继承之外再确认一次）。
+- **C-07** 每请求加载改为带 mtime/大小指纹的缓存：配置不变时只做几次 `metadata`，
+  变化时立即重载（热生效保留）。
+- **C-09** `AIROOT_DEPLOY_DIR` 不再影响部署位置（统一 `config::machine_dir()`），
+  避免"服务二进制受保护"与"配置受保护"分裂成两套边界。
+- `AI-Root policy` / `signature` 为只读命令，不创建任何文件。
+
+### Tests
+
+- 测试数 **152 → 175**，全部通过（Windows 25H2 真机，`cargo test --release`，
+  耗时 0.76s）。新增 23 项配置测试 + 3 项端到端：
+  - 三层合并：mode 只能收紧（4 种组合）、confirm 只能缩短、超时钳制；
+  - fail-closed：策略删除不重建、规则文件损坏整体降级、跨文件重复 ID 降级；
+  - 严格字段：策略/规则里拼错字段必须报错；
+  - 迁移：v1 JSON → TOML（含备份）、旧布局 → 分层布局（不覆盖已存在目标）；
+  - 缓存：文件改动后重新加载；
+  - 端到端：用户配置收紧为 `disabled` 后 argv 白名单失效（`mode:disabled`）；
+    用户配置注入规则无效；策略缺失时真实请求被拒（`degraded:deny`）。
+- **实机验证**：`config check` 对拼错字段给出 `unknown field ... expected one of ...`
+  并返回退出码 1；`examples/` 三个示例文件通过校验（mode=strict、规则 14 条）。
+
+### 未验证（明确记录）
+
+- 布局迁移在**真实 SYSTEM 服务**上下文中的执行（本机未安装服务）；
+- 迁移后旧版本回滚的完整流程（文档给了手工步骤，未实测）；
+- `%ProgramData%` 被组策略重定向 / 非系统盘 ProgramData 的场景。
+
+## [1.1.0] — 2026-10-21
+
+> 主题：**授权层**。把「一张令牌 = 一个 SYSTEM shell」改为「令牌 + 服务端授权策略」。
+> 完整审计与逐项修复记录见 [docs/SECURITY_REFACTOR_AUDIT.md](docs/SECURITY_REFACTOR_AUDIT.md)，
+> 配置指南见 [docs/授权策略.md](docs/授权策略.md)。
+
+### Security — 更新与部署（Critical）
+
+- **修复：非提权用户可替换 SYSTEM 服务二进制**（审计 V-01）。旧 `update` 只需 PE 头校验，
+  任何能执行它的用户都能把任意代码变成 LocalSystem 服务。
+  现改为三道门控：`WinVerifyTrust` 验证 **Authenticode 嵌入签名** →
+  发布者证书 SHA-256 命中策略 `trusted_publishers` → 目标路径取自 SCM 实际 `ImagePath`
+  且必须位于受保护数据目录。
+- **新增**：架构必须与当前进程一致（x86 二进制不再能替换 x64 服务）；
+  拒绝版本降级；复制后二次比对 SHA-256；启动 20s 未 Running **自动回滚**到 `.old`。
+- **修复**：部署失败回退到源路径（V-03）。`deploy_global` 失败现在直接返回 `Err`，
+  不再把用户可写目录里的 exe 注册为 SYSTEM 服务。
+- **移除**：`update` 依赖 `AIROOT_DEPLOY_DIR` 推算目标路径（既是功能缺陷，也是任意目录写入原语）。
+
+### Security — ACL（High）
+
+- **修复**：`set_dir_acl` 返回 `Result` 并传播每条 `icacls` 的错误（V-04，原先全部 `let _ =` 丢弃）。
+- **新增**：`verify_dir_acl` 用 `GetNamedSecurityInfoW` 解析**二进制 DACL** 校验三条不变量
+  （危险 SID 无写权限 / SYSTEM 有写 / 无残留继承 ACE），不再依赖 `icacls` 文本匹配本地化账户名。
+- **变更**：服务启动时 ACL 设置或校验失败 → **拒绝启动**（fail closed），写 `acl_setup_failed` 事件。
+- **变更**：`ensure_token` 先硬化目录 ACL 再写令牌；令牌已存在时也复验目录权限（V-16）。
+- **移除**：`acl_has_system_full`（只查 `contains("SYSTEM") && contains("(F)")` 的弱判据）。
+
+### Security — 执行与授权（Critical）
+
+- **新增 `src/policy.rs`**：Allow / Confirm / Deny 三级判定；内置保护硬编码不可覆盖
+  （间接执行宿主、下载器、不可逆磁盘/引导、关闭安全控制、账户/持久化、改 AI-Root 自身）；
+  deny 规则优先于 allow；未知操作/未知字段一律拒绝；策略损坏自动降级为「只读」。
+- **新增 `AI-Root exec`**：结构化 argv 执行，**不经 shell**；程序解析成绝对路径（不查当前目录）；
+  参数是数组。策略可按「程序 + 参数前缀 + 目录」精确授权。
+- **变更**：`AI-Root run`（传统 shell）默认进入**人工确认**流程。
+- **新增 `src/consent.rs`**：文件型确认通道。批准内容 = `sha256(op|完整参数摘要)`，
+  与参数绑定、一次性、带 TTL；普通用户无法写 `pending\`（ACL）。
+- **新增**：`AI-Root pending` / `approve` / `deny` / `policy` / `signature` / `trust-publisher`。
+
+### Security — 协议与审计（Medium）
+
+- **协议 v2**：`Request` 增加 `op` / `argv` / `target` / `v`；`#[serde(deny_unknown_fields)]`
+  —— 发 `"confirmed": true` 会**解析失败**而不是被静默忽略（V-09）。
+- **响应**增加 `decision` / `rule_id` / `reason` / `confirmation_id`，调用方能看到「为什么被拒绝」。
+- **新增 `common::redact`**：审计日志遮蔽 `--password=` / `-p` / `API_KEY=` 等参数（V-11）。
+- **新增**：`policy_decision` / `confirm_consumed` / `update_rejected` / `update_rollback` 事件类型。
+
+### Fixed — 稳定性
+
+- **修复 panic**：`exec.rs` 用 `&stdout[..200]` 做预览，中文输出时第 200 字节常落在字符中间
+  → thread panic，客户端收不到响应（V-07）。改为 `truncate_utf8` 向前回退到字符边界。
+- **修复 TOCTOU**：脚本模式临时文件从 `%TEMP%`（SYSTEM 下为 `C:\Windows\Temp`，用户可写）
+  迁到 `%ProgramData%\AI-Root\tmp\`（ACL 保护）+ 16 字节加密随机名 + `create_new`（V-08）。
+- **修复**：超时 `taskkill` 失败现在记录 `taskkill_failed` 事件并降级为 `child.kill()`（V-13）。
+- **修复**：临时文件清理失败记录 `temp_cleanup_failed`（含路径），不再静默。
+- **修复**：客户端读响应超时从固定 60s 改为「执行超时 + 30s」，避免长命令被客户端提前放弃。
+- **修复**：测试日志污染真实 `%ProgramData%\AI-Root`（测试构建下固定写 `%TEMP%\airoot-test-logs`）。
+
+### Changed — 行为与兼容
+
+- `Request.command` 变为 `Option<String>`（v1 客户端仍可用，语义为 legacy shell）。
+- `AI-Root update` 在未配置 `trusted_publishers` 时**一律拒绝**，并提示如何建立信任根。
+- `AI-Root policy` / `signature` 为只读命令，**不会**创建 `%ProgramData%\AI-Root`。
+
+### Tests
+
+- 测试数 **57 → 152**（新增策略引擎、确认通道、ACL 二进制校验、签名验证、UTF-8 截断、
+  协议严格字段、授权端到端等用例）。全部在 Windows 25H2 真机通过。
+- 未验证项（明确记录）：服务安装/启动/真正的 SYSTEM 上下文 ACL 行为、
+  `update` 端到端签名替换、域环境行为 —— 需在可恢复的 Windows 虚拟机验证。
+
 ## [Unreleased]
 
 ## [1.0.0] — 2026-10-04
