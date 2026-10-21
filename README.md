@@ -146,7 +146,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
 
 ```text
 AI-Root install            注册为 LocalSystem 自启服务（管理员，仅首次）
-AI-Root uninstall          卸载服务（管理员；同时清理部署目录/包装器/令牌/身份文件）
+AI-Root uninstall          卸载服务（管理员；删程序与凭据，保留策略/规则/日志）
+AI-Root grant              对已存在的服务补发用户 STOP/START 授权（管理员；install 失败降级时用）
 AI-Root rotate-token       轮换共享令牌（写盘后服务端自动热加载，旧令牌立即失效）
 AI-Root start              启动服务（install 授权后非提权即可）
 AI-Root stop               停止服务（install 授权后非提权即可）
