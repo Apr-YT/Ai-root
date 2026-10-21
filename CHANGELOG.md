@@ -3,6 +3,44 @@
 本文件记录 AI-Root 的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.3.1] — 2026-10-21
+
+### Fixed — 安装会直接失败（严重）
+
+在本机实测 `install` 失败：
+
+```text
+[错误] secrets 目录权限不安全（未写入令牌）：残留 3 条继承 ACE
+（/inheritance:r 未生效，父目录权限会继续传播）
+```
+
+根因：`icacls /inheritance:r` **只作用于指定目录，不递归子目录**。
+
+`ensure_token` 的顺序是 `create_dir_all(secrets)` → `set_dir_acl(数据目录)`。
+创建 `secrets` 时，父目录 `%ProgramData%\AI-Root` 还是从 `ProgramData` 继承来的弱
+DACL，于是 `secrets` 把 3 条 ACE（含 `Users` 可写）**固化**为自己的继承 ACE。
+之后对父目录执行 `/inheritance:r` 并不会清除子目录里已固化的 ACE，
+`verify_dir_acl(secrets)` 随即拒绝写入令牌 —— 安装失败。
+
+修复：`set_dir_acl` 改为**递归硬化**（深度 2，覆盖
+`secrets` / `logs` / `rules.d` / `state\{tmp,pending}`），每个目录独立断继承并显式授权。
+
+**校验逻辑没有放宽**：`verify_dir_acl` 仍然拒绝任何继承 ACE。放宽校验会让秘密目录
+真的保留可写 ACE；正确做法是让硬化覆盖到子目录。
+
+### Tests
+
+- 新增 `set_dir_acl_hardens_preexisting_subdirs`：先在父目录硬化前创建两级子目录，
+  使其继承弱 ACE，再断言三者都被硬化。已做**变异验证**：把递归深度改成 0 时该用例
+  立即失败（报「残留 4 条继承 ACE」），恢复后通过 —— 确认它能抓住旧缺陷而不是摆设。
+- 测试数 **175 → 176**。
+- 真机补齐此前一直标记为「未验证」的链路：
+  `install` 成功 → 服务 `Running` → `exec whoami` 返回 `nt authority\system` →
+  重复 `install` 幂等（输出「已安装，未做变更」，exit 0）→
+  `secrets` 目录 ACL 全显式（`SYSTEM:F` / `Administrators:F` / 用户 `:R`，无 `(I)` 标记）。
+
+> v1.3.0 的 Release 产物含此缺陷（安装会失败），请使用 v1.3.1。
+
 ## [1.3.0] — 2026-10-21
 
 > 主题：**一键化**。把「翻文档、猜依赖、拼命令」收敛成可重复执行的脚本入口。

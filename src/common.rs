@@ -501,6 +501,54 @@ impl std::error::Error for AclError {}
 /// 「SYSTEM 无写权限」或「继承已断但显式 ACE 缺失」的状态，而调用方毫不知情。
 /// 现在任何一步失败都返回 `Err`，由调用方决定是否继续（服务启动时选择拒绝启动）。
 pub fn set_dir_acl(dir: &std::path::Path) -> Result<(), AclError> {
+    harden_dir_tree(dir, ACL_HARDEN_DEPTH)
+}
+
+/// 递归硬化深度。
+///
+/// 当前布局为 `machine\{secrets,logs,state\{tmp,pending},rules.d}`，2 层足够。
+/// 不做无界递归：`AIROOT_DATA_DIR` 可以把数据目录指向任意位置，
+/// 无界遍历会拖慢服务启动。
+const ACL_HARDEN_DEPTH: u8 = 2;
+
+/// 逐层硬化：每个目录都执行 `icacls /inheritance:r` + 显式授权。
+///
+/// ## 为什么必须递归（2026-10-21 本机 install 实测失败）
+///
+/// `icacls /inheritance:r` **只作用于指定目录，不递归子目录**。
+///
+/// 而 `ensure_token` 的顺序是 `create_dir_all(secrets)` → `set_dir_acl(数据目录)`。
+/// 创建 `secrets` 时父目录 `%ProgramData%\AI-Root` 还是从 `ProgramData` 继承来的
+/// 弱 DACL，于是 `secrets` 把 3 条 ACE（含 Users 可写）**固化**成自己的继承 ACE。
+/// 之后对父目录执行 `/inheritance:r` 并不会清除子目录里已经固化的那些 ACE，
+/// 紧接着 `verify_dir_acl(secrets)` 报
+/// 「残留 3 条继承 ACE（/inheritance:r 未生效）」并拒绝写入令牌 —— 安装直接失败。
+///
+/// 这是「硬化没覆盖到子目录」，不是「校验过严」。放宽校验会让秘密目录真的
+/// 保留可写 ACE；正确做法是逐层断继承。
+fn harden_dir_tree(dir: &std::path::Path, depth: u8) -> Result<(), AclError> {
+    set_one_dir_acl(dir)?;
+    if depth == 0 {
+        return Ok(());
+    }
+    // 读不到子项不算失败：目录本身已硬化，可能只是没有列目录的权限。
+    let mut children: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    children.sort();
+    for child in children {
+        // 子目录失败必须向上传播：秘密目录权限不可靠时不能算「部分成功」。
+        harden_dir_tree(&child, depth - 1)?;
+    }
+    Ok(())
+}
+
+fn set_one_dir_acl(dir: &std::path::Path) -> Result<(), AclError> {
     let dir_str = dir.to_string_lossy().to_string();
 
     // 先断开继承（清除全部继承 ACE），再加显式 ACE。
@@ -1181,6 +1229,40 @@ mod tests {
             "当前用户 ({user_name}) 失去只读 ACE。\
              典型原因：icacls 的 SID 参数缺少 `*` 前缀，被当账户名解析失败而静默丢弃。\n实际 ACL:\n{after}"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 子目录必须被一起硬化（2026-10-21 本机 install 失败的真实回归）。
+    ///
+    /// 复现条件：子目录在父目录硬化**之前**创建 → 它继承父目录当时的（弱）ACE，
+    /// 并把这些 ACE 固化为自己的继承 ACE。`icacls /inheritance:r` 不递归，
+    /// 旧实现只硬化父目录，子目录里那几条 (I) ACE 仍然存在，
+    /// `verify_dir_acl(secrets)` 随即拒绝写令牌，安装失败。
+    #[test]
+    fn set_dir_acl_hardens_preexisting_subdirs() {
+        let base = std::env::temp_dir().join(format!("airoot-acl-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("创建测试根失败");
+
+        // 先给父目录一条**可继承**的 ACE 作为「弱权限来源」（Users 只读，
+        // 只读不会被判为危险写权限，但会被计入「继承 ACE」）。
+        let _ = Command::new("icacls")
+            .arg(&base)
+            .arg("/grant")
+            .arg("*S-1-5-32-545:(OI)(CI)R")
+            .output();
+
+        // 在父目录硬化之前创建两级子目录，使它们继承上面那条 ACE。
+        let secret = base.join("secrets");
+        let nested = secret.join("nested");
+        std::fs::create_dir_all(&nested).expect("创建子目录失败");
+
+        set_dir_acl(&base).expect("递归硬化应成功");
+
+        verify_dir_acl(&base).expect("父目录不应残留继承 ACE");
+        verify_dir_acl(&secret).expect("secrets 子目录必须被硬化（旧实现漏掉这里）");
+        verify_dir_acl(&nested).expect("二级子目录必须被硬化");
 
         let _ = std::fs::remove_dir_all(&base);
     }

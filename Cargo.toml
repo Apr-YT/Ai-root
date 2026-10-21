@@ -1,6 +1,6 @@
 [package]
 name = "AI-Root"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2021"
 description = "AI-Root —— 以 LocalSystem 运行的提权命令中继（命名管道 IPC + 共享令牌鉴权）"
 default-run = "AI-Root"
