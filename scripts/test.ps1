@@ -151,15 +151,15 @@ if ($skipNotes.Count -gt 0) {
 # ------------------------------------------------------------
 Write-Host ""
 Write-Host "当前环境无法覆盖、需在可恢复虚拟机验证的项:" -ForegroundColor DarkGray
+# 只列**确实没有**覆盖的项。install/start/stop/uninstall 已在真机执行过，
+# 不能再标为「未验证」——那同样是失真。
 $notCovered = @(
-    "install / start / stop / uninstall 的真实 SCM 生命周期"
-    "服务以 LocalSystem 运行时的目录 ACL 行为"
-    "update 端到端：签名包替换、健康检查失败后自动回滚"
+    "update 端到端：签名包替换、健康检查失败后自动回滚（需签名包 + 信任根）"
+    "服务以 LocalSystem 启动时的目录 ACL 自检路径（install 由管理员身份执行，两者不同）"
     "域环境下的管道 SDDL 与非交互登录连接"
 )
 if ($svc.Exists) {
-    Write-Host "  （检测到本机已安装 AI-Root 服务，但仍未执行破坏性用例）" -ForegroundColor DarkGray
-    # 已装服务并不改变上面前三项：测试套件本身不做真实安装/卸载。
+    Write-Host "  （本机已安装 AI-Root 服务，状态 $($svc.State)；上述用例不依赖它的存在）" -ForegroundColor DarkGray
 }
 foreach ($n in $notCovered) { Write-Host "  - $n" -ForegroundColor DarkGray }
 

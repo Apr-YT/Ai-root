@@ -6,7 +6,8 @@
 # ⚠ 本文件（以及 scripts\ 下所有 .ps1）必须保存为 **UTF-8 with BOM**。
 #   Windows PowerShell 5.1 读取 .ps1 时按系统 ANSI 代码页解码（中文机器为 GBK/936），
 #   无 BOM 的 UTF-8 中文会变成乱码，甚至因乱码产生不配对的引号而报语法错误。
-#   仓库根目录的 install-service.ps1 早就记录过这个坑，此处沿用同一约定。
+#   本仓库所有 .ps1 均按此约定保存（UTF-8 with BOM）；编辑脚本时不要用会丢 BOM 的
+#   工具另存，否则中文会变乱码甚至产生语法错误。
 
 $ErrorActionPreference = "Continue"
 

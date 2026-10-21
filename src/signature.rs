@@ -350,7 +350,7 @@ fn extract_signer(path: &Path) -> Option<(String, Option<String>)> {
     let mut name_buf = [0u16; 256];
     let name_len = unsafe {
         winapi_raw::CertGetNameStringW(
-            cert as *const c_void,
+            cert,
             CERT_NAME_SIMPLE_DISPLAY_TYPE,
             0,
             ptr::null_mut(),
@@ -486,7 +486,7 @@ mod tests {
         let thumb = r.signer_thumbprint.expect("应能提取签名者证书指纹");
         assert_eq!(thumb.len(), 64, "SHA-256 指纹应为 64 个 hex 字符: {thumb}");
         // 把它加入信任列表后应被接受（验证白名单比对逻辑真的生效）
-        let r2 = verify_file(&sample, &[thumb.clone()]);
+        let r2 = verify_file(&sample, std::slice::from_ref(&thumb));
         assert!(r2.publisher_allowed, "指纹应命中白名单");
         assert!(r2.is_acceptable(), "签名可信 + 发布者在白名单 → 应可接受");
     }

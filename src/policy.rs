@@ -506,15 +506,14 @@ impl Policy {
         {
             if r.matches(action) {
                 // Balanced 模式额外硬约束：argv 必须落在 workspace_roots 内
-                if self.file.mode == Mode::Balanced && action.op_kind() == OpKind::RunArgv {
-                    if !self.workspace_allows(action) {
+                if self.file.mode == Mode::Balanced && action.op_kind() == OpKind::RunArgv
+                    && !self.workspace_allows(action) {
                         return Verdict::new(
                             Decision::Confirm,
                             format!("rule:{}", r.id),
                             "Balanced 模式：工作目录不在 workspace_roots 内，需确认",
                         );
                     }
-                }
                 return Verdict::new(
                     Decision::Allow,
                     format!("rule:{}", r.id),
@@ -579,10 +578,7 @@ impl Policy {
             return false;
         }
         match action {
-            Action::Argv { cwd, .. } => match cwd {
-                Some(c) => path_under_any_ci(c, &self.file.workspace_roots),
-                None => false,
-            },
+            Action::Argv { cwd: Some(c), .. } => path_under_any_ci(c, &self.file.workspace_roots),
             _ => false,
         }
     }

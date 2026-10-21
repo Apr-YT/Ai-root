@@ -3,6 +3,40 @@
 本文件记录 AI-Root 的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.4.0] — 2026-10-21
+
+> 主题：**正式版整理**。不新增功能，只清理开发期遗留、统一口径、把质量门槛拉齐。
+
+### Removed
+
+- **移除 `install-service.ps1`**（破坏性变更）：它已被 `scripts/install.ps1` 完全取代，
+  且缺少幂等判断、签名检查、`-PreflightOnly` 与安装后自检。README 此前仍在推荐旧入口，
+  容易让人用到行为不一致的脚本。
+  迁移：把 `-File install-service.ps1` 换成 `-File scripts\install.ps1`（`-Exe` 参数兼容）。
+- 删除 5 处死代码：`CLIENT_READ_TIMEOUT_MS`、`log_path()`、`read_frame()`、
+  `ACCESS_DENIED_ACE_TYPE`；`is_valid_pe` 改为 `#[cfg(test)]`（仅测试使用）。
+
+### Changed
+
+- **审计报告归档**：`docs/SECURITY_REFACTOR_AUDIT.md` 与 `docs/CONFIG_AUDIT.md`
+  移入 `docs/audit/`，文首标注「历史记录，非当前行为依据」，避免被当作现状阅读。
+- **重写 `docs/项目结构说明.md`**：原文档已失真（声称 `server.rs` 1,247 行、漏掉
+  `config`/`policy`/`consent`/`signature` 四个模块、无 `scripts/`）。改为只描述职责，
+  不再记录会随迭代过时的行数。
+- README 部署章节只介绍 `scripts/install.ps1`，删除旧脚本的 6 步表格。
+- 源码注释去掉开发期叙事（「旧实现…」「改造点…」、bug 编号 B3/V-01、具体日期），
+  保留全部解释「为什么不能这样写」的安全结论。
+
+### Fixed
+
+- clippy 警告 **20 → 0**：`io::Error::other`、doc 列表缩进、可折叠 `match`/`if`、
+  多余指针转换、复杂类型抽别名等。
+- 帧上限的两条断言改为编译期 `const _: () = assert!(...)`，不再有运行期开销。
+
+### Tests
+
+- 176 passed；`cargo clippy --all-targets` 0 warning；CI msvc + gnu 双 job。
+
 ## [1.3.1] — 2026-10-21
 
 ### Fixed — 安装会直接失败（严重）

@@ -51,8 +51,8 @@ impl ExecResult {
 /// 为什么不直接写 `&s[..n]`：`&str` 的索引是字节偏移，若 `n` 落在多字节字符
 /// 中间，会在**运行时 panic**（`byte index is not a char boundary`）。
 /// 中文 Windows 下命令输出含中文极常见（`ipconfig`、`dir`、`echo 中文`），
-/// 200 字节这个位置经常正好切在一个汉字中间 —— 旧实现因此在
-/// `run_child` 里 panic，导致该请求永远收不到响应帧。
+/// 200 字节这个位置经常正好切在一个汉字中间 —— 直接切片会因此
+/// 在 `run_child` 里 panic，导致该请求永远收不到响应帧。
 ///
 /// 语义：向**前**回退到最近的字符边界，宁可少截几个字节也不 panic。
 pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
@@ -194,7 +194,7 @@ pub fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecRes
     // 代价：`^`/`&` 仅在**引号外**被转义为字面量，故**引号外**的 `&` 与 `&&` 串联**全部失效**（退化为字面 `&`/`&`）；
     // 仅 `|`/`<`/`>`/`()` 运算符语义保留。需要 `&`/`&&` 串联请改用多行脚本模式（命令含 `\n`、
     // 或 `AI-Root run --file <脚本>` / `AI-Root run --stdin`）。
-    // 引号内的 `&`/`^` 不做转义（B3 修复）：cmd 引号内 `^` 非转义符，盲目加 `^` 会把 `&` 变成字面 `^&` 破坏内容。
+    // 引号内的 `&`/`^` 不做转义：cmd 引号内 `^` 非转义符，盲目加 `^` 会把 `&` 变成字面 `^&` 破坏内容。
     let escaped = escape_cmd_meta(command);
     builder.raw_arg("/C").raw_arg(&escaped);
     builder.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -290,6 +290,7 @@ fn run_script(script: &str, cwd: Option<&str>, timeout_ms: u64) -> ExecResult {
 /// - 本体 `AI-Root-<rand>.cmd`：脚本内容，UTF-8 + CRLF（见 `encode_script`）。
 /// - 包装 `AI-Root-<rand>.wrap.cmd`：**纯 ASCII**，内容为
 ///   `@echo off` / `chcp 65001 >nul` / `call "<本体路径>"`。
+///
 /// 原理：cmd 顶层批处理存在「预读缓冲」怪癖——`chcp` 生效前的行已按旧代码页读入，
 /// 导致 UTF-8 中文在某些行乱码；且 `cmd /C "chcp & call \"path\""` 单行形式会因
 /// `/C` 引号剥离把 `call` 参数拆坏（实测失败）。而包装脚本全 ASCII（顶层读取无中文问题），
@@ -546,7 +547,7 @@ fn drain_pipe<R: Read>(pipe: Option<R>) -> (Vec<u8>, bool) {
 /// （如未加引号的设备实例 ID `VID_373B&PID_1216&MI_00&COL0x` 中的 `&` 会被拆段）。
 /// 在**引号外**的 `^`/`&` 前加 `^` 转义为字面量，确保整条命令原样送达目标程序。
 ///
-/// **引号感知（修复 B3）**：cmd 的双引号内部，`^` **不是转义符**（引号内 `^` 为字面量），
+/// **引号感知**：cmd 的双引号内部，`^` **不是转义符**（引号内 `^` 为字面量），
 /// 且引号内的 `&`/`|`/`<`/`>`/`()` 本来就由 cmd 当字面量处理、不会被当作分隔符/重定向。
 /// 因此**仅当字符位于引号外部时才转义**；引号内的 `&` 必须保持原样。否则盲目加 `^`
 /// 会使 `echo "a&b"` 变成 `echo "a^&b"`、输出 `a^&b` 而非 `a&b`（静默内容破坏）。
@@ -558,7 +559,7 @@ fn escape_cmd_meta(cmd: &str) -> String {
     let mut in_quotes = false;
     for c in cmd.chars() {
         match c {
-            // 每个 `"` 切换引号状态；引号内的 `&`/`^` 不再转义（B3 修复）
+            // 每个 `"` 切换引号状态；引号内的 `&`/`^` 不再转义
             '"' => {
                 in_quotes = !in_quotes;
                 out.push(c);
@@ -578,6 +579,7 @@ fn escape_cmd_meta(cmd: &str) -> String {
 /// 同一 `cmd /C` 进程内输出编码并不统一：
 /// - `dir`/`ver` 等内建命令按系统 OEM 代码页（中文 Windows = GBK 936）回显；
 /// - `echo 中文` 则原样回显命令行字面量（经 CreateProcessW 以 UTF-16 传入后转回 OEM，或保留 UTF-8）。
+///
 /// 单一代码页无法同时正确解码两者。故采用双解码策略：
 ///   1) 先严格按 UTF-8 解码（覆盖 UTF-8 发射器及全部 ASCII 内容）；
 ///   2) 失败再回退到系统 OEM 代码页（GBK）解码。
@@ -657,6 +659,7 @@ fn decode_codepage(bytes: &[u8], codepage: u32) -> String {
 /// - GBK 编码脚本反而乱码（cmd 按 UTF-8 读 GBK 字节）；
 /// - `@chcp 65001` 前置会触发 cmd 批处理「预读缓冲」怪癖，部分行被按旧代码页读入而乱码；
 /// - UTF-8 BOM 在部分 cmd 版本下会被当 GBK 读成「锘」前缀，同样不可靠。
+///
 /// 统一 CRLF 换行，避免 cmd 对 LF 的兼容性问题。
 fn encode_script(s: &str) -> Vec<u8> {
     let normalized: String = s.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -667,7 +670,7 @@ fn encode_script(s: &str) -> Vec<u8> {
 mod tests {
     use super::{escape_cmd_meta, run_argv, run_command, run_script_file_in, truncate_utf8};
 
-    // ---------- UTF-8 安全截断（V-07 回归）----------
+    // ---------- UTF-8 安全截断（回归）----------
 
     #[test]
     fn truncate_utf8_ascii_is_plain_prefix() {
@@ -678,7 +681,7 @@ mod tests {
     #[test]
     fn truncate_utf8_never_splits_multibyte_char() {
         // 「中」= 3 字节（E4 B8 AD）。200 落在 66*3+2 处，即第三个字节之前 ——
-        // 旧实现 `&s[..200]` 在此处 panic。
+        // 直接字节切片 `&s[..200]` 在此处 panic。
         let s = "中".repeat(200);
         let cut = truncate_utf8(&s, 200);
         assert!(cut.len() <= 200);
@@ -705,7 +708,7 @@ mod tests {
         assert_eq!(cut, "🙂".repeat(5));
     }
 
-    /// 精确回归 V-07：非零退出 + 中文输出会走 preview 分支，旧实现此处 panic。
+    /// 回归：非零退出 + 中文输出会走 preview 分支，直接字节切片在此处 panic。
     /// 本测试真实驱动脚本执行，断言不 panic 且退出码正确。
     #[test]
     fn chinese_output_with_nonzero_exit_does_not_panic() {
@@ -838,7 +841,7 @@ mod tests {
 
     #[test]
     fn preserves_amp_inside_quotes_b3() {
-        // B3 修复：引号内的 & 不得转义，否则输出 a^&b
+        // 引号内的 & 不得转义，否则输出 a^&b
         assert_eq!(escape_cmd_meta("echo \"a&b\""), "echo \"a&b\"");
         // 含 & 的设备实例 ID（带引号）应原样保留
         assert_eq!(

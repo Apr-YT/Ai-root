@@ -218,7 +218,7 @@ pub fn validate_request(req: &Request) -> Result<(), String> {
 /// 防线程泄漏：客户端连接后若不发送数据，read_exact 会永久阻塞工作线程。
 /// 通过 PeekNamedPipe 轮询可用字节数实现超时。
 ///
-/// 计时语义（B4 优化）：旧实现让「帧头等待 + 帧体读取」共享同一个总预算 deadline，
+/// 计时语义：若让「帧头等待 + 帧体读取」共享同一个总预算 deadline，
 /// 导致接近 16MB 上限的大负载在慢速管道上，可能因累计耗时（而非真正卡死）在帧体
 /// 中途被误判超时断连。现改为分阶段计时：
 ///   1. 帧头阶段——保留原有「连接后静默」保护：连续 `idle_ms` 拿不到 4 字节帧头即超时。
@@ -256,7 +256,7 @@ pub fn read_frame_timeout(file: &mut File, idle_ms: u64) -> io::Result<Vec<u8>> 
     };
 
     // ---- 帧头阶段：等待 4 字节可用 ----
-    // 语义与旧实现一致：连接后连续 idle_ms 无帧头即超时（防连接后静默的线程泄漏）
+    // 语义：连接后连续 idle_ms 无帧头即超时（防连接后静默的线程泄漏）
     let hdr_start = Instant::now();
     loop {
         let total = peek(handle)?;
@@ -317,14 +317,6 @@ pub fn read_frame_timeout(file: &mut File, idle_ms: u64) -> io::Result<Vec<u8>> 
         last_progress = Instant::now(); // 有增量：刷新空闲计时
     }
     Ok(buf)
-}
-
-/// 兼容旧调用：默认 60s 空闲读超时
-///
-/// 注：主路径已改为按「执行超时 + 余量」动态计算，本函数保留供固定预算场景使用。
-#[allow(dead_code)]
-pub fn read_frame(file: &mut File) -> io::Result<Vec<u8>> {
-    read_frame_timeout(file, common::CLIENT_READ_TIMEOUT_MS)
 }
 
 /// 向文件写入一帧
@@ -826,13 +818,16 @@ mod tests {
 
     #[test]
     fn frame_max_size_constant_is_sane() {
-        // FRAME_MAX_SIZE 必须显著大于命令长度上限，否则合法请求会被帧层拒绝
-        assert!(
+        // FRAME_MAX_SIZE 必须显著大于命令长度上限，否则合法请求会被帧层拒绝。
+        // 两条都用编译期断言：它们是常量不变量，没有理由留到运行期检查。
+        const _: () = assert!(
             common::FRAME_MAX_SIZE > 8191,
             "帧上限必须大于命令长度上限 8191"
         );
-        // 且长度前缀为 u32，上限不得超过 u32::MAX
-        assert!(common::FRAME_MAX_SIZE <= u32::MAX as usize);
+        // 且长度前缀为 u32，上限不得超过 u32::MAX。
+        // 用编译期断言而非 assert!：这是常量不变量，没必要留到运行期检查，
+        // 也不会被 clippy 判为 assertions_on_constants。
+        const _: () = assert!(common::FRAME_MAX_SIZE <= u32::MAX as usize);
     }
 
     // ============ read_frame_timeout：真实命名管道集成测试 ============

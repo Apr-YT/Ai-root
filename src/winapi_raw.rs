@@ -272,9 +272,6 @@ pub const SE_FILE_OBJECT: u32 = 1;
 pub const ACL_SIZE_INFORMATION_CLASS: u32 = 2;
 /// ACCESS_ALLOWED_ACE_TYPE
 pub const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-/// ACCESS_DENIED_ACE_TYPE（deny ACE 只会收紧权限，校验时直接跳过）
-#[allow(dead_code)]
-pub const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 /// ACE_HEADER.AceFlags 中的「继承来的」标记
 pub const INHERITED_ACE_FLAG: u8 = 0x10;
 

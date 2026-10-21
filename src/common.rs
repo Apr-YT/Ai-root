@@ -26,11 +26,6 @@ use crate::winapi_raw;
 /// 边界：建议 >= 1000（防慢网误杀），<= 60000（防线程长期占用）。
 pub const PIPE_READ_TIMEOUT_MS: u64 = 10_000;
 
-/// 客户端读取响应帧空闲超时（毫秒）。`read_frame` 默认超时，与命令执行超时无关。
-/// 来源：经验值；SYSTEM 命令多数较快，兜底 60s。
-#[allow(dead_code)] // 保留给固定预算的调用方；当前客户端按「执行超时 + 余量」动态计算
-pub const CLIENT_READ_TIMEOUT_MS: u64 = 60_000;
-
 /// 命令默认执行超时（毫秒）。`AI-Root run` 未传 `--timeout` 时采用。
 /// 来源：经验值；覆盖绝大多数系统命令。服务端会钳制到 [0, MAX_COMMAND_TIMEOUT_MS]。
 /// 边界：建议 >= 1000。
@@ -111,14 +106,6 @@ pub fn token_path() -> PathBuf {
     crate::config::Paths::resolve()
         .secrets()
         .join("token.txt")
-}
-
-/// 兼容入口：审计日志路径。
-///
-/// 内部已改用 `exec_log_path()`（测试构建下指向 `%TEMP%`），本函数保留给外部调用方。
-#[allow(dead_code)]
-pub fn log_path() -> PathBuf {
-    logs_dir().join("exec.log")
 }
 
 /// GUI 实时事件流文件（JSONL，追加写）。服务端在 exec_start/exec_done/token_rotate 等
@@ -381,7 +368,7 @@ pub const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 ///
 /// 优先级：已持久化的 `sid.txt` → 回退到当前进程身份。
 ///
-/// ⚠ 为什么不能直接用 `get_user_sid()`（2026-10-04 线上故障根因）：
+/// ⚠ 为什么不能直接用 `get_user_sid()`（线上故障根因）：
 ///   `set_dir_acl` 被**服务自身**在启动时调用（`run_pipe_server`），而服务以 LocalSystem
 ///   运行 → 此时 `get_user_sid()` 返回 **`S-1-5-18`**（SYSTEM 自己），不是安装用户。
 ///   于是「授予当前用户只读」这条 ACE 变成「把 SYSTEM 降级为只读」，
@@ -468,7 +455,7 @@ impl std::error::Error for AclError {}
 
 /// 设置目录 ACL：仅 SYSTEM 完全控制 + Administrators 完全控制 + 安装用户只读
 ///
-/// 为什么必须给 Administrators `(F)`（2026-10-04 实测补充）：
+/// 为什么必须给 Administrators `(F)`（实测补充）：
 ///   首次以管理员身份 `install` 时，目录由**当前用户（Administrator 成员）**创建，
 ///   目录 owner 即当前用户；而 `set_dir_acl` 只显式授予 SYSTEM + 用户只读。
 ///   Windows 的 `icacls` 在 DACL 变更后，**为了不把 owner 自己锁在外面**，会自动把
@@ -479,7 +466,7 @@ impl std::error::Error for AclError {}
 ///
 /// ⚠ 安全关键：必须先用 `/inheritance:r` **断开并清除继承的 ACE**，再显式授权。
 ///
-/// 2026-10-04 实测发现的缺陷：原实现只用 `/inheritance:e` + `/grant:r`，
+/// 实测发现的缺陷：只用 `/inheritance:e` + `/grant:r` 时，
 /// 而 `icacls /grant:r` **只替换指定 SID 的那一条 ACE，不会清除其它 SID 的 ACE**。
 /// 于是 `C:\ProgramData` 继承来的 `BUILTIN\Users:(I)(CI)(WD,AD,WEA,WA)` 会**原样保留** ——
 /// 即任意本地用户仍对该目录**有写权限**，可覆写 `token.txt` 并自授权连上 SYSTEM 中继。
@@ -496,7 +483,7 @@ impl std::error::Error for AclError {}
 /// 服务启动 / `ensure_token` / `rotate_token` / `set_enabled` 反复调用会导致 ACE 条目无限膨胀。
 /// `:r` 会先移除该 SID 的全部既有 ACE 再写入唯一一条，既保证幂等，也顺带清理历史累积的重复 ACE。
 ///
-/// ⚠ 错误处理（2026-10-21 改造）：原实现返回 `()` 并把每条 icacls 的结果 `let _ =` 丢弃，
+/// ⚠ 错误处理：返回 `()` 并把每条 icacls 的结果 `let _ =` 丢弃，
 /// 属 fail-open —— `/inheritance:r` 成功而后续 grant 全失败时，目录可能落入
 /// 「SYSTEM 无写权限」或「继承已断但显式 ACE 缺失」的状态，而调用方毫不知情。
 /// 现在任何一步失败都返回 `Err`，由调用方决定是否继续（服务启动时选择拒绝启动）。
@@ -513,7 +500,7 @@ const ACL_HARDEN_DEPTH: u8 = 2;
 
 /// 逐层硬化：每个目录都执行 `icacls /inheritance:r` + 显式授权。
 ///
-/// ## 为什么必须递归（2026-10-21 本机 install 实测失败）
+/// ## 为什么必须递归（本机 install 实测失败）
 ///
 /// `icacls /inheritance:r` **只作用于指定目录，不递归子目录**。
 ///
@@ -589,7 +576,7 @@ fn set_one_dir_acl(dir: &std::path::Path) -> Result<(), AclError> {
     }
 
     // 兜底自检：用**二进制 DACL** 确认 SYSTEM 确实有写权限（不依赖本地化显示名）。
-    // 历史缺陷 C 的失败模式正是「SYSTEM 被降为只读」，此处检测到即立刻补回。
+    // 「SYSTEM 被降为只读」一旦发生，服务将无法写令牌/日志；此处检测到即立刻补回。
     if !dacl_has_system_write(dir) {
         grant_one(&dir_str, "*S-1-5-18:(OI)(CI)F")?;
         if !dacl_has_system_write(dir) {
@@ -876,9 +863,9 @@ fn dacl_has_system_write(dir: &std::path::Path) -> bool {
 
 /// 确保令牌存在：不存在则生成并写盘、设置 ACL
 ///
-/// ⚠ 改造点（V-16）：令牌**已存在**时不再直接返回。
-/// 旧实现 `if tp.exists() { return Ok(...) }` 导致「ACL 在 install 早期窗口被写坏」
-/// 之后永远不修复 —— 而令牌可读性正是整个中继的边界。现在已存在时也会
+/// ⚠ 令牌**已存在**时不能直接返回。
+/// 若写成 `if tp.exists() { return Ok(...) }`，「ACL 在 install 早期窗口被写坏」
+/// 之后将永远不被修复 —— 而令牌可读性正是整个中继的边界。已存在时也会
 /// 用真实 DACL 复验目录权限，不安全即报错（fail closed）。
 pub fn ensure_token() -> io::Result<String> {
     let paths = crate::config::Paths::resolve();
@@ -889,8 +876,7 @@ pub fn ensure_token() -> io::Result<String> {
     // 因为"迁移到一半"会让令牌位置与代码预期不一致。
     if crate::config::needs_layout_migration(&paths) {
         crate::config::migrate_layout(&paths).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("磁盘布局迁移失败，拒绝继续：{e}"),
             )
         })?;
@@ -909,7 +895,7 @@ pub fn ensure_token() -> io::Result<String> {
         return Ok(std::fs::read_to_string(&tp)?.trim().to_string());
     }
     // ⚠ 顺序：**先硬化目录 ACL，再写令牌**。
-    // 反过来（旧实现）会有一个窗口：token.txt 已经在弱权限目录里存在过，
+    // 若先写令牌再硬化目录，会有一个窗口：token.txt 已经在弱权限目录里存在过，
     // 期间任何本地用户都能读到这个等同 SYSTEM 凭据的文件。
     set_dir_acl(&dir).map_err(|e| {
         io::Error::new(
@@ -1009,7 +995,7 @@ pub fn is_enabled() -> bool {
 
 /// 设置启用状态
 ///
-/// ⚠ 改造点：ACL 失败必须上报（旧实现 `set_dir_acl` 静默吞错）。
+/// ⚠ ACL 失败必须上报，不能静默吞错。
 pub fn set_enabled(enabled: bool) -> Result<(), AclError> {
     let flag = enabled_flag_path();
     if enabled {
@@ -1145,7 +1131,7 @@ mod tests {
 
     /// 安全回归：`set_dir_acl` 必须清除**继承来的** `BUILTIN\Users` 写权限。
     ///
-    /// 背景（2026-10-04 实测发现的真实缺陷）：原实现用 `/inheritance:e` + `/grant:r`，
+    /// 背景（实测发现的真实缺陷）：用 `/inheritance:e` + `/grant:r` 时，
     /// 而 `icacls /grant:r` 只替换指定 SID 那一条 ACE，**不清除其它 SID 的 ACE**。
     /// `C:\ProgramData` 继承来的 `BUILTIN\Users:(I)(CI)(WD,AD,WEA,WA)` 会原样保留，
     /// 使任意本地用户仍可写该目录 → 覆写 `token.txt` 自授权连 SYSTEM 中继。
@@ -1233,11 +1219,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// 子目录必须被一起硬化（2026-10-21 本机 install 失败的真实回归）。
+    /// 子目录必须被一起硬化（本机 install 失败的真实回归）。
     ///
     /// 复现条件：子目录在父目录硬化**之前**创建 → 它继承父目录当时的（弱）ACE，
     /// 并把这些 ACE 固化为自己的继承 ACE。`icacls /inheritance:r` 不递归，
-    /// 旧实现只硬化父目录，子目录里那几条 (I) ACE 仍然存在，
+    /// 若只硬化父目录，子目录里那几条 (I) ACE 仍然存在，
     /// `verify_dir_acl(secrets)` 随即拒绝写令牌，安装失败。
     #[test]
     fn set_dir_acl_hardens_preexisting_subdirs() {
@@ -1261,7 +1247,7 @@ mod tests {
         set_dir_acl(&base).expect("递归硬化应成功");
 
         verify_dir_acl(&base).expect("父目录不应残留继承 ACE");
-        verify_dir_acl(&secret).expect("secrets 子目录必须被硬化（旧实现漏掉这里）");
+        verify_dir_acl(&secret).expect("secrets 子目录必须被硬化");
         verify_dir_acl(&nested).expect("二级子目录必须被硬化");
 
         let _ = std::fs::remove_dir_all(&base);
@@ -1290,12 +1276,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// ⚠ 安全回归（2026-10-04 线上故障）：`set_dir_acl` **绝不能以 SYSTEM 为参数**把
+    /// ⚠ 安全回归（线上故障）：`set_dir_acl` **绝不能以 SYSTEM 为参数**把
     /// SYSTEM 自己降级为只读。
     ///
     /// 故障链路（已在真实机器上复现并定位）：
     ///   1. 服务以 LocalSystem 运行，启动时 `run_pipe_server` 调用 `set_dir_acl(data_dir)`；
-    ///   2. 旧实现内部用 `get_user_sid()` 取「当前用户」→ 以 SYSTEM 身份运行时 `whoami /user`
+    ///   2. 若用 `get_user_sid()` 取「当前用户」→ 以 SYSTEM 身份运行时 `whoami /user`
     ///      返回 **`S-1-5-18`**（SYSTEM 自己），而非安装用户；
     ///   3. 于是「授予当前用户只读」那步变成 `grant_one("*S-1-5-18:(OI)(CI)R")`，
     ///      而 `:r` 是 replace 语义 → **覆盖掉刚授予的 SYSTEM:(F)**；
@@ -1350,7 +1336,7 @@ mod tests {
         std::fs::create_dir_all(&base).expect("创建测试目录失败");
         let dir_str = base.to_string_lossy().to_string();
 
-        // 模拟"旧实现的错误结果"：先人为把 SYSTEM 降为只读
+        // 构造「SYSTEM 被降为只读」的场景
         grant_one(&dir_str, &format!("*{LOCAL_SYSTEM_SID}:(OI)(CI)R"))
             .expect("人为降级 SYSTEM 的前提构造失败");
         let poisoned = icacls_show(&base);
@@ -1431,7 +1417,7 @@ mod tests {
     }
 
     // ============================================================
-    // verify_dir_acl：真实 DACL 校验（V-04 / V-05 回归）
+    // verify_dir_acl：真实 DACL 校验（回归）
     // ============================================================
 
     /// 正确配置后，校验必须通过 —— 证明校验器不是「一律报错」。
@@ -1504,7 +1490,7 @@ mod tests {
     }
 
     /// set_dir_acl 对不存在的目录必须返回 Err（而不是静默「设置成功」）。
-    /// 这正是旧实现 fail-open 的形态：icacls 报错、函数返回 ()。
+    /// 这正是 fail-open 的形态：icacls 报错、函数却返回 ()。
     #[test]
     fn set_dir_acl_errors_on_missing_dir() {
         let missing = std::env::temp_dir().join(format!(

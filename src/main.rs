@@ -315,7 +315,7 @@ fn client_call(spec: CallSpec, json_mode: bool) -> i32 {
     }
 
     // 读超时：必须覆盖「命令执行超时」+ 传输余量。
-    // 旧实现固定 60s，导致 `--timeout 300000` 的请求在 60s 就被客户端放弃，
+    // 固定 60s 会让 `--timeout 300000` 的请求在 60s 就被客户端放弃，
     // 而服务端仍在跑（表现为「命令跑了但调用方超时」）。
     let read_budget = spec.timeout_ms.saturating_add(30_000);
     let resp_bytes = match protocol::read_frame_timeout(&mut file, read_budget) {
@@ -382,7 +382,7 @@ fn client_call(spec: CallSpec, json_mode: bool) -> i32 {
     }
 
     if !resp.stdout.is_empty() {
-        print!("{}\n", resp.stdout);
+        println!("{}", resp.stdout);
     }
     if !resp.stderr.is_empty() {
         eprint!("{}", c(C_RED, &resp.stderr, on));

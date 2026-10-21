@@ -101,29 +101,20 @@ AI-Root run --json "whoami"     # 传统 shell 路径，默认需人工确认
 ## 部署（仅需一次，管理员）
 
 ```powershell
-# 推荐：自动请求 UAC、幂等、安装后自检（配置 / ACL / 中继冒烟）
+# 自动请求 UAC；幂等；安装后自检（服务状态 / 配置 / 目录 ACL / 中继冒烟）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
-
-# 旧入口仍可用，但缺少签名检查、幂等判断与安装后验证：
-# powershell -ExecutionPolicy Bypass -File install-service.ps1
 ```
 
-`install-service.ps1` 分 6 步并**逐步打印结果，不含隐藏动作**：
+只想先看它做什么、不产生任何变更：
 
-| 步骤 | 内容 |
-|---|---|
-| 0 | 提权自检（非管理员直接 `exit 1`） |
-| 1 | 二进制 SHA256 指纹核对（不匹配即 `exit 1`，避免装错版本） |
-| 2 | 安装前快照（服务状态 / 目录 ACL / 部署产物存在性） |
-| 3 | `AI-Root install`（注册 LocalSystem 自启服务） |
-| 4 | 安装后核对（服务注册与启动类型、`SERVICE_START_NAME`、部署副本与包装器、**Users 无写权限 + SYSTEM 保留 (F)**、`sid.txt`） |
-| 5-6 | 启动服务 + `sc qfailure` 失败恢复核对（应 60s/300s/600s） |
-
-> ⚠ 若第 4 步 ACL 检查报 `[X]`（Users 仍持有写权限），**请立即停止使用并反馈**。
-> 同时应确认 `NT AUTHORITY\SYSTEM` 为 `(F)`；若为 `(R)` 则命中自降权限缺陷。
-> 两处判据的成因与验证见 [docs/安全模型.md](docs/安全模型.md)。
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -PreflightOnly
+```
 
 也可手动逐步执行：`AI-Root.exe install` → `AI-Root.exe start`（同样需管理员）。
+
+> 若安装后自检报告「数据目录 ACL 存在普通用户写权限」，请立即停止使用并反馈；
+> 权限判定依据见 [docs/安全模型.md](docs/安全模型.md)。
 
 ### 部署产物
 
@@ -363,9 +354,9 @@ AI-Root config path       # 各文件位置
 
 ## 安全模型
 
-> v1.1 起，安全模型从「令牌 = 一个 SYSTEM shell」改为「**令牌 + 服务端授权策略**」。
-> 完整机制见 [docs/授权策略.md](docs/授权策略.md)；原始审计见
-> [docs/SECURITY_REFACTOR_AUDIT.md](docs/SECURITY_REFACTOR_AUDIT.md)。
+> 安全模型是「**令牌 + 服务端授权策略**」——令牌只决定能否发起请求，
+> 每个请求仍要通过策略判定。完整机制见 [docs/授权策略.md](docs/授权策略.md)；
+> 改造前的审计记录见 [docs/audit/SECURITY_REFACTOR_AUDIT.md](docs/audit/SECURITY_REFACTOR_AUDIT.md)。
 
 ### 两层边界
 
@@ -690,7 +681,7 @@ AI-Root/
 ├── assets/              # 图标与资源脚本
 ├── .cargo/config.toml   # 构建配置（单一事实来源）
 ├── build.rs / build.sh / build.ps1
-├── install-service.ps1  # 管理员安装脚本（6 步自检）
+├── scripts/             # 一键脚本（doctor / build / test / install / uninstall）
 └── .github/workflows/ci.yml
 ```
 
@@ -718,15 +709,20 @@ AI-Root/
 | 文档 | 内容 |
 |---|---|
 | [docs/配置说明.md](docs/配置说明.md) | **三层配置优先级、TOML 字段、rules.d、版本/布局迁移与回滚** |
-| [docs/CONFIG_AUDIT.md](docs/CONFIG_AUDIT.md) | 配置架构审计：10 项问题与目标架构 |
 | [docs/授权策略.md](docs/授权策略.md) | 授权模型、判定顺序、默认白名单、确认流程、更新与回滚 |
-| [docs/SECURITY_REFACTOR_AUDIT.md](docs/SECURITY_REFACTOR_AUDIT.md) | v1.1 安全审计：16 项确认问题、修复方案、验证状态 |
 | [docs/安全模型.md](docs/安全模型.md) | ACL 隔离缺陷 A/B/C 的成因、验证与回归测试 |
 | [docs/构建说明.md](docs/构建说明.md) | 工具链自省、host≠target、资源嵌入、可复现性结论 |
 | [docs/测试说明.md](docs/测试说明.md) | 测试矩阵、变异验证记录、已知缺口 |
 | [docs/项目结构说明.md](docs/项目结构说明.md) | 目录结构与文件职责 |
 | [docs/examples/使用示例.md](docs/examples/使用示例.md) | 多语言集成示例 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
+
+历史归档（记录改造过程，**不作为当前行为依据**）：
+
+| 文档 | 内容 |
+|---|---|
+| [docs/audit/SECURITY_REFACTOR_AUDIT.md](docs/audit/SECURITY_REFACTOR_AUDIT.md) | v1.1 安全审计：16 项确认问题、修复方案与验证状态 |
+| [docs/audit/CONFIG_AUDIT.md](docs/audit/CONFIG_AUDIT.md) | 配置架构审计：10 项问题与目标架构 |
 
 ---
 

@@ -48,11 +48,15 @@ const AUTH_LOCK_SECS: u64 = 120;
 /// 单个调用方 SID 在 60s 窗口内允许的最大鉴权失败次数，超出即定向拒绝 300s。
 const MAX_AUTH_FAILS_PER_SID: u32 = 5;
 
-/// 按调用方 SID 的定向失败计数表（SID → (窗口起点, 失败次数, 封禁截止)）。
+/// 单个 SID 的失败记录：(窗口起点, 失败次数, 封禁截止时刻)
+type SidFailEntry = (Instant, u32, Option<Instant>);
+/// 按 SID 的失败计数表
+type SidFailTable = Mutex<Option<HashMap<String, SidFailEntry>>>;
+
+/// 按调用方 SID 的定向失败计数表。
 /// 用于防「同一身份反复试探令牌」——这是本服务一连接一请求模型下唯一有意义的
 /// 定向防护维度（连接级计数无意义，详见 handle_client 内注释）。
-static SID_FAILS: Mutex<Option<HashMap<String, (Instant, u32, Option<Instant>)>>> =
-    Mutex::new(None);
+static SID_FAILS: SidFailTable = Mutex::new(None);
 
 /// 记录一次「按 SID 的鉴权失败」，返回 (该 SID 当前失败次数, 是否已被定向拒绝)。
 /// 窗口 60s 内失败达到 MAX_AUTH_FAILS_PER_SID 即封禁该 SID 300s（自动过期）。
@@ -65,9 +69,9 @@ fn record_sid_fail(sid: &str) -> (u32, bool) {
     // 惰性清理：表过大时清掉所有已过期条目（超时未再犯者不留痕）
     if map.len() > 256 {
         map.retain(|_, (start, _, until)| {
-            let active = now.duration_since(*start) <= Duration::from_secs(60)
-                || until.map(|u| now < u).unwrap_or(false);
-            active
+            
+            now.duration_since(*start) <= Duration::from_secs(60)
+                || until.map(|u| now < u).unwrap_or(false)
         });
     }
 
@@ -169,8 +173,7 @@ fn create_pipe() -> io::Result<winapi_raw::HANDLE> {
         )
     };
     if converted == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("SDDL 转换失败, last_err={}", unsafe {
                 winapi_raw::GetLastError()
             }),
@@ -205,8 +208,7 @@ fn create_pipe() -> io::Result<winapi_raw::HANDLE> {
     }
 
     if handle == winapi_raw::INVALID_HANDLE_VALUE {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("CreateNamedPipeW 失败, last_err={}", unsafe {
                 winapi_raw::GetLastError()
             }),
@@ -224,8 +226,7 @@ fn accept_one() -> io::Result<File> {
         // ERROR_PIPE_CONNECTED：连接在 CreateNamedPipe 与 ConnectNamedPipe 之间已建立
         if err != winapi_raw::ERROR_PIPE_CONNECTED {
             unsafe { winapi_raw::CloseHandle(handle) };
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "ConnectNamedPipe 失败",
             ));
         }
@@ -1107,7 +1108,7 @@ pub fn run_pipe_server(stop_event: winapi_raw::HANDLE) -> Result<(), String> {
     // 确保 SYSTEM 创建的事件文件可被安装用户读取。
     // ⚠ 服务以 LocalSystem 运行，此处 set_dir_acl 内部的 granted_user_sid() 会读 sid.txt
     //   取到**安装用户** SID，而不是当前进程的 S-1-5-18 —— 否则会把 SYSTEM 自降为只读
-    //   （2026-10-04 线上故障，见 common.rs::select_grant_sid 文档）。
+    //   （线上故障，见 common.rs::select_grant_sid 文档）。
     // ⚠ fail-closed：ACL 是令牌保密性的唯一边界。设置或校验失败时**不进入主循环**，
     // 让服务启动失败（SCM 记 7034/1053），而不是带着可疑权限继续监听管道。
     let dir = common::data_dir();

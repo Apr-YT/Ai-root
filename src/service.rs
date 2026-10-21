@@ -169,7 +169,7 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
 
 /// 卸载服务（需管理员权限）。
 ///
-/// ## 清理边界（2026-10-21 修正）
+/// ## 清理边界
 ///
 /// 只清理**程序文件**与**凭据**，保留**用户数据**：
 ///
@@ -182,7 +182,7 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
 /// | `%LOCALAPPDATA%\AI-Root\user.toml` | `state\pending\`（待确认请求） |
 /// |  | `state\enabled.flag`（服务已不存在） |
 ///
-/// 为什么不再 `remove_dir_all`：旧实现删掉整个数据目录，紧接着却打印
+/// 为什么不能 `remove_dir_all`：它会删掉整个数据目录，紧接着却打印
 /// 「执行日志/事件流保留于 …」，函数注释也写着「数据目录保留日志供审计查阅」——
 /// 实现与声明**自相矛盾**。用户重装后会发现授权策略退回默认、审计记录消失，
 /// 且没有任何提示。卸载不该是「静默重置全部配置」的同义词。
@@ -320,7 +320,7 @@ fn remove_file_retry(p: &std::path::Path, attempts: u32) -> std::io::Result<()> 
         }
     }
     Err(last.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "删除失败且无错误信息")
+        std::io::Error::other("删除失败且无错误信息")
     }))
 }
 
@@ -475,11 +475,11 @@ fn expected_machine() -> u16 {
 /// 校验文件是有效 PE **且架构与服务一致**。
 ///
 /// 注：`update_self` 内部直接比较 `pe_machine` 以获得更精确的错误信息，
-/// 本函数保留给单元测试与将来的调用方使用。
+/// 本函数仅供单元测试断言架构匹配。
 ///
-/// 改造点：旧实现接受 x64/x86 任意一种 —— 用 x86 二进制替换 x64 服务会让服务
-/// 直接起不来（甚至留下无法回滚的坏状态）。架构必须精确匹配。
-#[allow(dead_code)] // 见上方说明：update 内部用 pe_machine 直接比较
+/// 架构必须精确匹配：用 x86 二进制替换 x64 服务会让服务直接起不来，
+/// 甚至留下无法回滚的坏状态。
+#[cfg(test)]
 fn is_valid_pe(path: &std::path::Path) -> bool {
     pe_machine(path) == Some(expected_machine())
 }
@@ -532,9 +532,9 @@ fn wait_running(svc: &windows_service::service::Service, secs: u64) -> bool {
 
 /// 自主更新服务二进制。
 ///
-/// ## 安全模型（2026-10-21 重做）
+/// ## 安全模型
 ///
-/// 旧实现的防护是「PE 头校验 + 打印 SHA-256」。这在安全上等于零：
+/// 只做「PE 头校验 + 打印 SHA-256」在安全上等于零：
 /// 任何能执行 `AI-Root update` 的人都能把任意 PE 变成 LocalSystem 服务，
 /// 而 `install` 又主动给安装用户授予了服务 STOP/START 权限 ——
 /// 于是「非提权用户 → SYSTEM」是一条不需要令牌、不需要读文件的直路。
@@ -838,7 +838,7 @@ fn service_run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 确保令牌与默认启用
     // 服务启动：令牌与 ACL 不可用时**拒绝启动**（fail closed）。
-    // 旧实现用 `.ok()` 吞掉错误，等于「权限异常也照常提供 SYSTEM 中继」。
+    // 用 `.ok()` 吞掉错误，等于「权限异常也照常提供 SYSTEM 中继」。
     common::ensure_token()
         .map_err(|e| format!("令牌/ACL 初始化失败，拒绝启动：{e}"))?;
     common::set_enabled(true).map_err(|e| format!("启用标志/ACL 初始化失败，拒绝启动：{e}"))?;

@@ -838,8 +838,7 @@ fn move_file(src: &Path, dst: &Path, what: &str, done: &mut Vec<String>) -> Resu
         let a = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
         let b = std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0);
         if a != b || a == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "复制后长度不一致",
             ));
         }
