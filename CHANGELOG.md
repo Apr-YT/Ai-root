@@ -28,6 +28,26 @@ DACL，于是 `secrets` 把 3 条 ACE（含 `Users` 可写）**固化**为自己
 **校验逻辑没有放宽**：`verify_dir_acl` 仍然拒绝任何继承 ACE。放宽校验会让秘密目录
 真的保留可写 ACE；正确做法是让硬化覆盖到子目录。
 
+### Fixed — `-Force` 重装只卸载、不安装（严重）
+
+`install.ps1 -Force` 在卸载之后**没有执行安装**：`$svc` 是卸载**之前**取的快照，
+`if ($svc.Exists)` 仍为真，外层 `else`（全新安装）分支因此永远不可达。
+
+实测结果：服务被删掉后只剩一个 delete-pending 的僵尸（SCM 里 `DISABLED` 却仍显示
+`RUNNING`）、没有令牌文件，`exec` 直接报「未找到令牌，请先以管理员运行 install」。
+
+修复：把安装动作抽成 `Install-Service` 函数，`-Force` 分支在卸载后**显式调用**；
+并对「同名服务仍处于 delete-pending」增加 2s 后重试一次。
+
+### Fixed — `uninstall` 对运行中的服务只做标记删除
+
+`delete()` 不会终止正在运行的进程，只是把服务标记为删除。于是紧接着删 exe 会因
+文件仍被占用而失败（os error 5），部署目录残留上一版二进制，服务继续跑旧代码，
+而调用方以为已换版。
+
+修复：`delete` 之前先 `stop` 并等待 `STOPPED`（最多 5 秒）；删文件改为
+重试 6 次 × 200ms。
+
 ### Tests
 
 - 新增 `set_dir_acl_hardens_preexisting_subdirs`：先在父目录硬化前创建两级子目录，

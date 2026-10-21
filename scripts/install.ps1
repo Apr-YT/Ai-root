@@ -198,6 +198,38 @@ if (-not (Test-IsAdmin)) {
 }
 
 # ------------------------------------------------------------
+# 7. 安装动作（「全新安装」与「-Force 重装」共用）
+# ------------------------------------------------------------
+# 为什么抽成函数：-Force 分支原先只调用 uninstall，然后指望外层 else 去安装。
+# 但 $svc 是**卸载之前**取的快照，Exists 仍为 true，外层 else 永远不会执行 ——
+# 实测结果就是「只卸载、没安装」：留下一个 delete-pending 的服务（SCM 显示
+# DISABLED）、没有令牌文件，exec 直接报「未找到令牌」。
+function Install-Service {
+    Write-Host ""
+    Write-Host "=== 注册 LocalSystem 服务 ===" -ForegroundColor Cyan
+
+    $result = Invoke-AiRoot -Exe $exePath -Arguments @("install")
+
+    # 卸载是异步的：SCM 标记删除后进程仍在退出，同名服务可能还处于 delete-pending，
+    # 此时 create_service 会报「已存在」。等 2s 重试一次即可。
+    if ($result.ExitCode -ne 0 -and $result.Output -match "已存在") {
+        Write-Info "同名服务可能仍在 delete-pending，等待 2s 后重试..."
+        Start-Sleep -Seconds 2
+        $result = Invoke-AiRoot -Exe $exePath -Arguments @("install")
+    }
+
+    Write-Host $result.Output
+    if ($result.ExitCode -ne 0) {
+        Write-Bad "安装失败（exit=$($result.ExitCode)）"
+        Write-Info "常见原因:"
+        Write-Info "  - 数据目录 ACL 设置失败（需管理员，且不能被杀软锁定）"
+        Write-Info "  - 同名服务仍处于 delete-pending（卸载后需等几秒）"
+        Write-Info "排查: AI-Root status / 事件查看器 / scripts\doctor.ps1"
+        exit 1
+    }
+}
+
+# ------------------------------------------------------------
 # 7. 已安装分支：默认不动，显式选择才变更
 # ------------------------------------------------------------
 if ($svc.Exists) {
@@ -244,6 +276,8 @@ if ($svc.Exists) {
             Write-Bad "卸载失败，已中止（未执行安装）。"
             exit 1
         }
+        # 卸载完成后**必须显式安装**：$svc 是卸载前的快照，外层 else 不可达。
+        Install-Service
     }
     else {
         Write-Host ""
@@ -259,18 +293,7 @@ else {
     # --------------------------------------------------------
     # 8. 全新安装
     # --------------------------------------------------------
-    Write-Host ""
-    Write-Host "=== 注册 LocalSystem 服务 ===" -ForegroundColor Cyan
-    $i = Invoke-AiRoot -Exe $exePath -Arguments @("install")
-    Write-Host $i.Output
-    if ($i.ExitCode -ne 0) {
-        Write-Bad "安装失败（exit=$($i.ExitCode)）"
-        Write-Info "常见原因:"
-        Write-Info "  - 数据目录 ACL 设置失败（需管理员，且不能被杀软锁定）"
-        Write-Info "  - 端口/管道名被占用"
-        Write-Info "排查: AI-Root status / 事件查看器 / scripts\doctor.ps1"
-        exit 1
-    }
+    Install-Service
 }
 
 # ------------------------------------------------------------

@@ -191,6 +191,28 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
 pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(common::SERVICE_NAME, ServiceAccess::ALL_ACCESS)?;
+
+    // ⚠ 必须先停止，再删除。
+    //
+    // `delete()` 对**运行中**的服务只做「标记删除」：进程会继续运行到自行退出，
+    // SCM 则立即把它置为 DISABLED 且不再响应查询/启动。实测后果是
+    // `-Force` 重装后：部署目录里的 exe 仍被占用删不掉（os error 5）、
+    // 服务还在跑旧二进制、令牌也没重建，而调用方以为已经换版。
+    // 先 stop 并等待 STOPPED，后续删文件才可能成功。
+    if let Ok(st) = service.query_status() {
+        if st.current_state != ServiceState::Stopped {
+            let _ = service.stop();
+            for _ in 0..20 {
+                if let Ok(s) = service.query_status() {
+                    if s.current_state == ServiceState::Stopped {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+
     service.delete()?;
     println!("✓ 服务已卸载: {}", common::SERVICE_NAME);
 
@@ -203,13 +225,16 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
         if !p.exists() {
             continue;
         }
-        match std::fs::remove_file(&p) {
+        // 服务 delete 后进程退出是**异步**的，文件可能仍被占用。
+        // 实测 -Force 重装时旧 exe 删除失败（os error 5），导致部署目录里
+        // 残留上一版二进制、服务仍在跑旧代码。此处重试后再放弃。
+        match remove_file_retry(&p, 6) {
             Ok(()) => {
                 removed_program += 1;
                 println!("✓ 已删除程序文件: {}", p.display());
             }
-            // 服务刚 delete 时进程可能尚未完全退出，文件仍被占用。这不是安全
-            // 问题（凭据与配置已按下面的范围处理），如实提示而不是静默吞掉。
+            // 重试仍失败才提示（例如被杀软长期锁定）。这不是安全问题
+            // （凭据与配置已按下面的范围处理），如实说明而不是静默吞掉。
             Err(e) => eprintln!("[warn] 删除失败（可能仍被占用）{}: {e}", p.display()),
         }
     }
@@ -274,6 +299,29 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("提示: 本次删除 {removed_program} 个程序文件。");
     Ok(())
+}
+
+/// 删除文件并在失败时重试。
+///
+/// 服务 `delete()` 只把服务标记为删除，**进程退出是异步的**。紧接着删 exe 往往
+/// 因文件仍被占用而失败（实测 `-Force` 重装时 os error 5），结果部署目录里留下
+/// 上一版二进制、服务继续运行旧代码，而调用方以为已经换版。
+fn remove_file_retry(p: &std::path::Path, attempts: u32) -> std::io::Result<()> {
+    let mut last: Option<std::io::Error> = None;
+    for i in 0..attempts {
+        match std::fs::remove_file(p) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                if i + 1 < attempts {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "删除失败且无错误信息")
+    }))
 }
 
 pub fn start_svc() -> Result<(), Box<dyn std::error::Error>> {
