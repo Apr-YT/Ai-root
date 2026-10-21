@@ -38,6 +38,14 @@ param(
 $ErrorActionPreference = "Continue"
 . (Join-Path $PSScriptRoot "_common.ps1")
 
+# -WhatIf 必须真的生效。
+#
+# 本脚本声明了 SupportsShouldProcess，但写操作分散在「备份 / 调 AI-Root uninstall /
+# -Purge 删除」三处，逐处调用 $PSCmdlet.ShouldProcess 很容易漏掉一处 ——
+# 而漏掉一处就意味着：用户以为加了 -WhatIf 是演练，实际却真的删了东西。
+# 因此统一在入口把 -WhatIf 折叠成 -DryRun，保证「只要带上就绝不落盘」。
+if ($WhatIfPreference) { $DryRun = $true }
+
 $repoRoot = Get-RepoRoot
 $dataDir = Join-Path $env:ProgramData "AI-Root"
 $userDir = Join-Path $env:LOCALAPPDATA "AI-Root"
@@ -109,7 +117,8 @@ if ($keepTargets.Count -gt 0) {
 if ($DryRun) {
     Write-Host ""
     Write-Host "=== DryRun：未做任何变更 ===" -ForegroundColor Yellow
-    if (-not $NoBackup -and -not $Purge) {
+    # -Purge 也会先备份（见下方备份段），这里不要错误地只在非 Purge 时提示。
+    if (-not $NoBackup) {
         Write-Host "  实际执行时会先备份配置与日志到 %ProgramData%\AI-Root-backup-<时间戳>" -ForegroundColor DarkGray
     }
     Write-Host "  实际执行: scripts\uninstall.ps1 $($(if ($Purge) { '-Purge ' } else { '' }))$($(if ($Force) { '-Force' } else { '' }))" -ForegroundColor DarkGray

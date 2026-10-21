@@ -204,8 +204,13 @@ if ($exe.Path) {
     }
 
     # config check 是只读的（load_readonly / load_existing），不会创建目录
+    $machinePolicy = Join-Path $env:ProgramData "AI-Root\policy.toml"
     $chk = Invoke-AiRoot -Exe $exe.Path -Arguments @("config", "check")
-    if ($chk.ExitCode -eq 0) {
+    if (-not (Test-Path $machinePolicy)) {
+        # 「策略缺失」在 config check 里有意不算失败（首次使用不该报错），
+        # 但直接显示「通过」会让人误以为授权策略已就绪。此处如实区分。
+        Add-Result "配置校验" "INFO" "策略尚未初始化（首次 install 或 AI-Root config init 后生成）" ""
+    } elseif ($chk.ExitCode -eq 0) {
         Add-Result "配置校验" "OK" "全部配置层通过" ""
     } else {
         Add-Result "配置校验" "FAIL" (($chk.Output -split "`r?`n" | Select-Object -First 6) -join " / ") "按提示修正 policy.toml / user.toml，或执行 AI-Root config check 查看完整输出"

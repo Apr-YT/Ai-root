@@ -155,13 +155,31 @@ function Get-AiRootServiceState {
 # ============================================================
 function Invoke-AiRoot {
     # 调用 AI-Root 并捕获输出与退出码。
-    # 用 @Arguments 展开数组，避免把参数拼成字符串后被引号/空格拆散。
+    #
+    # 编码：AI-Root 的 stdout 是 **UTF-8**，而 Windows PowerShell 5.1 默认按控制台
+    # 代码页（中文机器为 GBK/936）解码子进程输出 —— 不切换就会把中文提示读成
+    # 「绛惧悕淇℃伅」这类乱码，用户根本看不懂安装结果与签名错误。
+    #
+    # 只在本调用期间切换、finally 立即恢复：icacls / sc.exe 等系统工具按 **OEM**
+    # 代码页输出，若全局改成 UTF-8，它们反而会乱码。两者不能共用一个全局值。
     param(
         [Parameter(Mandatory = $true)][string]$Exe,
         [string[]]$Arguments = @()
     )
-    $out = & $Exe @Arguments 2>&1
-    $code = $LASTEXITCODE
+
+    $prevEnc = $null
+    try { $prevEnc = [Console]::OutputEncoding } catch { }
+
+    $out = $null
+    $code = -1
+    try {
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $out = & $Exe @Arguments 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        if ($null -ne $prevEnc) { [Console]::OutputEncoding = $prevEnc }
+    }
+
     return [pscustomobject]@{
         ExitCode = $code
         Output   = ($out | Out-String).Trim()

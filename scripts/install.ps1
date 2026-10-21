@@ -107,7 +107,10 @@ if ($isSigned) {
 } else {
     if ($StrictSignature) {
         Write-Bad "未通过 Authenticode 签名校验，-StrictSignature 已启用，拒绝安装。"
-        Write-Info ($sigText -split "`r?`n" | Select-Object -First 8) 
+        # 逐行输出，避免整段签名报告被 [string] 参数用空格拼成一行难以阅读
+        foreach ($line in ($sigText -split "`r?`n" | Select-Object -First 8)) {
+            if ($line.Trim()) { Write-Info $line }
+        }
         exit 1
     }
     Write-Warn "该二进制没有可验证的 Authenticode 嵌入签名（本地自编译属正常）"
@@ -118,6 +121,8 @@ if ($isSigned) {
 # ------------------------------------------------------------
 # 4. 服务状态（幂等判断）
 # ------------------------------------------------------------
+$dataDir = Join-Path $env:ProgramData "AI-Root"
+$installedExe = Join-Path $dataDir "AI-Root.exe"
 $svc = Get-AiRootServiceState
 if ($svc.Exists) {
     Write-Ok "服务已存在，当前状态: $($svc.State)"
@@ -149,6 +154,22 @@ if ($PreflightOnly) {
     Write-Host ""
     Write-Host "预检完成，未做任何变更。" -ForegroundColor Green
     exit 0
+}
+
+# ------------------------------------------------------------
+# 5.5 变更前确认（放在提权**之前**）
+# ------------------------------------------------------------
+# 为什么必须在提权前：UAC 会新开一个窗口，用户在那里看不到本脚本刚打印的
+# 服务状态、二进制版本与签名信息，却要对着一个孤零零的 y/N 做决定。
+# 在原来的窗口里确认，上下文完整。
+if ($svc.Exists -and $Force -and -not $Yes) {
+    Write-Host ""
+    Write-Warn "将卸载现有服务（保留 $dataDir 下的配置与日志）并重新安装。"
+    $answer = Read-Host "  继续? [y/N]"
+    if ($answer -notmatch "^(y|yes)$") {
+        Write-Info "已取消，未做变更。"
+        exit 0
+    }
 }
 
 # ------------------------------------------------------------
@@ -191,7 +212,20 @@ if ($svc.Exists) {
             Write-Info "  2) 先给二进制签名，再 AI-Root trust-publisher <exe> 建立信任根"
             exit 1
         }
-        $u = Invoke-AiRoot -Exe $exePath -Arguments @("update", $exePath)
+        # 用**已安装的副本**执行 update，而不是刚编译出来的源文件。
+        #
+        # 原因：update 内部用 std::env::current_exe() 探测「当前版本」做降级判断。
+        # 若拿源文件执行，current 与 target 是同一个文件，版本比较变成 1.3.0 -> 1.3.0，
+        # 「拒绝降级」这道检查就形同虚设。用部署副本执行，current 才是真实在用版本。
+        $runner = $exePath
+        if (Test-Path $installedExe) {
+            $runner = $installedExe
+            Write-Info "执行者: $runner（已安装副本，用于识别当前版本）"
+        } else {
+            Write-Warn "未找到已安装副本，退回用源文件执行；版本降级检查可能不准确"
+        }
+
+        $u = Invoke-AiRoot -Exe $runner -Arguments @("update", $exePath)
         Write-Host $u.Output
         if ($u.ExitCode -ne 0) {
             Write-Bad "更新失败（exit=$($u.ExitCode)）。AI-Root update 失败时会自动回滚到上一版本。"
@@ -203,13 +237,7 @@ if ($svc.Exists) {
     elseif ($Force) {
         Write-Host ""
         Write-Host "=== 重装（卸载 -> 安装；策略/规则/日志保留）===" -ForegroundColor Cyan
-        if (-not $Yes) {
-            $answer = Read-Host "  将卸载现有服务（保留配置与日志）并重新安装，继续? [y/N]"
-            if ($answer -notmatch "^(y|yes)$") {
-                Write-Info "已取消，未做变更。"
-                exit 0
-            }
-        }
+        # 确认已在提权前完成（步骤 5.5），此处不再询问。
         $u = Invoke-AiRoot -Exe $exePath -Arguments @("uninstall")
         Write-Host $u.Output
         if ($u.ExitCode -ne 0) {

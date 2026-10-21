@@ -31,7 +31,9 @@ param(
     [switch]$Force,
     [switch]$Purge,
     [switch]$DryRun,
-    [switch]$Yes
+    [switch]$Yes,
+    # 透传给 install.ps1：未签名即拒绝（分发给他人时用）
+    [switch]$StrictSignature
 )
 
 $ErrorActionPreference = "Continue"
@@ -102,6 +104,7 @@ switch ($Action) {
         if ($Update) { $a += "-Update" }
         if ($Force) { $a += "-Force" }
         if ($Yes) { $a += "-Yes" }
+        if ($StrictSignature) { $a += "-StrictSignature" }
         $c = Invoke-Step "安装 / 更新" "install.ps1" $a
         Add-StepResult "install" $c
     }
