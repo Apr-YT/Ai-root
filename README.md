@@ -58,18 +58,26 @@ AI 智能体常需执行需要管理员权限的操作（装驱动、改注册�
 | 情况 | 怎么做 |
 |---|---|
 | **只想用** | 下载 Release 中的 `AI-Root.exe`，**无需构建**。跳到 [部署](#部署仅需一次管理员)。 |
-| **要改代码 / 自己构建** | 见 [构建](#构建)。 |
+| **要改代码 / 自己构建** | `scripts\dev.ps1 -Action all`（体检 + 编译 + 测试），见 [脚本](#脚本scripts)。 |
 
-最小可用流程（管理员 PowerShell，一次）：
+从源码到可用，最少三条命令：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File install-service.ps1
+# 1) 体检：缺什么、怎么补（不安装任何东西）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action doctor
+
+# 2) 编译 + 测试
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action all
+
+# 3) 安装（弹一次 UAC；拒绝则不做任何变更）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action install
 ```
 
 之后（任意用户，无需提权）：
 
 ```powershell
-AI-Root run --json "whoami"     # → nt authority\system
+AI-Root exec whoami             # → nt authority\system
+AI-Root run --json "whoami"     # 传统 shell 路径，默认需人工确认
 ```
 
 ---
@@ -93,8 +101,11 @@ AI-Root run --json "whoami"     # → nt authority\system
 ## 部署（仅需一次，管理员）
 
 ```powershell
-# 以管理员身份打开 PowerShell，然后执行：
-powershell -ExecutionPolicy Bypass -File install-service.ps1
+# 推荐：自动请求 UAC、幂等、安装后自检（配置 / ACL / 中继冒烟）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
+
+# 旧入口仍可用，但缺少签名检查、幂等判断与安装后验证：
+# powershell -ExecutionPolicy Bypass -File install-service.ps1
 ```
 
 `install-service.ps1` 分 6 步并**逐步打印结果，不含隐藏动作**：
@@ -455,6 +466,80 @@ ACL 是「谁能进门」，策略是「进门后能做什么」。
 
 ---
 
+## 脚本（scripts\）
+
+`scripts\` 把常用操作收敛成**可重复执行**的入口。重复运行不会破坏已有安装。
+
+| 脚本 | 作用 | 需要管理员 | 改系统状态 |
+|---|---|---|---|
+| `doctor.ps1` | 检查 Rust / 目标平台 / 链接器 / SDK / 配置 / 服务状态 | 否 | 否 |
+| `build.ps1` | Release 编译，输出 EXE 路径与 SHA256 | 否 | 否 |
+| `test.ps1` | 运行测试，区分「通过 / 失败 / 环境跳过」 | 否 | 否 |
+| `install.ps1` | 安装或更新，自动请求 UAC，安装后自检 | 是（自动提权） | 是 |
+| `uninstall.ps1` | 卸载，默认先备份配置与日志 | 是（自动提权） | 是 |
+| `dev.ps1` | 统一入口，透传到上面五个脚本 | 取决于动作 | 取决于动作 |
+
+统一入口：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action doctor
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action build  [-Target msvc|gnu] [-Clean]
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action test   [-Filter policy]
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action install [-PreflightOnly|-Update|-Force]
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action uninstall [-DryRun|-Purge]
+```
+
+### 首次安装
+
+```powershell
+scripts\dev.ps1 -Action doctor     # 先确认环境
+scripts\dev.ps1 -Action all        # 体检 + 编译 + 测试
+scripts\dev.ps1 -Action install    # 安装（UAC 一次），装完自动验证
+```
+
+安装后自检包括：服务状态、`config check`、数据目录 ACL 提示，以及一次
+`AI-Root exec whoami` 冒烟（应返回 `nt authority\system`）。
+
+### 日常更新
+
+```powershell
+scripts\dev.ps1 -Action build
+scripts\dev.ps1 -Action install -Update
+```
+
+`-Update` 走服务端签名更新通道（Authenticode + 发布者指纹，失败自动回滚）。
+
+> **本地自编译的 exe 没有签名，`-Update` 一定会被拒绝** —— 这是设计，不是故障。
+> 本地迭代请用 `-Force`（先卸载再安装，策略与日志保留）：
+>
+> ```powershell
+> scripts\dev.ps1 -Action install -Force
+> ```
+
+### 行为边界
+
+| 场景 | 行为 |
+|---|---|
+| 服务已安装，再跑 `install` | 只打印状态并退出 0，**不重装** |
+| 服务已安装，要换版本 | 必须显式 `-Update` 或 `-Force` |
+| 本地未签名二进制 | `install` 警告后继续（本地开发必须允许）；`-StrictSignature` 则拒绝 |
+| 未签名包 + `-Update` | 预检阶段就拒绝，并提示改用 `-Force` |
+| 卸载 | 默认把 `policy.toml` / `rules.d` / `logs` / `user.toml` 备份到 `%ProgramData%\AI-Root-backup-<时间戳>` |
+| 重复卸载 | 未安装时提示「无需卸载」，退出 0 |
+| `-Purge` | 才删除配置、规则、日志与用户偏好，且默认先备份 |
+| 仓库路径含中文 | 自动把 `CARGO_TARGET_DIR` 切到 `%LOCALAPPDATA%\AI-Root\build-target` |
+
+`uninstall` 的删除边界（与 `src/service.rs::uninstall` 一致）：
+
+| 删除 | 保留 |
+|---|---|
+| 服务注册、`AI-Root.exe`(.old/.new)、`state\tmp`、`state\pending`、`state\enabled.flag`、`secrets\token.txt`、`state\sid.txt`、`C:\Windows\AI-Root.cmd` | `policy.toml`、`rules.d\`、`logs\`、`state\policy.initialized`、`%LOCALAPPDATA%\AI-Root\user.toml` |
+
+> 脚本只做编排，**不绕过任何安全机制**：不关闭 Defender、不改安全策略、
+> 不跳过 `update` 的签名校验、不替用户确认 UAC。
+
+---
+
 ## 构建
 
 **推荐路线：msvc**（Windows 上 Rust 标准做法，无需额外配置 binutils）
@@ -463,8 +548,12 @@ ACL 是「谁能进门」，策略是「进门后能做什么」。
 rustup toolchain install stable-x86_64-pc-windows-msvc
 # 并安装 VS Build Tools（提供 link.exe）：
 #   https://visualstudio.microsoft.com/visual-cpp-build-tools/
-powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
 ```
+
+> `scripts\build.ps1` 只是「环境适配 + 结果报告」的薄封装，真正构建仍走仓库根的
+> `build.ps1`（CI 与开发者同一条路径）。它会自动处理中文路径（切 ASCII 产物目录）、
+> 输出 EXE 绝对路径与 SHA256。
 
 **备选路线：gnu**（不依赖 VS，但**需额外装 MinGW binutils**）
 

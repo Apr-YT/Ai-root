@@ -1,0 +1,313 @@
+﻿# scripts/install.ps1 —— 安全安装 / 更新 AI-Root 服务
+#
+# 用法:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1
+#   ... -File scripts\install.ps1 -PreflightOnly     # 只检查环境与签名，不安装（不需要管理员）
+#   ... -File scripts\install.ps1 -Update            # 已安装时走签名更新（保留现有配置）
+#   ... -File scripts\install.ps1 -Force             # 已安装时卸载后重装（配置与日志保留）
+#   ... -File scripts\install.ps1 -Exe D:\x\AI-Root.exe
+#
+# 幂等性:
+#   服务已存在时，默认**不**重装，只打印当前状态并退出 0。
+#   要变更版本必须显式选择 -Update（官方更新通道）或 -Force（重装）。
+#   这样重复执行本脚本不会破坏正在使用的安装。
+#
+# 安全:
+#   - install 本身不做签名校验（本地自编译场景必须允许），但会**展示**签名状态并告警。
+#   - 需要签名强制的场景（分发给他人）加 -StrictSignature，未签名即拒绝。
+#   - 不关闭 Defender、不修改安全策略、不绕过 UAC（由系统弹窗，用户可拒绝）。
+
+[CmdletBinding()]
+param(
+    [string]$Exe = "",
+
+    # 已安装时执行签名更新（走 AI-Root update，失败自动回滚）
+    [switch]$Update,
+
+    # 已安装时卸载后重装（先 uninstall 再 install；策略/规则/日志会保留）
+    [switch]$Force,
+
+    # 只做检查（环境、二进制、签名、服务状态），不产生任何变更，不需要管理员
+    [switch]$PreflightOnly,
+
+    # 未签名即拒绝安装（分发给他人时使用）
+    [switch]$StrictSignature,
+
+    # 跳过交互确认
+    [switch]$Yes
+)
+
+$ErrorActionPreference = "Continue"
+. (Join-Path $PSScriptRoot "_common.ps1")
+
+if ($Update -and $Force) {
+    Write-Bad "-Update 与 -Force 互斥：更新走签名通道，重装走卸载再安装，请选其一。"
+    exit 2
+}
+
+$repoRoot = Get-RepoRoot
+
+# ------------------------------------------------------------
+# 1. 定位二进制
+# ------------------------------------------------------------
+$found = Find-AiRootExe -RepoRoot $repoRoot -Explicit $Exe
+if (-not $found.Path) {
+    Write-Bad "找不到 AI-Root.exe: $($found.Source)"
+    Write-Info "先编译: scripts\build.ps1"
+    exit 1
+}
+$exePath = $found.Path
+
+Write-Host ""
+Write-Host "=== AI-Root 安装检查 ===" -ForegroundColor Cyan
+Write-Host "  二进制: $exePath" -ForegroundColor Gray
+Write-Host "  来源  : $($found.Source)" -ForegroundColor DarkGray
+
+# ------------------------------------------------------------
+# 2. 二进制基本校验
+# ------------------------------------------------------------
+$item = Get-Item $exePath
+$sha = (Get-FileHash $exePath -Algorithm SHA256).Hash
+Write-Host ("  大小  : {0:N1} MB" -f ($item.Length / 1MB)) -ForegroundColor Gray
+Write-Host "  SHA256: $sha" -ForegroundColor Gray
+
+$ver = Invoke-AiRoot -Exe $exePath -Arguments @("--version")
+if ($ver.ExitCode -eq 0) {
+    Write-Ok "可执行文件可运行: $(($ver.Output -split "`r?`n")[0])"
+} else {
+    Write-Bad "无法运行该二进制（架构不匹配或文件损坏）: $($ver.Output)"
+    exit 1
+}
+
+# 架构一致性：服务与安装程序必须同为 x64（或同为 ARM64）。
+# 这里只做冒烟提示，真正的强校验在 AI-Root update 内部（PE Machine 比对）。
+$vi = (Get-Item $exePath).VersionInfo
+if ($vi.FileVersion -or $vi.ProductName) {
+    Write-Info "文件版本: $($vi.FileVersion)  产品: $($vi.ProductName)"
+} else {
+    Write-Info "未嵌入版本资源（Rust 默认行为，不影响安装）"
+}
+
+# ------------------------------------------------------------
+# 3. 签名状态（展示 + 可选强制）
+# ------------------------------------------------------------
+$isSigned = $false
+$sigText = ""
+$sig = Invoke-AiRoot -Exe $exePath -Arguments @("signature", $exePath)
+if ($sig.Output) {
+    $sigText = $sig.Output
+    # 判据只用「明确通过」的措辞，避免把「未通过」误判成通过。
+    if ($sigText -match "信任链\s*[:：]\s*通过" -or $sigText -match "签名验证通过") {
+        $isSigned = $true
+    }
+}
+
+if ($isSigned) {
+    Write-Ok "Authenticode 签名校验通过"
+} else {
+    if ($StrictSignature) {
+        Write-Bad "未通过 Authenticode 签名校验，-StrictSignature 已启用，拒绝安装。"
+        Write-Info ($sigText -split "`r?`n" | Select-Object -First 8) 
+        exit 1
+    }
+    Write-Warn "该二进制没有可验证的 Authenticode 嵌入签名（本地自编译属正常）"
+    Write-Info "install 不校验签名（否则本地开发无法安装）；但 update 通道会强制校验。"
+    Write-Info "分发给他人时请用 signtool 签名，并加 -StrictSignature。"
+}
+
+# ------------------------------------------------------------
+# 4. 服务状态（幂等判断）
+# ------------------------------------------------------------
+$svc = Get-AiRootServiceState
+if ($svc.Exists) {
+    Write-Ok "服务已存在，当前状态: $($svc.State)"
+} else {
+    Write-Info "服务未安装"
+}
+
+# ------------------------------------------------------------
+# 5. PreflightOnly 到此为止
+# ------------------------------------------------------------
+if ($PreflightOnly) {
+    Write-Host ""
+    Write-Host "=== 预检结论 ===" -ForegroundColor Cyan
+    Write-Ok "二进制可运行"
+    if ($isSigned) { Write-Ok "签名有效" } else { Write-Warn "未签名（本地开发可接受）" }
+    if ($svc.Exists) {
+        Write-Info "已安装（状态 $($svc.State)）。变更版本请用 -Update 或 -Force。"
+    } else {
+        Write-Info "未安装。去掉 -PreflightOnly 即可执行安装（会请求 UAC）。"
+    }
+    # 提前拦截「注定失败」的组合：update 通道强制要求签名 + 信任根。
+    # 让用户在提权前就知道这条路走不通，而不是等 UAC 之后再报错。
+    if ($Update -and -not $isSigned) {
+        Write-Bad "-Update 要求 Authenticode 嵌入签名，当前二进制未通过校验，update 一定会被拒绝。"
+        Write-Info "改用: scripts\install.ps1 -Force（重装，保留策略与日志）"
+        Write-Info "或先签名并用 AI-Root trust-publisher 建立信任根。"
+        exit 1
+    }
+    Write-Host ""
+    Write-Host "预检完成，未做任何变更。" -ForegroundColor Green
+    exit 0
+}
+
+# ------------------------------------------------------------
+# 6. 提权（UAC）
+# ------------------------------------------------------------
+if (-not (Test-IsAdmin)) {
+    Write-Host ""
+    Write-Warn "安装/更新服务需要管理员权限，正在请求 UAC..."
+    Write-Info "系统会弹出授权窗口；拒绝即可取消，不会产生任何变更。"
+
+    $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
+    if ($Exe) { $argList += @("-Exe", "`"$Exe`"") }
+    if ($Update) { $argList += "-Update" }
+    if ($Force) { $argList += "-Force" }
+    if ($StrictSignature) { $argList += "-StrictSignature" }
+    if ($Yes) { $argList += "-Yes" }
+
+    try {
+        $p = Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs -Wait -PassThru
+        exit $p.ExitCode
+    } catch {
+        Write-Bad "提权被取消或失败: $($_.Exception.Message)"
+        Write-Info "也可以在「以管理员身份运行」的 PowerShell 中重跑本脚本。"
+        exit 1
+    }
+}
+
+# ------------------------------------------------------------
+# 7. 已安装分支：默认不动，显式选择才变更
+# ------------------------------------------------------------
+if ($svc.Exists) {
+    if ($Update) {
+        Write-Host ""
+        Write-Host "=== 通过 update 通道更新 ===" -ForegroundColor Cyan
+        if (-not $isSigned) {
+            Write-Bad "update 要求「Authenticode 嵌入签名 + 发布者证书在 trusted_publishers 中」。"
+            Write-Info "当前二进制未通过签名校验，update 一定会被拒绝。"
+            Write-Info "可选方案:"
+            Write-Info "  1) 用 scripts\install.ps1 -Force 重装（保留策略与日志）"
+            Write-Info "  2) 先给二进制签名，再 AI-Root trust-publisher <exe> 建立信任根"
+            exit 1
+        }
+        $u = Invoke-AiRoot -Exe $exePath -Arguments @("update", $exePath)
+        Write-Host $u.Output
+        if ($u.ExitCode -ne 0) {
+            Write-Bad "更新失败（exit=$($u.ExitCode)）。AI-Root update 失败时会自动回滚到上一版本。"
+            Write-Info "确认服务状态: AI-Root status"
+            exit 1
+        }
+        Write-Ok "更新完成"
+    }
+    elseif ($Force) {
+        Write-Host ""
+        Write-Host "=== 重装（卸载 -> 安装；策略/规则/日志保留）===" -ForegroundColor Cyan
+        if (-not $Yes) {
+            $answer = Read-Host "  将卸载现有服务（保留配置与日志）并重新安装，继续? [y/N]"
+            if ($answer -notmatch "^(y|yes)$") {
+                Write-Info "已取消，未做变更。"
+                exit 0
+            }
+        }
+        $u = Invoke-AiRoot -Exe $exePath -Arguments @("uninstall")
+        Write-Host $u.Output
+        if ($u.ExitCode -ne 0) {
+            Write-Bad "卸载失败，已中止（未执行安装）。"
+            exit 1
+        }
+    }
+    else {
+        Write-Host ""
+        Write-Host "=== 已安装，未做变更 ===" -ForegroundColor Yellow
+        Write-Info "当前状态: $($svc.State)"
+        Write-Info "更新版本: scripts\install.ps1 -Update（签名通道，失败自动回滚）"
+        Write-Info "重装    : scripts\install.ps1 -Force（保留配置与日志）"
+        Write-Info "卸载    : scripts\uninstall.ps1"
+        exit 0
+    }
+}
+else {
+    # --------------------------------------------------------
+    # 8. 全新安装
+    # --------------------------------------------------------
+    Write-Host ""
+    Write-Host "=== 注册 LocalSystem 服务 ===" -ForegroundColor Cyan
+    $i = Invoke-AiRoot -Exe $exePath -Arguments @("install")
+    Write-Host $i.Output
+    if ($i.ExitCode -ne 0) {
+        Write-Bad "安装失败（exit=$($i.ExitCode)）"
+        Write-Info "常见原因:"
+        Write-Info "  - 数据目录 ACL 设置失败（需管理员，且不能被杀软锁定）"
+        Write-Info "  - 端口/管道名被占用"
+        Write-Info "排查: AI-Root status / 事件查看器 / scripts\doctor.ps1"
+        exit 1
+    }
+}
+
+# ------------------------------------------------------------
+# 9. 安装后验证
+# ------------------------------------------------------------
+Write-Host ""
+Write-Host "=== 安装后验证 ===" -ForegroundColor Cyan
+
+$svc2 = Get-AiRootServiceState
+if ($svc2.Exists) {
+    Write-Ok "服务已注册，状态: $($svc2.State)"
+} else {
+    Write-Bad "服务注册后查询不到，安装可能未生效"
+    exit 1
+}
+
+if ($svc2.State -ne "Running") {
+    Write-Info "服务未运行，尝试启动..."
+    $s = Invoke-AiRoot -Exe $exePath -Arguments @("start")
+    Write-Host $s.Output
+    Start-Sleep -Seconds 2
+    $svc2 = Get-AiRootServiceState
+    if ($svc2.State -eq "Running") {
+        Write-Ok "服务已启动"
+    } else {
+        Write-Warn "服务仍未进入 Running（当前: $($svc2.State)）"
+        Write-Info "查看: AI-Root status，或事件查看器 -> Windows 日志 -> 系统"
+    }
+}
+
+# 配置层校验（只读）
+$chk = Invoke-AiRoot -Exe $exePath -Arguments @("config", "check")
+if ($chk.ExitCode -eq 0) {
+    Write-Ok "配置校验通过"
+} else {
+    Write-Warn "配置校验未通过:"
+    Write-Info (($chk.Output -split "`r?`n" | Select-Object -First 6) -join " / ")
+}
+
+# 数据目录 ACL 提示（真正的强制校验在服务启动时，验证失败会拒绝启动）
+$dataDir = Join-Path $env:ProgramData "AI-Root"
+if (Test-Path $dataDir) {
+    $acl = (& icacls $dataDir 2>&1 | Out-String)
+    if ($acl -match "BUILTIN\\Users:.*\((M|F|W)\)" -or $acl -match "Everyone:.*\((M|F|W)\)") {
+        Write-Warn "数据目录 ACL 中检测到普通用户写权限，请人工确认:"
+        Write-Info $dataDir
+    } else {
+        Write-Ok "数据目录 ACL 未发现普通用户写权限"
+    }
+}
+
+# 冒烟：用受控的只读操作确认中继可用（whoami 在默认白名单内）
+$smoke = Invoke-AiRoot -Exe $exePath -Arguments @("exec", "whoami")
+if ($smoke.ExitCode -eq 0 -and $smoke.Output -match "SYSTEM") {
+    Write-Ok "中继可用（whoami 返回 SYSTEM 身份）"
+} else {
+    Write-Warn "冒烟测试未通过（不影响安装，可能是策略或服务启动延迟）"
+    Write-Info (($smoke.Output -split "`r?`n" | Select-Object -First 3) -join " / ")
+}
+
+Write-Host ""
+Write-Host "=== 完成 ===" -ForegroundColor Green
+Write-Host "  服务状态: $($svc2.State)"
+Write-Host "  使用示例: AI-Root exec git --version"
+Write-Host "  查看策略: AI-Root policy"
+Write-Host "  查看待确认: AI-Root pending"
+Write-Host "  卸载: scripts\uninstall.ps1"
+exit 0

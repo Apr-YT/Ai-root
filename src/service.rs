@@ -167,41 +167,112 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 卸载服务（需管理员权限）。删除服务 + 清理部署残留（令牌/部署目录/包装器/用户SID）。
-/// 令牌是 SYSTEM 凭据，卸载后必须清除，避免最高权限凭据残留盘上。
+/// 卸载服务（需管理员权限）。
+///
+/// ## 清理边界（2026-10-21 修正）
+///
+/// 只清理**程序文件**与**凭据**，保留**用户数据**：
+///
+/// | 保留（重新安装后继续生效） | 删除（可再生成 / 必须清除） |
+/// |---|---|
+/// | `policy.toml` 管理员授权策略 | `AI-Root.exe` / `.old` / `.new` |
+/// | `rules.d\` 自定义自动化规则 | `secrets\token.txt`（SYSTEM 凭据） |
+/// | `logs\` 审计与事件日志 | `state\sid.txt`（安装用户身份记录） |
+/// | `state\policy.initialized` 初始化标记 | `state\tmp\`（临时脚本） |
+/// | `%LOCALAPPDATA%\AI-Root\user.toml` | `state\pending\`（待确认请求） |
+/// |  | `state\enabled.flag`（服务已不存在） |
+///
+/// 为什么不再 `remove_dir_all`：旧实现删掉整个数据目录，紧接着却打印
+/// 「执行日志/事件流保留于 …」，函数注释也写着「数据目录保留日志供审计查阅」——
+/// 实现与声明**自相矛盾**。用户重装后会发现授权策略退回默认、审计记录消失，
+/// 且没有任何提示。卸载不该是「静默重置全部配置」的同义词。
+///
+/// 需要彻底清除时用 `scripts/uninstall.ps1 -Purge`（它会先做完整备份）。
 pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(common::SERVICE_NAME, ServiceAccess::ALL_ACCESS)?;
     service.delete()?;
     println!("✓ 服务已卸载: {}", common::SERVICE_NAME);
 
-    // 清理部署残留（尽力而为，失败仅提示）
     let dir = deploy_dir();
-    let deploy_dir = dir.as_path();
-    if deploy_dir.exists() {
-        let _ = std::fs::remove_dir_all(deploy_dir);
-        println!("✓ 已清理部署目录: {}", deploy_dir.display());
+
+    // ── 1. 程序文件（部署副本与更新暂存/备份）──
+    let mut removed_program = 0usize;
+    for name in ["AI-Root.exe", "AI-Root.exe.old", "AI-Root.exe.new"] {
+        let p = dir.join(name);
+        if !p.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&p) {
+            Ok(()) => {
+                removed_program += 1;
+                println!("✓ 已删除程序文件: {}", p.display());
+            }
+            // 服务刚 delete 时进程可能尚未完全退出，文件仍被占用。这不是安全
+            // 问题（凭据与配置已按下面的范围处理），如实提示而不是静默吞掉。
+            Err(e) => eprintln!("[warn] 删除失败（可能仍被占用）{}: {e}", p.display()),
+        }
     }
+
+    // ── 2. 运行期残留（可安全重建）──
+    let state = dir.join(config::STATE_DIR);
+    for name in ["tmp", "pending"] {
+        let p = state.join(name);
+        if p.exists() {
+            match std::fs::remove_dir_all(&p) {
+                Ok(()) => println!("✓ 已清理运行期残留: {}", p.display()),
+                Err(e) => eprintln!("[warn] 清理失败 {}: {e}", p.display()),
+            }
+        }
+    }
+    // 服务已不存在，启用标志留着只会让「是否启用」的判断产生歧义。
+    let flag = state.join("enabled.flag");
+    if flag.exists() {
+        let _ = std::fs::remove_file(&flag);
+    }
+
     let wrapper = std::path::Path::new("C:\\Windows\\AI-Root.cmd");
     if wrapper.exists() {
-        let _ = std::fs::remove_file(wrapper);
-        println!("✓ 已清理全局包装器: {}", wrapper.display());
+        match std::fs::remove_file(wrapper) {
+            Ok(()) => println!("✓ 已清理全局包装器: {}", wrapper.display()),
+            Err(e) => eprintln!("[warn] 清理包装器失败 {}: {e}", wrapper.display()),
+        }
     }
-    // 令牌（SYSTEM 凭据）必须清除；数据目录保留日志供审计查阅
+
+    // ── 3. 凭据（必须清除，不留最高权限凭据残盘）──
     let tok = common::token_path();
     if tok.exists() {
-        let _ = std::fs::remove_file(&tok);
-        println!("✓ 已清除令牌文件（SYSTEM 凭据不残留）");
+        match std::fs::remove_file(&tok) {
+            Ok(()) => println!("✓ 已清除令牌文件（SYSTEM 凭据不残留）"),
+            Err(e) => eprintln!("[warn] 令牌删除失败（请手工确认）{}: {e}", tok.display()),
+        }
     }
     let sid = common::user_sid_path();
     if sid.exists() {
-        let _ = std::fs::remove_file(&sid);
-        println!("✓ 已清除安装用户 SID 记录");
+        match std::fs::remove_file(&sid) {
+            Ok(()) => println!("✓ 已清除安装用户 SID 记录"),
+            Err(e) => eprintln!("[warn] SID 记录删除失败 {}: {e}", sid.display()),
+        }
     }
-    println!(
-        "提示: 执行日志/事件流保留于 {}（如需彻底清除请手动删除目录）",
-        common::data_dir().display()
-    );
+
+    // ── 4. 明确告知保留了什么（避免用户以为配置被删）──
+    let paths = config::Paths::resolve();
+    let mut kept: Vec<std::path::PathBuf> = Vec::new();
+    for p in [paths.policy(), paths.rules_dir(), paths.logs(), paths.user_file()] {
+        if p.exists() {
+            kept.push(p);
+        }
+    }
+    if kept.is_empty() {
+        println!("提示: 未发现需要保留的用户数据（可能为首次安装后立即卸载）。");
+    } else {
+        println!("以下用户数据已保留（重新安装后继续生效）:");
+        for p in &kept {
+            println!("  - {}", p.display());
+        }
+        println!("彻底清除请用: scripts\\uninstall.ps1 -Purge（会先备份）");
+    }
+    println!("提示: 本次删除 {removed_program} 个程序文件。");
     Ok(())
 }
 

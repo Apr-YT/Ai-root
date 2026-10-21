@@ -3,6 +3,58 @@
 本文件记录 AI-Root 的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.3.0] — 2026-10-21
+
+> 主题：**一键化**。把「翻文档、猜依赖、拼命令」收敛成可重复执行的脚本入口。
+
+### Added — scripts\
+
+- **`scripts/doctor.ps1`**：检查 PowerShell 版本、进程架构、Rust 工具链、
+  已装 target、MSVC `link.exe` / MinGW `as.exe`、Windows SDK、仓库路径编码、
+  配置层校验与服务状态；每项缺失都给出**可复制执行**的修复建议。只读，不装任何东西。
+- **`scripts/build.ps1`**：Release 编译，输出 EXE 绝对路径、版本、大小、SHA256。
+  仓库路径含非 ASCII 字符时自动把 `CARGO_TARGET_DIR` 切到
+  `%LOCALAPPDATA%\AI-Root\build-target`（MinGW `ld` 无法处理中文路径）。
+- **`scripts/test.ps1`**：运行测试并区分「通过 / 失败 / 环境跳过」，同时明确列出
+  当前环境**根本无法覆盖**的项（真实 SCM 生命周期、SYSTEM 上下文 ACL、update 端到端、域环境）。
+- **`scripts/install.ps1`**：非管理员时通过 UAC 自提权；幂等（已安装只报状态、不重装）；
+  `-PreflightOnly` 只检查不落盘；签名状态展示 + `-StrictSignature` 强制；
+  安装后自检服务状态、`config check`、数据目录 ACL 与 `exec whoami` 冒烟。
+- **`scripts/uninstall.ps1`**：清单预览 + 确认 + 默认备份 + `-DryRun`；
+  `-Purge` 才彻底删除，且默认先备份到 `%ProgramData%\AI-Root-backup-<时间戳>`。
+- **`scripts/dev.ps1`**：统一入口 `-Action doctor|build|test|install|uninstall|all`，
+  子脚本以独立进程执行并汇总退出码。
+
+### Fixed — 卸载会删掉用户数据（严重）
+
+- `service.rs::uninstall` 原先 `remove_dir_all(deploy_dir)`，而 `deploy_dir` 就是
+  `%ProgramData%\AI-Root` —— `policy.toml`、`rules.d\`、`logs\` 与凭据同在此目录。
+  于是「卸载服务」实际等于「静默重置全部配置并删除审计日志」，紧接着却打印
+  「执行日志/事件流保留于 …」，注释也写着「数据目录保留日志供审计查阅」，
+  实现与声明自相矛盾。
+- 现在只删除：程序文件（`AI-Root.exe` / `.old` / `.new`）、运行期残留
+  （`state\tmp`、`state\pending`、`state\enabled.flag`）、凭据（`secrets\token.txt`、
+  `state\sid.txt`）与全局包装器；**保留** `policy.toml`、`rules.d\`、`logs\`、
+  `state\policy.initialized` 与 `%LOCALAPPDATA%\AI-Root\user.toml`，并在结束时逐项列出保留内容。
+
+### Changed
+
+- `scripts/uninstall.ps1` 只把**部署目录内**的 exe 计入删除项；构建产物
+  （`target\` 或 `build-target\`）不属于安装内容，卸载不会碰。
+- README 增补 [脚本](#脚本scripts) 章节：首次安装三条命令、日常更新两条命令、行为边界表。
+
+### Tests
+
+- 全部脚本已在 Windows 11 25H2 / PowerShell 5.1 真机执行：
+  `doctor` 通过（1 警告：非 ASCII 仓库路径，已自动处理）；
+  `build` 成功（31.5s，EXE 2.0 MB）；
+  `test` **175 passed / 0 failed**（含从非仓库目录调用的路径验证）；
+  `install -PreflightOnly` 正确识别未签名并保持零变更；
+  `uninstall -DryRun` 在未安装时输出「无需卸载」；
+  `dev.ps1 -Action doctor` 汇总正常。
+- 未真实执行：服务安装/卸载（会改变主力机的 SYSTEM 服务状态）、UAC 提权路径、
+  `-Update` 成功路径（需签名包 + 信任根）。这些需在可恢复虚拟机验证。
+
 ## [1.2.0] — 2026-10-21
 
 > 主题：**配置架构**。把「12 个编译期常量 + 3 个环境变量 + 一个 JSON 文件」整理成
