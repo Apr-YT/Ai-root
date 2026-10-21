@@ -191,6 +191,33 @@ if (-not (Test-Path $cargoExe)) {
 if (-not $cargoExe) { Write-Error "未找到 cargo, 请先安装 Rust (rustup)" }
 Write-Host "[*] 工具链: $toolchainDir"
 
+# ---- 2.5) 隔离 rustup shim: 让 rustc 直连真实可执行文件 ----
+# 为什么必须做（2026-10-21 CI msvc job 实测，基线 10-04 起一直红）：
+#   cargo 调用 build script 时用的是**裸名 `rustc`**，日志可见：
+#     process didn't exit successfully: `rustc --crate-name build_script_build ...`
+#   因此它走 PATH 解析。而 %USERPROFILE%\.cargo\bin\rustc.exe 是 rustup 的 **shim**，
+#   shim 默认 RUSTUP_AUTO_INSTALL=1，会在**编译进行中**同步 channel 并重装已登记组件。
+#   GitHub windows-latest 镜像里 rust-src 的文件与 rustup manifest 不一致，重装时报
+#     error: failed to install component: 'rust-src',
+#            detected conflict: 'lib\rustlib\src\rust\library\.cargo\config.toml'
+#   随后 rolling back changes —— 把正在被使用的 toolchain 破坏，rustc 退出 1，
+#   cargo 报 "could not compile `proc-macro2` (build script)"。表象极具误导性：
+#   看起来像代码编译错误，实际是工具链在编译途中被回滚。
+#
+#   gnu 分支此前**侥幸躲过**：它在注入 MinGW binutils 时顺带把 $toolchainDir\bin
+#   前置了（见下方第 3 步），shim 因此不在路径首位。msvc 分支没有该副作用，故暴露。
+#   这说明修复必须无条件执行，不能依赖某个 target 的附加逻辑。
+#
+# 三条措施缺一不可：
+#   1. 前置 toolchain\bin —— rustc/cargo 命中真实文件，根本不进入 shim；
+#   2. RUSTUP_TOOLCHAIN —— 万一仍有 shim 被调用，明确指定 toolchain，不触发 channel 同步；
+#   3. RUSTUP_AUTO_INSTALL=0 —— 构建期禁止任何 toolchain 变更。缺组件就立即明确报错
+#      （fail fast），而不是边编译边安装、装失败再回滚。
+$env:PATH = "$toolchainDir\bin;$env:PATH"
+$env:RUSTUP_TOOLCHAIN = Split-Path -Leaf $toolchainDir
+$env:RUSTUP_AUTO_INSTALL = "0"
+Write-Host "[*] 已隔离 rustup shim: rustc 直连 $toolchainDir\bin" -ForegroundColor Cyan
+
 # ---- 3) gnu target: 注入完整 MinGW binutils ----
 if ($TARGET -eq "x86_64-pc-windows-gnu") {
     $binutilsCandidates = @()
@@ -220,8 +247,10 @@ rustup 自带的 self-contained 目录缺 as.exe, 无法独立完成链接。
        \$env:MINGW_BINUTILS_BIN = "<你的 binutils>\bin"
 "@
     }
-    # 顺序: binutils 在 toolchain bin **之前**, 确保同名工具(dlltool/as/ld)用完整版。
-    $env:PATH = "$binutils;$toolchainDir\bin;$env:PATH"
+    # 顺序: binutils 放在**最前**, 确保同名工具(as/dlltool/ld)用完整版, 而不是 rustup
+    # self-contained 里的残缺版。toolchain\bin 已由 2.5 步前置, 此处不再重复添加
+    # （重复虽无害, 但会让「谁负责前置 toolchain\bin」这件事变得含糊）。
+    $env:PATH = "$binutils;$env:PATH"
     Write-Host "[*] MinGW binutils: $binutils" -ForegroundColor Cyan
 
     # 必须验证可达: 只塞进 PATH 不够, 否则会一路编译到某依赖链接期才报
