@@ -566,9 +566,9 @@ bash build.sh
 - **优先向系统自省，而非猜测路径**：
   | 信息 | 获取方式 | 可移植性 |
   | -------- | ----------------------------------------------------------- | ------------------- |
-  | rust 根 | `rustup show home` 反推（**并校验 toolchain 真实存在**） | 高——只要 rustup 在 PATH |
+  | rust 根 | `rustup show home` 反推，并校验 toolchain 真实存在 | 高，只要 rustup 在 PATH |
   | cargo | `rustup which cargo` 直接定位（绕开 rustup shim） | 高 |
-  | binutils | `MINGW_BINUTILS_BIN` → PATH 中的 `as.exe` → 常见 MSYS2/MinGW 位置 | 中——gnu 需用户提供 |
+  | binutils | `MINGW_BINUTILS_BIN`，其次 PATH 中的 `as.exe`，再次常见 MSYS2/MinGW 位置 | 中，gnu 需用户提供 |
 - **依赖自检**：缺 rustup / toolchain / binutils 时直接打印**可复制执行**的修复命令，  
   而不是让用户对着链接期报错猜。
 - **仓库须置于纯 ASCII 路径**（MinGW `ld` 无法正确处理含中文的产物路径）。
