@@ -346,12 +346,26 @@ if (Test-Path $dataDir) {
 }
 
 # 冒烟：用受控的只读操作确认中继可用（whoami 在默认白名单内）
-$smoke = Invoke-AiRoot -Exe $exePath -Arguments @("exec", "whoami")
-if ($smoke.ExitCode -eq 0 -and $smoke.Output -match "SYSTEM") {
+# 冒烟测试必须重试：服务进入 Running 与管道可连接不是同一时刻。
+# 实测刚启动就发请求会拿到「命名管道不存在」，服务本身是好的。
+# 重试 10 次、每次 1 秒，覆盖绝大多数启动耗时；仍失败才认为有问题。
+$smoke = $null
+$smokeOk = $false
+for ($i = 1; $i -le 10; $i++) {
+    $smoke = Invoke-AiRoot -Exe $exePath -Arguments @("exec", "whoami")
+    if ($smoke.ExitCode -eq 0 -and $smoke.Output -match "SYSTEM") {
+        $smokeOk = $true
+        break
+    }
+    if ($i -lt 10) { Start-Sleep -Seconds 1 }
+}
+
+if ($smokeOk) {
     Write-Ok "中继可用（whoami 返回 SYSTEM 身份）"
 } else {
-    Write-Warn "冒烟测试未通过（不影响安装，可能是策略或服务启动延迟）"
+    Write-Warn "中继在 10 秒内未就绪（服务状态为 $($svc2.State)）"
     Write-Info (($smoke.Output -split "`r?`n" | Select-Object -First 3) -join " / ")
+    Write-Info "排查: AI-Root status / 事件查看器 / scripts\doctor.ps1"
 }
 
 Write-Host ""

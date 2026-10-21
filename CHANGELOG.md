@@ -3,34 +3,34 @@
 本文件记录 AI-Root 的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [1.4.0] - 2026-10-21
+## [Unreleased]
 
-### Removed
 
-- `install-service.ps1`。破坏性变更，改用 `scripts\install.ps1`。
-  旧脚本缺少幂等判断、签名检查、`-PreflightOnly` 和安装后自检。
-- 死代码：`CLIENT_READ_TIMEOUT_MS`、`log_path()`、`read_frame()`、`ACCESS_DENIED_ACE_TYPE`。
-  `is_valid_pe` 改为 `#[cfg(test)]`。
+## [1.4.2] - 2026-10-21
 
-### Changed
-
-- 审计报告移入 `docs/audit/`，文件头标注为历史记录。
-- 重写 `docs/项目结构说明.md`。原文声称 `server.rs` 1,247 行（实际 2,027），
-  漏掉 `config`、`policy`、`consent`、`signature` 四个模块，也没有 `scripts/`。
-  新版只描述职责，不记录行数。
-- README 部署章节只保留 `scripts\install.ps1`，删掉旧脚本的分步说明。
-- 源码注释去掉改造过程叙述和 bug 编号，保留安全相关的设计理由。
 
 ### Fixed
 
-- clippy 警告从 20 条降到 0。
-- 帧上限的两条断言改为编译期 `const _: () = assert!(...)`。
+- 数据目录 DACL 可能残留过宽的显式 ACE。`icacls /inheritance:r` 只断开并清除
+  继承的条目，不会删除已经显式写入的 ACE。如果某次运行拿不到安装用户 SID，
+  走了退化分支写入 `INTERACTIVE:(R)`，之后即使拿到 SID，这条 ACE 也删不掉，
+  两条会长期并存。
+
+  影响：`INTERACTIVE` 覆盖所有交互登录的本地用户，多用户机器上其他账号也能读到
+  `secrets\token.txt`。`verify_dir_acl` 只检查写权限，读权限不在判定范围内，
+  所以这个残留不会触发告警。
+
+  现在每次硬化前会先移除 INTERACTIVE、Authenticated Users、Everyone、Users、
+  Guests、ANONYMOUS LOGON、NETWORK 这些主体的显式 ACE，再按需重新授予。
+  补了一条测试：先人为写入 `INTERACTIVE:(R)`，调用硬化后断言其消失；
+  变异验证（去掉移除逻辑）会立刻 FAILED。
 
 ### Tests
 
-- 176 passed，clippy 0 warning，CI 的 msvc 与 gnu 两个 job 均通过。
+- 178 passed。
 
 ## [1.4.1] - 2026-10-21
+
 
 ### Fixed
 
@@ -71,7 +71,36 @@
 
 - 177 passed。
 
+## [1.4.0] - 2026-10-21
+
+
+### Removed
+
+- `install-service.ps1`。破坏性变更，改用 `scripts\install.ps1`。
+  旧脚本缺少幂等判断、签名检查、`-PreflightOnly` 和安装后自检。
+- 死代码：`CLIENT_READ_TIMEOUT_MS`、`log_path()`、`read_frame()`、`ACCESS_DENIED_ACE_TYPE`。
+  `is_valid_pe` 改为 `#[cfg(test)]`。
+
+### Changed
+
+- 审计报告移入 `docs/audit/`，文件头标注为历史记录。
+- 重写 `docs/项目结构说明.md`。原文声称 `server.rs` 1,247 行（实际 2,027），
+  漏掉 `config`、`policy`、`consent`、`signature` 四个模块，也没有 `scripts/`。
+  新版只描述职责，不记录行数。
+- README 部署章节只保留 `scripts\install.ps1`，删掉旧脚本的分步说明。
+- 源码注释去掉改造过程叙述和 bug 编号，保留安全相关的设计理由。
+
+### Fixed
+
+- clippy 警告从 20 条降到 0。
+- 帧上限的两条断言改为编译期 `const _: () = assert!(...)`。
+
+### Tests
+
+- 176 passed，clippy 0 warning，CI 的 msvc 与 gnu 两个 job 均通过。
+
 ## [1.3.1] - 2026-10-21
+
 
 ### Fixed：安装会直接失败（严重）
 
@@ -131,6 +160,7 @@ v1.3.0 的 Release 产物含此缺陷，安装会失败，请使用 v1.3.1。
 
 ## [1.3.0] - 2026-10-21
 
+
 ### Added：scripts\
 
 - `scripts/doctor.ps1`：检查 PowerShell 版本、进程架构、Rust 工具链、
@@ -180,6 +210,7 @@ v1.3.0 的 Release 产物含此缺陷，安装会失败，请使用 v1.3.1。
   `-Update` 成功路径（需签名包 + 信任根）。这些需在可恢复虚拟机验证。
 
 ## [1.2.0] - 2026-10-21
+
 
 ### Added：配置系统
 
@@ -259,6 +290,7 @@ v1.3.0 的 Release 产物含此缺陷，安装会失败，请使用 v1.3.1。
 
 ## [1.1.0] - 2026-10-21
 
+
 ### Security：更新与部署（Critical）
 
 - 修复：非提权用户可替换 SYSTEM 服务二进制（审计 V-01）。旧 `update` 只需 PE 头校验，
@@ -325,9 +357,8 @@ v1.3.0 的 Release 产物含此缺陷，安装会失败，请使用 v1.3.1。
 - 未验证项（明确记录）：服务安装/启动/真正的 SYSTEM 上下文 ACL 行为、
   `update` 端到端签名替换、域环境行为，需在可恢复的 Windows 虚拟机验证。
 
-## [Unreleased]
-
 ## [1.0.0] - 2026-10-04
+
 
 ### Fixed：构建与 CI
 
@@ -400,6 +431,7 @@ v1.3.0 的 Release 产物含此缺陷，安装会失败，请使用 v1.3.1。
 - 关键缺陷均经变异测试验证（改坏实现必须精确 FAILED）。
 
 ## [0.9.0] - 2026-08-28
+
 
 `0.9.0` 是 1.0.0 之前的开发里程碑，没有发布过 Release，所以没有 tag 链接。
 

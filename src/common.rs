@@ -554,6 +554,16 @@ fn set_one_dir_acl(dir: &std::path::Path) -> Result<(), AclError> {
         )));
     }
 
+    // 清除历史上可能残留的、本不该存在的显式 ACE。
+    //
+    // 为什么必须有这一步：`/inheritance:r` 只断开并清除**继承**的 ACE，
+    // 不会删除已经**显式**写进 DACL 的条目。于是出现过这种情况：
+    //   某次运行拿不到安装用户 SID，走了退化分支，显式写入 `INTERACTIVE:(R)`；
+    //   之后拿到 SID 了，新的授权会追加用户自己的 ACE，但那条 INTERACTIVE 删不掉，
+    //   两条长期并存。多用户机器上，其他交互登录用户因此也能读到 token.txt。
+    // `verify_dir_acl` 只检查写权限，读权限它不管，所以这个残留不会报错。
+    strip_stale_aces(&dir_str);
+
     // ⚠ 必须用 `granted_user_sid()`（安装用户）而非 `get_user_sid()`（当前进程身份）：
     //   本函数会被以 SYSTEM 运行的服务调用，此时 `get_user_sid()` == S-1-5-18，
     //   会导致「授予当前用户只读」变成「把 SYSTEM 降级为只读」→ 服务无法写数据目录。
@@ -589,6 +599,39 @@ fn set_one_dir_acl(dir: &std::path::Path) -> Result<(), AclError> {
     // 最终验收：真实 DACL 必须满足「危险主体无写权限 + SYSTEM 有写 + 无继承 ACE」。
     // 这一步是 fail-closed 的关键 —— 不再靠 `contains("SYSTEM") && contains("(F)")` 猜。
     verify_dir_acl(dir)
+}
+
+/// 不应出现在数据目录 DACL 里的主体。
+///
+/// 这些主体要么范围过宽（Everyone、Authenticated Users、INTERACTIVE、Users、
+/// Guests、NETWORK 都覆盖到安装用户以外的账号），要么根本不该有本地访问
+/// （ANONYMOUS）。它们一旦出现在 DACL 上，即使只有读权限，也等于把令牌
+/// 交给更多人。
+const STALE_SIDS: &[&str] = &[
+    "*S-1-5-4",      // INTERACTIVE
+    "*S-1-5-11",     // Authenticated Users
+    "*S-1-1-0",      // Everyone
+    "*S-1-5-32-545", // Users
+    "*S-1-5-32-546", // Guests
+    "*S-1-5-7",      // ANONYMOUS LOGON
+    "*S-1-5-2",      // NETWORK
+];
+
+/// 移除可能残留的过宽授权 ACE。
+///
+/// 逐条执行：`/remove:g` 对不存在的 SID 会返回非零，属于正常情况（本来就没有），
+/// 因此这里不看退出码，只保证执行过。真正的验收在 `verify_dir_acl`。
+///
+/// 注意 `Users` 也在清除列表里，而安装用户通常是 Users 成员。删掉的是那个
+/// **组**的 ACE，安装用户自己有一条独立 SID 的 ACE，读权限不受影响。
+fn strip_stale_aces(dir_str: &str) {
+    for sid in STALE_SIDS {
+        let _ = Command::new("icacls")
+            .arg(dir_str)
+            .arg("/remove:g")
+            .arg(sid)
+            .output();
+    }
 }
 
 /// 单条 `icacls /grant:r` 授权。`:r` = replace 语义（幂等，不累积重复 ACE）。
@@ -1225,6 +1268,44 @@ mod tests {
     /// 并把这些 ACE 固化为自己的继承 ACE。`icacls /inheritance:r` 不递归，
     /// 若只硬化父目录，子目录里那几条 (I) ACE 仍然存在，
     /// `verify_dir_acl(secrets)` 随即拒绝写令牌，安装失败。
+    /// 残留的过宽显式 ACE 必须被清掉。
+    ///
+    /// 场景：某次运行拿不到安装用户 SID，走了退化分支，显式写入 `INTERACTIVE:(R)`。
+    /// 之后拿到 SID，`/inheritance:r` 删不掉这条显式 ACE，于是它长期留在 DACL 上。
+    /// 多用户机器上，其他交互登录用户因此也能读到 token.txt。
+    #[test]
+    fn set_dir_acl_strips_stale_interactive_ace() {
+        let base = std::env::temp_dir().join(format!("airoot-acl-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("创建测试目录失败");
+
+        // 人为制造「退化分支留下的残留」：显式授予 INTERACTIVE 只读
+        let g = Command::new("icacls")
+            .arg(&base)
+            .arg("/grant:r")
+            .arg("*S-1-5-4:(OI)(CI)R")
+            .output()
+            .expect("执行 icacls 失败");
+        assert!(g.status.success(), "前提构造失败：无法写入 INTERACTIVE ACE");
+        assert!(
+            icacls_show(&base).contains("INTERACTIVE"),
+            "前提不成立：DACL 里应当已经有 INTERACTIVE，否则本测试没有验证意义"
+        );
+
+        set_dir_acl(&base).expect("硬化应成功");
+
+        assert!(
+            !icacls_show(&base).contains("INTERACTIVE"),
+            "残留的 INTERACTIVE 只读 ACE 必须被清除，实际 ACL:\n{}",
+            icacls_show(&base)
+        );
+        // 清掉过宽主体之后，SYSTEM 与 Administrators 的完全控制不能被牵连
+        verify_dir_acl(&base).expect("清除残留后仍应通过 ACL 验收");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 子目录硬化的回归测试
     #[test]
     fn set_dir_acl_hardens_preexisting_subdirs() {
         let base = std::env::temp_dir().join(format!("airoot-acl-tree-{}", std::process::id()));
