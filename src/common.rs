@@ -234,7 +234,14 @@ fn build_logger() -> Option<Logger> {
     let dir = logs_dir();
     let _ = std::fs::create_dir_all(&dir);
     let events = LogFile::open(&events_log_path(), true).ok()?;
-    let exec = LogFile::open(&exec_log_path(), false).ok()?;
+    // 审计日志同样逐条落盘。
+    //
+    // 曾经用 16KB 批量 flush（realtime=false）。问题是：只有在缓冲积满、
+    // 或服务**正常停止**时才落盘，于是个人使用这种每天几十条命令的量，
+    // 文件上能看到的是很久以前的内容；而进程被强杀（taskkill /F、崩溃、
+    // 断电）时，缓冲区里的条目全部丢失。审计日志的价值就是事后可查，
+    // 这两点都不可接受。单条 write + flush 的开销在这个量级可以忽略。
+    let exec = LogFile::open(&exec_log_path(), true).ok()?;
     Some(Logger {
         events: Mutex::new(events),
         exec: Mutex::new(exec),
@@ -1149,6 +1156,35 @@ pub fn log_exec(caller: &str, pid: u32, command: &str, exit_code: i32) {
 #[allow(clippy::assertions_on_constants)] // 常量契约断言是有意的（防常量被默默改动）
 mod tests {
     use super::*;
+
+    /// 审计日志必须逐条落盘，不能依赖「缓冲满了」或「进程正常退出」。
+    ///
+    /// 曾经 exec.log 用 16KB 批量 flush：个人使用每天几十条命令，文件上能看到的
+    /// 是很久以前的内容；进程被强杀时缓冲里的条目全部丢失。
+    #[test]
+    fn audit_log_line_is_visible_without_explicit_flush() {
+        let p = std::env::temp_dir().join(format!("airoot-log-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+
+        let mut lf = LogFile::open(&p, true).expect("打开日志失败");
+        lf.write_line(b"first line\n");
+        // 刻意不调用 flush：模拟服务持续运行、尚未走到停止流程的状态
+        let body = std::fs::read_to_string(&p).expect("读日志失败");
+        assert_eq!(
+            body, "first line\n",
+            "写一行就应当已经落盘，实际读到 {body:?}"
+        );
+
+        lf.write_line(b"second line\n");
+        let body2 = std::fs::read_to_string(&p).expect("读日志失败");
+        assert!(
+            body2.contains("second line"),
+            "第二行也应立即可见，实际 {body2:?}"
+        );
+
+        drop(lf);
+        let _ = std::fs::remove_file(&p);
+    }
 
     /// 运行 icacls 并返回 stdout（用于断言 ACL 内容）。
     fn icacls_show(dir: &std::path::Path) -> String {
